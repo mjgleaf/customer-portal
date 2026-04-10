@@ -9,7 +9,8 @@ import ContactPage from './pages/ContactPage';
 import './index.css';
 
 function ProtectedRoutes() {
-    const { isAuthenticated } = useAuth();
+    const { isAuthenticated, loading } = useAuth();
+    if (loading) return null;
     if (!isAuthenticated) return <Navigate to="/login" replace />;
 
     return (
@@ -25,7 +26,9 @@ function ProtectedRoutes() {
 }
 
 function AppRoutes() {
-    const { isAuthenticated } = useAuth();
+    const { isAuthenticated, loading } = useAuth();
+
+    if (loading) return null;
 
     return (
         <Routes>

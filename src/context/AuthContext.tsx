@@ -1,10 +1,21 @@
-import { createContext, useContext, useState, type ReactNode } from 'react';
+import { createContext, useContext, useMemo, type ReactNode } from 'react';
+import {
+    useMsal,
+    useIsAuthenticated,
+    MsalProvider,
+} from '@azure/msal-react';
+import {
+    PublicClientApplication,
+    type AccountInfo,
+    InteractionStatus,
+} from '@azure/msal-browser';
+import { msalConfig, loginRequest } from '../config/auth';
 import type { CustomerProfile } from '../types';
 
 interface AuthContextValue {
     customer: CustomerProfile | null;
     isAuthenticated: boolean;
-    login: (email: string, password: string) => Promise<void>;
+    login: () => Promise<void>;
     logout: () => void;
     loading: boolean;
     error: string | null;
@@ -23,55 +34,61 @@ export function useAuth() {
     return useContext(AuthContext);
 }
 
-/**
- * For now, this uses a simple demo auth flow.
- * In production this would integrate with Azure AD B2C or similar
- * to authenticate external customers.
- */
-export function AuthProvider({ children }: { children: ReactNode }) {
-    const [customer, setCustomer] = useState<CustomerProfile | null>(() => {
-        const saved = sessionStorage.getItem('portal-customer');
-        return saved ? JSON.parse(saved) : null;
-    });
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState<string | null>(null);
+export const msalInstance = new PublicClientApplication(msalConfig);
 
-    const login = async (email: string, _password: string) => {
-        setLoading(true);
-        setError(null);
-        try {
-            // Demo: derive company from email domain
-            const domain = email.split('@')[1]?.split('.')[0] || 'Customer';
-            const companyName = domain.charAt(0).toUpperCase() + domain.slice(1);
-            const profile: CustomerProfile = {
-                companyName,
-                contactName: email.split('@')[0].replace(/[._]/g, ' '),
-                contactEmail: email,
-            };
-            sessionStorage.setItem('portal-customer', JSON.stringify(profile));
-            setCustomer(profile);
-        } catch (err: any) {
-            setError(err.message || 'Login failed');
-        } finally {
-            setLoading(false);
-        }
+function accountToProfile(account: AccountInfo): CustomerProfile {
+    const claims = account.idTokenClaims as Record<string, unknown> | undefined;
+
+    return {
+        companyName:
+            (claims?.extension_CompanyName as string) ??
+            (claims?.company as string) ??
+            account.tenantId,
+        contactName: account.name ?? account.username,
+        contactEmail: account.username,
+    };
+}
+
+function AuthContextInner({ children }: { children: ReactNode }) {
+    const { instance, inProgress, accounts } = useMsal();
+    const isAuthenticated = useIsAuthenticated();
+
+    const customer = useMemo<CustomerProfile | null>(() => {
+        const account = accounts[0];
+        if (!account) return null;
+        return accountToProfile(account);
+    }, [accounts]);
+
+    const loading = inProgress !== InteractionStatus.None;
+
+    const login = async () => {
+        await instance.loginRedirect(loginRequest);
     };
 
     const logout = () => {
-        sessionStorage.removeItem('portal-customer');
-        setCustomer(null);
+        instance.logoutRedirect({ postLogoutRedirectUri: msalConfig.auth.redirectUri });
     };
 
     return (
-        <AuthContext.Provider value={{
-            customer,
-            isAuthenticated: !!customer,
-            login,
-            logout,
-            loading,
-            error,
-        }}>
+        <AuthContext.Provider
+            value={{
+                customer,
+                isAuthenticated,
+                login,
+                logout,
+                loading,
+                error: null,
+            }}
+        >
             {children}
         </AuthContext.Provider>
+    );
+}
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+    return (
+        <MsalProvider instance={msalInstance}>
+            <AuthContextInner>{children}</AuthContextInner>
+        </MsalProvider>
     );
 }
