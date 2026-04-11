@@ -1,17 +1,13 @@
 import { type Configuration, LogLevel } from '@azure/msal-browser';
 
-const tenantName = import.meta.env.VITE_AZURE_B2C_TENANT_NAME;
-const clientId = import.meta.env.VITE_AZURE_B2C_CLIENT_ID;
-const signUpSignInPolicy = import.meta.env.VITE_AZURE_B2C_SIGNUP_SIGNIN_POLICY;
-const redirectUri = import.meta.env.VITE_AZURE_B2C_REDIRECT_URI;
-
-const b2cAuthority = `https://${tenantName}.b2clogin.com/${tenantName}.onmicrosoft.com/${signUpSignInPolicy}`;
+const clientId = import.meta.env.VITE_AZURE_CLIENT_ID;
+const tenantId = import.meta.env.VITE_AZURE_TENANT_ID;
+const redirectUri = import.meta.env.VITE_AZURE_REDIRECT_URI;
 
 export const msalConfig: Configuration = {
     auth: {
         clientId,
-        authority: b2cAuthority,
-        knownAuthorities: [`${tenantName}.b2clogin.com`],
+        authority: `https://login.microsoftonline.com/${tenantId}`,
         redirectUri,
         postLogoutRedirectUri: redirectUri,
     },
