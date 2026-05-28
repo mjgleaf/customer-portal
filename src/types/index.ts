@@ -28,6 +28,15 @@ export interface ProjectFile {
   mime_type: string | null
   uploaded_by: string | null
   created_at: string
+  kind?: string
+  document_request_id?: string | null
+}
+
+export interface DocumentRequest {
+  id: string
+  project_id: string
+  label: string
+  created_at: string
 }
 
 export interface ProjectMember {

@@ -1,9 +1,9 @@
 import { useEffect, useState, useRef, type ChangeEvent } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink } from 'lucide-react'
+import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
-import type { Project, ProjectFile, ProjectMember, Profile, Invoice } from '../types'
+import type { Project, ProjectFile, ProjectMember, Profile, Invoice, DocumentRequest } from '../types'
 
 function formatBytes(bytes: number | null): string {
   if (!bytes) return '—'
@@ -44,15 +44,20 @@ const statusLabels: Record<Project['status'], string> = {
   completed: 'Completed',
 }
 
+type TabKey = 'documents' | 'certificates' | 'invoices' | 'members'
+
 export default function ProjectPage() {
   const { id } = useParams<{ id: string }>()
   const { user, profile } = useAuth()
   const navigate = useNavigate()
   const isAdmin = profile?.role === 'admin'
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const uploadCtx = useRef<{ kind: string; requirementId: string | null }>({ kind: 'general', requirementId: null })
 
   const [project, setProject] = useState<Project | null>(null)
   const [files, setFiles] = useState<ProjectFile[]>([])
+  const [documentRequests, setDocumentRequests] = useState<DocumentRequest[]>([])
+  const [newRequirement, setNewRequirement] = useState('')
   const [invoices, setInvoices] = useState<Invoice[]>([])
   const [openingInvoice, setOpeningInvoice] = useState<string | null>(null)
   const [invoiceError, setInvoiceError] = useState('')
@@ -61,7 +66,7 @@ export default function ProjectPage() {
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState('')
-  const [activeTab, setActiveTab] = useState<'files' | 'invoices' | 'members'>('files')
+  const [activeTab, setActiveTab] = useState<TabKey>('documents')
 
   const [editing, setEditing] = useState(false)
   const [editName, setEditName] = useState('')
@@ -75,6 +80,7 @@ export default function ProjectPage() {
     if (!id) return
     fetchProject()
     fetchFiles()
+    fetchDocumentRequests()
     if (isAdmin) {
       fetchMembers()
       fetchAvailableProfiles()
@@ -98,7 +104,16 @@ export default function ProjectPage() {
       .select('*')
       .eq('project_id', id)
       .order('created_at', { ascending: false })
-    setFiles(data ?? [])
+    setFiles((data ?? []) as ProjectFile[])
+  }
+
+  async function fetchDocumentRequests() {
+    const { data } = await supabase
+      .from('document_requests')
+      .select('*')
+      .eq('project_id', id)
+      .order('created_at', { ascending: true })
+    setDocumentRequests((data ?? []) as DocumentRequest[])
   }
 
   async function fetchInvoices(customerId: string | null) {
@@ -164,19 +179,28 @@ export default function ProjectPage() {
     setAvailableProfiles((allProfiles ?? []).filter(p => !memberIds.has(p.id)))
   }
 
-  async function handleFileUpload(e: ChangeEvent<HTMLInputElement>) {
+  // --- Uploads (shared input, driven by uploadCtx) ---
+  function triggerUpload(ctx: { kind: string; requirementId: string | null }) {
+    uploadCtx.current = ctx
+    fileInputRef.current?.click()
+  }
+
+  async function handleFileInput(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
-    if (!file || !id || !user) return
+    if (file) await uploadFile(file, uploadCtx.current)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  async function uploadFile(file: File, ctx: { kind: string; requirementId: string | null }) {
+    if (!id || !user) return
     setUploading(true)
     setUploadError('')
 
     const storagePath = `${id}/${Date.now()}_${file.name}`
     const { error: storageError } = await supabase.storage.from('project-files').upload(storagePath, file)
-
     if (storageError) {
       setUploadError(storageError.message)
       setUploading(false)
-      if (fileInputRef.current) fileInputRef.current.value = ''
       return
     }
 
@@ -187,16 +211,16 @@ export default function ProjectPage() {
       size: file.size,
       mime_type: file.type,
       uploaded_by: user.id,
+      kind: ctx.kind,
+      document_request_id: ctx.requirementId,
     })
 
-    // Fire-and-forget email notification (admin upload -> customer; customer upload -> team)
     void supabase.functions.invoke('notify-upload', {
       body: { projectId: id, fileName: file.name, portalUrl: window.location.origin },
     }).catch(() => { /* best-effort */ })
 
-    fetchFiles()
+    await fetchFiles()
     setUploading(false)
-    if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
   async function handleDownload(file: ProjectFile) {
@@ -214,6 +238,19 @@ export default function ProjectPage() {
     await supabase.storage.from('project-files').remove([file.storage_path])
     await supabase.from('files').delete().eq('id', file.id)
     fetchFiles()
+  }
+
+  async function addRequirement() {
+    const label = newRequirement.trim()
+    if (!label || !id) return
+    await supabase.from('document_requests').insert({ project_id: id, label })
+    setNewRequirement('')
+    fetchDocumentRequests()
+  }
+
+  async function deleteRequirement(reqId: string) {
+    await supabase.from('document_requests').delete().eq('id', reqId)
+    fetchDocumentRequests()
   }
 
   async function handleSaveEdit() {
@@ -253,12 +290,24 @@ export default function ProjectPage() {
 
   if (!project) return null
 
-  const tabList: Array<'files' | 'invoices' | 'members'> = isAdmin
-    ? ['files', 'invoices', 'members']
-    : ['files', 'invoices']
+  const tabList: TabKey[] = isAdmin
+    ? ['documents', 'certificates', 'invoices', 'members']
+    : ['documents', 'certificates', 'invoices']
+
+  const certificates = files.filter(f => f.kind === 'certificate')
+  const generalDocs = files.filter(f => f.kind !== 'certificate' && !f.document_request_id)
+  const fileByRequirement = new Map<string, ProjectFile>()
+  for (const f of files) {
+    if (f.document_request_id && !fileByRequirement.has(f.document_request_id)) {
+      fileByRequirement.set(f.document_request_id, f)
+    }
+  }
 
   return (
     <div className="p-8 max-w-4xl mx-auto">
+      {/* Shared hidden file input for all uploads */}
+      <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileInput} />
+
       <Link to="/" className="inline-flex items-center gap-2 text-gray-500 hover:text-gray-700 text-sm mb-6 transition-colors">
         <ArrowLeft size={16} />
         Back to Dashboard
@@ -337,41 +386,169 @@ export default function ProjectPage() {
         ))}
       </div>
 
-      {/* Files tab */}
-      {activeTab === 'files' && (
-        <div className="bg-white border border-gray-200 rounded-xl">
-          <div className="flex items-center justify-between p-5 border-b border-gray-100">
-            <h2 className="font-semibold text-gray-900">Files</h2>
-            <div>
-              <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileUpload} />
+      {/* Documents tab */}
+      {activeTab === 'documents' && (
+        <div className="space-y-6">
+          {/* Required documents checklist */}
+          <div className="bg-white border border-gray-200 rounded-xl">
+            <div className="flex items-center gap-2 p-5 border-b border-gray-100">
+              <ClipboardList size={18} className="text-gray-400" />
+              <h2 className="font-semibold text-gray-900">Required documents</h2>
+            </div>
+
+            {documentRequests.length === 0 ? (
+              <div className="px-5 py-6 text-sm text-gray-500">
+                {isAdmin ? 'Add the documents you need from this customer below.' : 'No documents have been requested yet.'}
+              </div>
+            ) : (
+              <div className="divide-y divide-gray-50">
+                {documentRequests.map(req => {
+                  const f = fileByRequirement.get(req.id)
+                  return (
+                    <div key={req.id} className="flex items-center justify-between px-5 py-3.5">
+                      <div className="flex items-center gap-3 min-w-0">
+                        {f
+                          ? <Check size={18} className="text-green-600 flex-shrink-0" />
+                          : <div className="w-[18px] h-[18px] rounded-full border-2 border-gray-300 flex-shrink-0" />}
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium text-gray-900 truncate">{req.label}</p>
+                          {f
+                            ? <p className="text-xs text-gray-400 truncate">{f.name} · {formatDate(f.created_at)}</p>
+                            : <p className="text-xs text-amber-600">Awaiting upload</p>}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                        {f && (
+                          <button onClick={() => handleDownload(f)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                            <Download size={16} />
+                          </button>
+                        )}
+                        <button
+                          onClick={() => triggerUpload({ kind: 'general', requirementId: req.id })}
+                          disabled={uploading}
+                          className="text-xs font-semibold text-blue-600 hover:text-blue-700 px-2 py-1 disabled:opacity-50"
+                        >
+                          {f ? 'Replace' : 'Upload'}
+                        </button>
+                        {isAdmin && (
+                          <button onClick={() => deleteRequirement(req.id)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Remove requirement">
+                            <Trash2 size={16} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
+            {isAdmin && (
+              <div className="flex gap-2 p-4 border-t border-gray-100">
+                <input
+                  value={newRequirement}
+                  onChange={e => setNewRequirement(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && addRequirement()}
+                  placeholder="e.g. Rigging drawing"
+                  className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <button onClick={addRequirement} disabled={!newRequirement.trim()} className="flex items-center gap-1 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors">
+                  <Plus size={15} /> Add
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Other documents */}
+          <div className="bg-white border border-gray-200 rounded-xl">
+            <div className="flex items-center justify-between p-5 border-b border-gray-100">
+              <h2 className="font-semibold text-gray-900">Other documents</h2>
               <button
-                onClick={() => fileInputRef.current?.click()}
+                onClick={() => triggerUpload({ kind: 'general', requirementId: null })}
                 disabled={uploading}
                 className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
               >
                 <Upload size={15} />
-                {uploading ? 'Uploading...' : 'Upload File'}
+                {uploading ? 'Uploading...' : 'Upload'}
               </button>
             </div>
+
+            {uploadError && (
+              <div className="mx-5 mt-4 bg-red-50 text-red-600 text-sm px-3 py-2 rounded-lg">{uploadError}</div>
+            )}
+
+            {generalDocs.length === 0 ? (
+              <div className="text-center py-14">
+                <FileText className="mx-auto text-gray-300 mb-3" size={40} />
+                <p className="text-gray-500 text-sm font-medium">No other documents</p>
+                <p className="text-gray-400 text-xs mt-1">Upload drawings, POs, load-test info, etc.</p>
+              </div>
+            ) : (
+              <div className="divide-y divide-gray-50">
+                {generalDocs.map(file => (
+                  <div key={file.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
+                        <FileText size={16} className="text-blue-500" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-gray-900 truncate">{file.name}</p>
+                        <p className="text-xs text-gray-400">{formatBytes(file.size)} · {formatDate(file.created_at)}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                      <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                        <Download size={16} />
+                      </button>
+                      {(isAdmin || file.uploaded_by === user?.id) && (
+                        <button onClick={() => handleDeleteFile(file)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete">
+                          <Trash2 size={16} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Certificates tab */}
+      {activeTab === 'certificates' && (
+        <div className="bg-white border border-gray-200 rounded-xl">
+          <div className="flex items-center justify-between p-5 border-b border-gray-100">
+            <h2 className="font-semibold text-gray-900">Certificates &amp; reports</h2>
+            {isAdmin && (
+              <button
+                onClick={() => triggerUpload({ kind: 'certificate', requirementId: null })}
+                disabled={uploading}
+                className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                <Upload size={15} />
+                {uploading ? 'Uploading...' : 'Upload certificate'}
+              </button>
+            )}
           </div>
 
           {uploadError && (
             <div className="mx-5 mt-4 bg-red-50 text-red-600 text-sm px-3 py-2 rounded-lg">{uploadError}</div>
           )}
 
-          {files.length === 0 ? (
+          {certificates.length === 0 ? (
             <div className="text-center py-14">
-              <FileText className="mx-auto text-gray-300 mb-3" size={40} />
-              <p className="text-gray-500 text-sm font-medium">No files yet</p>
-              <p className="text-gray-400 text-xs mt-1">Click "Upload File" to add documents</p>
+              <Award className="mx-auto text-gray-300 mb-3" size={40} />
+              <p className="text-gray-500 text-sm font-medium">No certificates yet</p>
+              <p className="text-gray-400 text-xs mt-1">
+                {isAdmin ? 'Upload the proof-load test report here when it\'s ready.' : 'Your test reports will appear here once issued.'}
+              </p>
             </div>
           ) : (
             <div className="divide-y divide-gray-50">
-              {files.map(file => (
+              {certificates.map(file => (
                 <div key={file.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
-                      <FileText size={16} className="text-blue-500" />
+                    <div className="w-9 h-9 bg-green-50 rounded-lg flex items-center justify-center flex-shrink-0">
+                      <Award size={16} className="text-green-600" />
                     </div>
                     <div className="min-w-0">
                       <p className="text-sm font-medium text-gray-900 truncate">{file.name}</p>
@@ -379,19 +556,11 @@ export default function ProjectPage() {
                     </div>
                   </div>
                   <div className="flex items-center gap-1 ml-4 flex-shrink-0">
-                    <button
-                      onClick={() => handleDownload(file)}
-                      className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                      title="Download"
-                    >
+                    <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
                       <Download size={16} />
                     </button>
-                    {(isAdmin || file.uploaded_by === user?.id) && (
-                      <button
-                        onClick={() => handleDeleteFile(file)}
-                        className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                        title="Delete"
-                      >
+                    {isAdmin && (
+                      <button onClick={() => handleDeleteFile(file)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete">
                         <Trash2 size={16} />
                       </button>
                     )}
