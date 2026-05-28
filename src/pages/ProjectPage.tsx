@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, type ChangeEvent } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt } from 'lucide-react'
+import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import type { Project, ProjectFile, ProjectMember, Profile, Invoice } from '../types'
@@ -54,6 +54,8 @@ export default function ProjectPage() {
   const [project, setProject] = useState<Project | null>(null)
   const [files, setFiles] = useState<ProjectFile[]>([])
   const [invoices, setInvoices] = useState<Invoice[]>([])
+  const [openingInvoice, setOpeningInvoice] = useState<string | null>(null)
+  const [invoiceError, setInvoiceError] = useState('')
   const [members, setMembers] = useState<ProjectMember[]>([])
   const [availableProfiles, setAvailableProfiles] = useState<Profile[]>([])
   const [loading, setLoading] = useState(true)
@@ -109,12 +111,50 @@ export default function ProjectPage() {
     setInvoices((data ?? []) as Invoice[])
   }
 
+  async function viewInvoice(inv: Invoice) {
+    setOpeningInvoice(inv.id)
+    setInvoiceError('')
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/invoice-pdf`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session?.access_token ?? ''}`,
+          apikey: import.meta.env.VITE_SUPABASE_ANON_KEY as string,
+        },
+        body: JSON.stringify({ invoiceId: inv.id }),
+      })
+      if (!res.ok) {
+        let msg = 'Could not open this invoice.'
+        try { const j = await res.json(); if (j?.error) msg = j.error } catch { /* response was not json */ }
+        setInvoiceError(msg)
+        return
+      }
+      const blob = await res.blob()
+      window.open(URL.createObjectURL(blob), '_blank')
+    } catch {
+      setInvoiceError('Could not open this invoice.')
+    } finally {
+      setOpeningInvoice(null)
+    }
+  }
+
   async function fetchMembers() {
-    const { data } = await supabase
+    const { data: rows } = await supabase
       .from('project_members')
-      .select('*, profile:profiles(*)')
+      .select('id, project_id, user_id, created_at')
       .eq('project_id', id)
-    setMembers((data ?? []) as ProjectMember[])
+    const list = rows ?? []
+    if (list.length === 0) { setMembers([]); return }
+    // project_members.user_id points at auth.users, not profiles, so we can't
+    // embed the profile directly — fetch profiles separately and merge.
+    const { data: profs } = await supabase
+      .from('profiles')
+      .select('*')
+      .in('id', list.map(r => r.user_id))
+    const byId = new Map((profs ?? []).map(p => [p.id, p]))
+    setMembers(list.map(r => ({ ...r, profile: byId.get(r.user_id) })) as ProjectMember[])
   }
 
   async function fetchAvailableProfiles() {
@@ -148,6 +188,11 @@ export default function ProjectPage() {
       mime_type: file.type,
       uploaded_by: user.id,
     })
+
+    // Fire-and-forget email notification (admin upload -> customer; customer upload -> team)
+    void supabase.functions.invoke('notify-upload', {
+      body: { projectId: id, fileName: file.name, portalUrl: window.location.origin },
+    }).catch(() => { /* best-effort */ })
 
     fetchFiles()
     setUploading(false)
@@ -365,6 +410,10 @@ export default function ProjectPage() {
             <h2 className="font-semibold text-gray-900">Invoices</h2>
           </div>
 
+          {invoiceError && (
+            <div className="mx-5 mt-4 bg-red-50 text-red-600 text-sm px-3 py-2 rounded-lg">{invoiceError}</div>
+          )}
+
           {invoices.length === 0 ? (
             <div className="text-center py-14">
               <Receipt className="mx-auto text-gray-300 mb-3" size={40} />
@@ -374,7 +423,14 @@ export default function ProjectPage() {
           ) : (
             <div className="divide-y divide-gray-50">
               {invoices.map(inv => (
-                <div key={inv.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
+                <button
+                  key={inv.id}
+                  type="button"
+                  onClick={() => viewInvoice(inv)}
+                  disabled={openingInvoice === inv.id}
+                  title="View invoice PDF"
+                  className="w-full text-left flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors disabled:opacity-60"
+                >
                   <div className="flex items-center gap-3 min-w-0">
                     <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
                       <Receipt size={16} className="text-blue-500" />
@@ -397,8 +453,11 @@ export default function ProjectPage() {
                     <span className={`text-xs font-semibold px-2.5 py-1 rounded-full capitalize ${invoiceStatusColor(inv.status)}`}>
                       {inv.status ? inv.status.replace(/_/g, ' ') : '—'}
                     </span>
+                    {openingInvoice === inv.id
+                      ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600" />
+                      : <ExternalLink size={16} className="text-gray-400" />}
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           )}

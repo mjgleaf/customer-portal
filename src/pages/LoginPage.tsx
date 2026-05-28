@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 
 export default function LoginPage() {
@@ -24,11 +24,8 @@ export default function LoginPage() {
     <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl shadow-sm border border-gray-200 w-full max-w-md p-8">
         <div className="text-center mb-8">
-          <div className="w-12 h-12 bg-blue-600 rounded-xl flex items-center justify-center mx-auto mb-4">
-            <span className="text-white font-bold text-lg">CP</span>
-          </div>
-          <h1 className="text-2xl font-bold text-gray-900">Client Portal</h1>
-          <p className="text-gray-500 text-sm mt-1">Sign in to access your projects</p>
+          <img src="/logo.png" alt="Hydro-Wates" className="h-16 w-auto mx-auto mb-4" />
+          <p className="text-gray-500 text-sm mt-1">Sign in to your customer portal</p>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -67,6 +64,9 @@ export default function LoginPage() {
           >
             {loading ? 'Signing in...' : 'Sign in'}
           </button>
+          <Link to="/forgot-password" className="block text-center text-sm text-blue-600 hover:text-blue-700">
+            Forgot password?
+          </Link>
         </form>
       </div>
     </div>

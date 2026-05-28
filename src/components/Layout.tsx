@@ -9,15 +9,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex h-screen bg-gray-50">
       <aside className="w-64 bg-slate-800 flex flex-col flex-shrink-0">
-        <div className="p-6 border-b border-slate-700">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center text-white font-bold text-sm">
-              CP
-            </div>
-            <span className="text-white font-semibold">Client Portal</span>
+        <div className="p-4 border-b border-slate-700">
+          <div className="bg-white rounded-lg p-3 flex items-center justify-center">
+            <img src="/logo.png" alt="Hydro-Wates" className="h-10 w-auto" />
           </div>
           {profile?.company && (
-            <p className="text-slate-400 text-xs mt-2 ml-11">{profile.company}</p>
+            <p className="text-slate-400 text-xs mt-2">{profile.company}</p>
           )}
         </div>
 

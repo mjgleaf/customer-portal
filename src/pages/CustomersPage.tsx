@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Link } from 'react-router-dom'
 import { Users, Search, Mail, Check } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
@@ -95,11 +95,11 @@ export default function CustomersPage() {
           ) : filtered.map(c => {
             const invited = c.email ? invitedEmails.has(c.email.toLowerCase()) : false
             return (
-              <div key={c.id} className="flex items-center justify-between px-5 py-3.5">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-gray-900 truncate">{c.company || c.name || 'Unnamed customer'}</p>
+              <div key={c.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
+                <Link to={`/customers/${c.id}`} className="min-w-0 flex-1 group">
+                  <p className="text-sm font-medium text-gray-900 truncate group-hover:text-blue-600 transition-colors">{c.company || c.name || 'Unnamed customer'}</p>
                   <p className="text-xs text-gray-400 truncate">{c.email || 'No email on file'}</p>
-                </div>
+                </Link>
                 <div className="ml-4 flex-shrink-0">
                   {!c.email ? (
                     <span className="text-xs text-gray-400">No email</span>

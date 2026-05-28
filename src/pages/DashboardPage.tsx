@@ -114,7 +114,7 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">{isAdmin ? 'All Projects' : 'Your Projects'}</h1>
           <p className="text-gray-500 text-sm mt-1">
-            {isAdmin ? 'Manage all client projects' : 'Access your project files and documents'}
+            {isAdmin ? 'Manage all customer projects' : 'Access your project files and documents'}
           </p>
         </div>
         {isAdmin && (

@@ -3,6 +3,9 @@
 // center) and upserts them into Supabase. Uses the service-role key, so it
 // bypasses RLS when writing. Callable by an admin (manual button) or by the
 // scheduled cron (which authenticates with the service-role key).
+//
+// Also sends notification emails via Resend on genuinely-new invoices and on
+// project status changes (best-effort; skipped if RESEND_API_KEY is unset).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -64,6 +67,33 @@ function toIso(v: unknown): string | null {
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+function money(amount: unknown, currency: string | null): string {
+  const n = Number(amount);
+  if (isNaN(n)) return String(amount ?? "");
+  try {
+    return new Intl.NumberFormat("en-US", { style: "currency", currency: currency || "USD" }).format(n);
+  } catch {
+    return String(n);
+  }
+}
+
+// Send an email via Resend. Best-effort: no-op if RESEND_API_KEY is unset.
+async function sendEmail(to: string | null | undefined, subject: string, html: string) {
+  const apiKey = Deno.env.get("RESEND_API_KEY");
+  if (!apiKey || !to) return;
+  const from = Deno.env.get("NOTIFY_FROM") || "Hydro-Wates Portal <onboarding@resend.dev>";
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from, to: [to], subject, html }),
+    });
+    if (!res.ok) console.error("Resend error:", await res.text());
+  } catch (e) {
+    console.error("Resend send failed:", e);
+  }
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
@@ -103,10 +133,15 @@ Deno.serve(async (req) => {
       if (error) throw error;
     }
 
-    const { data: custList } = await admin.from("customers").select("id, zoho_contact_id");
+    const { data: custList } = await admin.from("customers").select("id, zoho_contact_id, email");
     const custMap = new Map((custList ?? []).map((c) => [c.zoho_contact_id, c.id]));
+    const custEmail = new Map((custList ?? []).map((c) => [c.id, c.email]));
 
-    // 2) Projects
+    // 2) Projects — capture existing statuses first so we can detect changes
+    const { data: existingProjects } = await admin
+      .from("projects").select("zoho_project_id, status").not("zoho_project_id", "is", null);
+    const oldStatus = new Map((existingProjects ?? []).map((p) => [p.zoho_project_id, p.status]));
+
     const projects = await fetchAll("projects", "projects", accessToken, orgId);
     const projectRows = projects.map((p) => ({
       zoho_project_id: String(p.project_id),
@@ -122,11 +157,28 @@ Deno.serve(async (req) => {
       if (error) throw error;
     }
 
+    // Email customers whose project status changed
+    for (const p of projects) {
+      const newStatus = mapProjectStatus(p.status);
+      const prev = oldStatus.get(String(p.project_id));
+      if (prev !== undefined && prev !== newStatus) {
+        const email = custEmail.get(custMap.get(String(p.customer_id)) ?? "");
+        await sendEmail(
+          email,
+          `Project status updated: ${p.project_name}`,
+          `<p>The status of your project <strong>${p.project_name}</strong> is now <strong>${newStatus}</strong>.</p>`,
+        );
+      }
+    }
+
     const { data: projList } = await admin
       .from("projects").select("id, zoho_project_id").not("zoho_project_id", "is", null);
     const projMap = new Map((projList ?? []).map((p) => [p.zoho_project_id, p.id]));
 
-    // 3) Invoices
+    // 3) Invoices — capture existing ids first so we can detect new ones
+    const { data: existingInvoices } = await admin.from("invoices").select("zoho_invoice_id");
+    const existingInvIds = new Set((existingInvoices ?? []).map((i) => i.zoho_invoice_id));
+
     const invoices = await fetchAll("invoices", "invoices", accessToken, orgId);
     const invoiceRows = invoices.map((inv) => ({
       zoho_invoice_id: String(inv.invoice_id),
@@ -143,6 +195,18 @@ Deno.serve(async (req) => {
     if (invoiceRows.length) {
       const { error } = await admin.from("invoices").upsert(invoiceRows, { onConflict: "zoho_invoice_id" });
       if (error) throw error;
+    }
+
+    // Email customers about genuinely-new invoices
+    for (const inv of invoices) {
+      if (!existingInvIds.has(String(inv.invoice_id))) {
+        const email = custEmail.get(custMap.get(String(inv.customer_id)) ?? "");
+        await sendEmail(
+          email,
+          `New invoice ${inv.invoice_number ?? ""}`.trim(),
+          `<p>A new invoice <strong>${inv.invoice_number ?? ""}</strong> for <strong>${money(inv.total, inv.currency_code)}</strong> is now available in your portal.</p>`,
+        );
+      }
     }
 
     return json({
