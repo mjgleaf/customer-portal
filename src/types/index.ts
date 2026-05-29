@@ -17,6 +17,7 @@ export interface Project {
   started_on?: string | null
   customer_id?: string | null
   customer?: { company: string | null; name: string | null } | null
+  lead_comments?: string | null
 }
 
 export interface ProjectFile {
@@ -30,6 +31,7 @@ export interface ProjectFile {
   created_at: string
   kind?: string
   document_request_id?: string | null
+  retest_due?: string | null
 }
 
 export interface DocumentRequest {

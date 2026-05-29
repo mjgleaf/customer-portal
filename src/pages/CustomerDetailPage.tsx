@@ -5,17 +5,6 @@ import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import type { Customer, Project } from '../types'
 
-const statusColors: Record<Project['status'], string> = {
-  active: 'text-green-700 bg-green-100',
-  'on-hold': 'text-yellow-700 bg-yellow-100',
-  completed: 'text-gray-600 bg-gray-100',
-}
-const statusLabels: Record<Project['status'], string> = {
-  active: 'Active',
-  'on-hold': 'On Hold',
-  completed: 'Completed',
-}
-
 export default function CustomerDetailPage() {
   const { id } = useParams<{ id: string }>()
   const { profile } = useAuth()
@@ -95,9 +84,6 @@ export default function CustomerDetailPage() {
                   </div>
                   <p className="text-sm font-medium text-gray-900 truncate">{p.name}</p>
                 </div>
-                <span className={`text-xs font-semibold px-2.5 py-1 rounded-full flex-shrink-0 ${statusColors[p.status]}`}>
-                  {statusLabels[p.status]}
-                </span>
               </Link>
             ))}
           </div>

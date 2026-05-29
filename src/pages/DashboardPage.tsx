@@ -5,12 +5,6 @@ import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import type { Project } from '../types'
 
-const statusConfig: Record<Project['status'], { label: string; color: string }> = {
-  active: { label: 'Active', color: 'text-green-700 bg-green-100' },
-  'on-hold': { label: 'On Hold', color: 'text-yellow-700 bg-yellow-100' },
-  completed: { label: 'Completed', color: 'text-gray-600 bg-gray-100' },
-}
-
 type SortKey = 'number-desc' | 'number-asc' | 'newest' | 'oldest'
 
 function beganTime(p: Project): number {
@@ -182,18 +176,16 @@ export default function DashboardPage() {
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {visibleProjects.map(project => {
-            const s = statusConfig[project.status]
             return (
               <Link
                 key={project.id}
                 to={`/projects/${project.id}`}
                 className="bg-white border border-gray-200 rounded-xl p-5 hover:shadow-md hover:border-blue-200 transition-all group block"
               >
-                <div className="flex items-start justify-between mb-3">
+                <div className="mb-3">
                   <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center group-hover:bg-blue-100 transition-colors">
                     <FolderOpen size={20} className="text-blue-600" />
                   </div>
-                  <span className={`text-xs font-semibold px-2 py-1 rounded-full ${s.color}`}>{s.label}</span>
                 </div>
                 <h3 className="font-semibold text-gray-900 mb-1">{project.name}</h3>
                 {(project.customer?.company || project.customer?.name) && (

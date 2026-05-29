@@ -32,19 +32,16 @@ function invoiceStatusColor(status: string | null): string {
   return 'text-gray-600 bg-gray-100'
 }
 
-const statusColors: Record<Project['status'], string> = {
-  active: 'text-green-700 bg-green-100',
-  'on-hold': 'text-yellow-700 bg-yellow-100',
-  completed: 'text-gray-600 bg-gray-100',
+// Badge for a certificate's re-test due date (only when overdue or within 30 days).
+function retestInfo(due: string | null | undefined): { label: string; color: string } | null {
+  if (!due) return null
+  const days = Math.ceil((new Date(due + 'T00:00:00').getTime() - Date.now()) / 86400000)
+  if (days < 0) return { label: 'Overdue', color: 'text-red-700 bg-red-100' }
+  if (days <= 30) return { label: days === 0 ? 'Due today' : `Due in ${days}d`, color: 'text-amber-700 bg-amber-100' }
+  return null
 }
 
-const statusLabels: Record<Project['status'], string> = {
-  active: 'Active',
-  'on-hold': 'On Hold',
-  completed: 'Completed',
-}
-
-type TabKey = 'documents' | 'certificates' | 'invoices' | 'members'
+type TabKey ='documents' | 'drawings' | 'certificates' | 'invoices' | 'members'
 
 export default function ProjectPage() {
   const { id } = useParams<{ id: string }>()
@@ -71,7 +68,6 @@ export default function ProjectPage() {
   const [editing, setEditing] = useState(false)
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
-  const [editStatus, setEditStatus] = useState<Project['status']>('active')
 
   const [showAddMember, setShowAddMember] = useState(false)
   const [selectedUserId, setSelectedUserId] = useState('')
@@ -93,7 +89,6 @@ export default function ProjectPage() {
     setProject(data)
     setEditName(data.name)
     setEditDesc(data.description ?? '')
-    setEditStatus(data.status)
     fetchInvoices(data.customer_id ?? null)
     setLoading(false)
   }
@@ -240,6 +235,11 @@ export default function ProjectPage() {
     fetchFiles()
   }
 
+  async function updateRetestDue(fileId: string, due: string | null) {
+    await supabase.from('files').update({ retest_due: due }).eq('id', fileId)
+    fetchFiles()
+  }
+
   async function addRequirement() {
     const label = newRequirement.trim()
     if (!label || !id) return
@@ -258,7 +258,6 @@ export default function ProjectPage() {
     await supabase.from('projects').update({
       name: editName.trim(),
       description: editDesc.trim() || null,
-      status: editStatus,
       updated_at: new Date().toISOString(),
     }).eq('id', project.id)
     setEditing(false)
@@ -291,11 +290,15 @@ export default function ProjectPage() {
   if (!project) return null
 
   const tabList: TabKey[] = isAdmin
-    ? ['documents', 'certificates', 'invoices', 'members']
-    : ['documents', 'certificates', 'invoices']
+    ? ['documents', 'drawings', 'certificates', 'invoices', 'members']
+    : ['documents', 'drawings', 'certificates', 'invoices']
 
   const certificates = files.filter(f => f.kind === 'certificate')
-  const generalDocs = files.filter(f => f.kind !== 'certificate' && !f.document_request_id)
+  const drawings = files.filter(f => f.kind === 'drawing')
+  const poFile = files.find(f => f.kind === 'purchase_order')
+  const generalDocs = files.filter(f =>
+    f.kind !== 'certificate' && f.kind !== 'drawing' && f.kind !== 'purchase_order' && !f.document_request_id
+  )
   const fileByRequirement = new Map<string, ProjectFile>()
   for (const f of files) {
     if (f.document_request_id && !fileByRequirement.has(f.document_request_id)) {
@@ -329,15 +332,6 @@ export default function ProjectPage() {
               className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
               placeholder="Description..."
             />
-            <select
-              value={editStatus}
-              onChange={e => setEditStatus(e.target.value as Project['status'])}
-              className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-            >
-              <option value="active">Active</option>
-              <option value="on-hold">On Hold</option>
-              <option value="completed">Completed</option>
-            </select>
             <div className="flex gap-2">
               <button onClick={handleSaveEdit} className="flex items-center gap-1 bg-blue-600 text-white px-3 py-1.5 rounded-lg text-sm hover:bg-blue-700 transition-colors">
                 <Check size={14} /> Save
@@ -350,12 +344,7 @@ export default function ProjectPage() {
         ) : (
           <div className="flex items-start justify-between">
             <div>
-              <div className="flex items-center gap-3 mb-2">
-                <h1 className="text-2xl font-bold text-gray-900">{project.name}</h1>
-                <span className={`text-xs font-semibold px-2.5 py-1 rounded-full ${statusColors[project.status]}`}>
-                  {statusLabels[project.status]}
-                </span>
-              </div>
+              <h1 className="text-2xl font-bold text-gray-900 mb-2">{project.name}</h1>
               {(project.customer?.company || project.customer?.name) && (
                 <p className="text-blue-600 text-sm font-medium mb-1">{project.customer?.company || project.customer?.name}</p>
               )}
@@ -370,6 +359,14 @@ export default function ProjectPage() {
           </div>
         )}
       </div>
+
+      {/* Lead notes (synced from SharePoint Lead List) */}
+      {project.lead_comments && (
+        <div className="bg-white border border-gray-200 rounded-xl p-5 mb-6">
+          <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">Lead notes</h2>
+          <p className="text-gray-700 text-sm whitespace-pre-wrap">{project.lead_comments}</p>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 mb-6 bg-gray-100 p-1 rounded-lg w-fit">
@@ -396,51 +393,77 @@ export default function ProjectPage() {
               <h2 className="font-semibold text-gray-900">Required documents</h2>
             </div>
 
-            {documentRequests.length === 0 ? (
-              <div className="px-5 py-6 text-sm text-gray-500">
-                {isAdmin ? 'Add the documents you need from this customer below.' : 'No documents have been requested yet.'}
+            <div className="divide-y divide-gray-50">
+              {/* Purchase order — always required */}
+              <div className="flex items-center justify-between px-5 py-3.5">
+                <div className="flex items-center gap-3 min-w-0">
+                  {poFile
+                    ? <Check size={18} className="text-green-600 flex-shrink-0" />
+                    : <div className="w-[18px] h-[18px] rounded-full border-2 border-gray-300 flex-shrink-0" />}
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-gray-900 truncate">
+                      Purchase order <span className="text-xs font-normal text-gray-400">· required</span>
+                    </p>
+                    {poFile
+                      ? <p className="text-xs text-gray-400 truncate">{poFile.name} · {formatDate(poFile.created_at)}</p>
+                      : <p className="text-xs text-amber-600">Awaiting upload</p>}
+                  </div>
+                </div>
+                <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                  {poFile && (
+                    <button onClick={() => handleDownload(poFile)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                      <Download size={16} />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => triggerUpload({ kind: 'purchase_order', requirementId: null })}
+                    disabled={uploading}
+                    className="text-xs font-semibold text-blue-600 hover:text-blue-700 px-2 py-1 disabled:opacity-50"
+                  >
+                    {poFile ? 'Replace' : 'Upload'}
+                  </button>
+                </div>
               </div>
-            ) : (
-              <div className="divide-y divide-gray-50">
-                {documentRequests.map(req => {
-                  const f = fileByRequirement.get(req.id)
-                  return (
-                    <div key={req.id} className="flex items-center justify-between px-5 py-3.5">
-                      <div className="flex items-center gap-3 min-w-0">
+
+              {/* Admin-defined required documents */}
+              {documentRequests.map(req => {
+                const f = fileByRequirement.get(req.id)
+                return (
+                  <div key={req.id} className="flex items-center justify-between px-5 py-3.5">
+                    <div className="flex items-center gap-3 min-w-0">
+                      {f
+                        ? <Check size={18} className="text-green-600 flex-shrink-0" />
+                        : <div className="w-[18px] h-[18px] rounded-full border-2 border-gray-300 flex-shrink-0" />}
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-gray-900 truncate">{req.label}</p>
                         {f
-                          ? <Check size={18} className="text-green-600 flex-shrink-0" />
-                          : <div className="w-[18px] h-[18px] rounded-full border-2 border-gray-300 flex-shrink-0" />}
-                        <div className="min-w-0">
-                          <p className="text-sm font-medium text-gray-900 truncate">{req.label}</p>
-                          {f
-                            ? <p className="text-xs text-gray-400 truncate">{f.name} · {formatDate(f.created_at)}</p>
-                            : <p className="text-xs text-amber-600">Awaiting upload</p>}
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-1 ml-4 flex-shrink-0">
-                        {f && (
-                          <button onClick={() => handleDownload(f)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
-                            <Download size={16} />
-                          </button>
-                        )}
-                        <button
-                          onClick={() => triggerUpload({ kind: 'general', requirementId: req.id })}
-                          disabled={uploading}
-                          className="text-xs font-semibold text-blue-600 hover:text-blue-700 px-2 py-1 disabled:opacity-50"
-                        >
-                          {f ? 'Replace' : 'Upload'}
-                        </button>
-                        {isAdmin && (
-                          <button onClick={() => deleteRequirement(req.id)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Remove requirement">
-                            <Trash2 size={16} />
-                          </button>
-                        )}
+                          ? <p className="text-xs text-gray-400 truncate">{f.name} · {formatDate(f.created_at)}</p>
+                          : <p className="text-xs text-amber-600">Awaiting upload</p>}
                       </div>
                     </div>
-                  )
-                })}
-              </div>
-            )}
+                    <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                      {f && (
+                        <button onClick={() => handleDownload(f)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                          <Download size={16} />
+                        </button>
+                      )}
+                      <button
+                        onClick={() => triggerUpload({ kind: 'general', requirementId: req.id })}
+                        disabled={uploading}
+                        className="text-xs font-semibold text-blue-600 hover:text-blue-700 px-2 py-1 disabled:opacity-50"
+                      >
+                        {f ? 'Replace' : 'Upload'}
+                      </button>
+                      {isAdmin && (
+                        <button onClick={() => deleteRequirement(req.id)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Remove requirement">
+                          <Trash2 size={16} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
 
             {isAdmin && (
               <div className="flex gap-2 p-4 border-t border-gray-100">
@@ -448,7 +471,7 @@ export default function ProjectPage() {
                   value={newRequirement}
                   onChange={e => setNewRequirement(e.target.value)}
                   onKeyDown={e => e.key === 'Enter' && addRequirement()}
-                  placeholder="e.g. Rigging drawing"
+                  placeholder="e.g. Method statement"
                   className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
                 <button onClick={addRequirement} disabled={!newRequirement.trim()} className="flex items-center gap-1 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors">
@@ -513,6 +536,61 @@ export default function ProjectPage() {
         </div>
       )}
 
+      {/* Drawings tab */}
+      {activeTab === 'drawings' && (
+        <div className="bg-white border border-gray-200 rounded-xl">
+          <div className="flex items-center justify-between p-5 border-b border-gray-100">
+            <h2 className="font-semibold text-gray-900">Drawings</h2>
+            <button
+              onClick={() => triggerUpload({ kind: 'drawing', requirementId: null })}
+              disabled={uploading}
+              className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+            >
+              <Upload size={15} />
+              {uploading ? 'Uploading...' : 'Upload drawing'}
+            </button>
+          </div>
+
+          {uploadError && (
+            <div className="mx-5 mt-4 bg-red-50 text-red-600 text-sm px-3 py-2 rounded-lg">{uploadError}</div>
+          )}
+
+          {drawings.length === 0 ? (
+            <div className="text-center py-14">
+              <FileText className="mx-auto text-gray-300 mb-3" size={40} />
+              <p className="text-gray-500 text-sm font-medium">No drawings yet</p>
+              <p className="text-gray-400 text-xs mt-1">Upload rigging or equipment drawings here</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-gray-50">
+              {drawings.map(file => (
+                <div key={file.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
+                      <FileText size={16} className="text-blue-500" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-gray-900 truncate">{file.name}</p>
+                      <p className="text-xs text-gray-400">{formatBytes(file.size)} · {formatDate(file.created_at)}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                    <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                      <Download size={16} />
+                    </button>
+                    {(isAdmin || file.uploaded_by === user?.id) && (
+                      <button onClick={() => handleDeleteFile(file)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete">
+                        <Trash2 size={16} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Certificates tab */}
       {activeTab === 'certificates' && (
         <div className="bg-white border border-gray-200 rounded-xl">
@@ -544,29 +622,48 @@ export default function ProjectPage() {
             </div>
           ) : (
             <div className="divide-y divide-gray-50">
-              {certificates.map(file => (
-                <div key={file.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-9 h-9 bg-green-50 rounded-lg flex items-center justify-center flex-shrink-0">
-                      <Award size={16} className="text-green-600" />
+              {certificates.map(file => {
+                const due = retestInfo(file.retest_due)
+                return (
+                  <div key={file.id} className="flex items-center justify-between gap-3 px-5 py-3.5 hover:bg-gray-50 transition-colors">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-9 h-9 bg-green-50 rounded-lg flex items-center justify-center flex-shrink-0">
+                        <Award size={16} className="text-green-600" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-gray-900 truncate">{file.name}</p>
+                        <p className="text-xs text-gray-400">{formatBytes(file.size)} · {formatDate(file.created_at)}</p>
+                      </div>
                     </div>
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-gray-900 truncate">{file.name}</p>
-                      <p className="text-xs text-gray-400">{formatBytes(file.size)} · {formatDate(file.created_at)}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1 ml-4 flex-shrink-0">
-                    <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
-                      <Download size={16} />
-                    </button>
-                    {isAdmin && (
-                      <button onClick={() => handleDeleteFile(file)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete">
-                        <Trash2 size={16} />
+                    <div className="flex items-center gap-3 flex-shrink-0">
+                      {isAdmin ? (
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs text-gray-400 hidden sm:inline">Re-test due</span>
+                          <input
+                            type="date"
+                            value={file.retest_due ?? ''}
+                            onChange={e => updateRetestDue(file.id, e.target.value || null)}
+                            className="border border-gray-300 rounded-lg px-2 py-1 text-xs text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          />
+                        </div>
+                      ) : (
+                        file.retest_due && <span className="text-xs text-gray-500 whitespace-nowrap">Re-test due {formatDate(file.retest_due)}</span>
+                      )}
+                      {due && (
+                        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full whitespace-nowrap ${due.color}`}>{due.label}</span>
+                      )}
+                      <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                        <Download size={16} />
                       </button>
-                    )}
+                      {isAdmin && (
+                        <button onClick={() => handleDeleteFile(file)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete">
+                          <Trash2 size={16} />
+                        </button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </div>
