@@ -63,6 +63,7 @@ export default function ProjectPage() {
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState('')
+  const [dragZone, setDragZone] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<TabKey>('documents')
 
   const [editing, setEditing] = useState(false)
@@ -181,38 +182,46 @@ export default function ProjectPage() {
   }
 
   async function handleFileInput(e: ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (file) await uploadFile(file, uploadCtx.current)
+    const files = e.target.files
+    if (files && files.length) await uploadFiles(Array.from(files), uploadCtx.current)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  async function uploadFile(file: File, ctx: { kind: string; requirementId: string | null }) {
-    if (!id || !user) return
+  async function uploadFiles(files: File[], ctx: { kind: string; requirementId: string | null }) {
+    if (!id || !user || files.length === 0) return
     setUploading(true)
     setUploadError('')
 
-    const storagePath = `${id}/${Date.now()}_${file.name}`
-    const { error: storageError } = await supabase.storage.from('project-files').upload(storagePath, file)
-    if (storageError) {
-      setUploadError(storageError.message)
-      setUploading(false)
-      return
+    let uploaded = 0
+    for (const file of files) {
+      const storagePath = `${id}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${file.name}`
+      const { error: storageError } = await supabase.storage.from('project-files').upload(storagePath, file)
+      if (storageError) {
+        setUploadError(storageError.message)
+        continue
+      }
+      await supabase.from('files').insert({
+        project_id: id,
+        name: file.name,
+        storage_path: storagePath,
+        size: file.size,
+        mime_type: file.type,
+        uploaded_by: user.id,
+        kind: ctx.kind,
+        document_request_id: ctx.requirementId,
+      })
+      uploaded++
     }
 
-    await supabase.from('files').insert({
-      project_id: id,
-      name: file.name,
-      storage_path: storagePath,
-      size: file.size,
-      mime_type: file.type,
-      uploaded_by: user.id,
-      kind: ctx.kind,
-      document_request_id: ctx.requirementId,
-    })
-
-    void supabase.functions.invoke('notify-upload', {
-      body: { projectId: id, fileName: file.name, portalUrl: window.location.origin },
-    }).catch(() => { /* best-effort */ })
+    if (uploaded > 0) {
+      void supabase.functions.invoke('notify-upload', {
+        body: {
+          projectId: id,
+          fileName: uploaded === 1 ? files[0].name : `${uploaded} files`,
+          portalUrl: window.location.origin,
+        },
+      }).catch(() => { /* best-effort */ })
+    }
 
     await fetchFiles()
     setUploading(false)
@@ -309,7 +318,7 @@ export default function ProjectPage() {
   return (
     <div className="p-8 max-w-4xl mx-auto">
       {/* Shared hidden file input for all uploads */}
-      <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileInput} />
+      <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileInput} />
 
       <Link to="/" className="inline-flex items-center gap-2 text-gray-500 hover:text-gray-700 text-sm mb-6 transition-colors">
         <ArrowLeft size={16} />
@@ -482,7 +491,12 @@ export default function ProjectPage() {
           </div>
 
           {/* Other documents */}
-          <div className="bg-white border border-gray-200 rounded-xl">
+          <div
+            onDragOver={e => { e.preventDefault(); setDragZone('general') }}
+            onDragLeave={() => setDragZone(null)}
+            onDrop={e => { e.preventDefault(); setDragZone(null); const fs = Array.from(e.dataTransfer.files); if (fs.length) uploadFiles(fs, { kind: 'general', requirementId: null }) }}
+            className={`bg-white border rounded-xl transition-colors ${dragZone === 'general' ? 'border-blue-400 ring-2 ring-blue-200' : 'border-gray-200'}`}
+          >
             <div className="flex items-center justify-between p-5 border-b border-gray-100">
               <h2 className="font-semibold text-gray-900">Other documents</h2>
               <button
@@ -491,7 +505,7 @@ export default function ProjectPage() {
                 className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
               >
                 <Upload size={15} />
-                {uploading ? 'Uploading...' : 'Upload'}
+                {uploading ? 'Uploading...' : 'Upload files'}
               </button>
             </div>
 
@@ -503,7 +517,7 @@ export default function ProjectPage() {
               <div className="text-center py-14">
                 <FileText className="mx-auto text-gray-300 mb-3" size={40} />
                 <p className="text-gray-500 text-sm font-medium">No other documents</p>
-                <p className="text-gray-400 text-xs mt-1">Upload drawings, POs, load-test info, etc.</p>
+                <p className="text-gray-400 text-xs mt-1">Click "Upload files" or drag files here</p>
               </div>
             ) : (
               <div className="divide-y divide-gray-50">
@@ -538,7 +552,12 @@ export default function ProjectPage() {
 
       {/* Drawings tab */}
       {activeTab === 'drawings' && (
-        <div className="bg-white border border-gray-200 rounded-xl">
+        <div
+          onDragOver={e => { e.preventDefault(); setDragZone('drawing') }}
+          onDragLeave={() => setDragZone(null)}
+          onDrop={e => { e.preventDefault(); setDragZone(null); const fs = Array.from(e.dataTransfer.files); if (fs.length) uploadFiles(fs, { kind: 'drawing', requirementId: null }) }}
+          className={`bg-white border rounded-xl transition-colors ${dragZone === 'drawing' ? 'border-blue-400 ring-2 ring-blue-200' : 'border-gray-200'}`}
+        >
           <div className="flex items-center justify-between p-5 border-b border-gray-100">
             <h2 className="font-semibold text-gray-900">Drawings</h2>
             <button
@@ -547,7 +566,7 @@ export default function ProjectPage() {
               className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
             >
               <Upload size={15} />
-              {uploading ? 'Uploading...' : 'Upload drawing'}
+              {uploading ? 'Uploading...' : 'Upload drawings'}
             </button>
           </div>
 
@@ -559,7 +578,7 @@ export default function ProjectPage() {
             <div className="text-center py-14">
               <FileText className="mx-auto text-gray-300 mb-3" size={40} />
               <p className="text-gray-500 text-sm font-medium">No drawings yet</p>
-              <p className="text-gray-400 text-xs mt-1">Upload rigging or equipment drawings here</p>
+              <p className="text-gray-400 text-xs mt-1">Click "Upload drawings" or drag files here</p>
             </div>
           ) : (
             <div className="divide-y divide-gray-50">

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { FolderOpen, Plus, RefreshCw, Search } from 'lucide-react'
+import { FolderOpen, Plus, RefreshCw, Search, Award, Receipt, AlertCircle } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import type { Project } from '../types'
@@ -9,6 +9,14 @@ type SortKey = 'number-desc' | 'number-asc' | 'newest' | 'oldest'
 
 function beganTime(p: Project): number {
   return p.started_on ? new Date(p.started_on).getTime() : new Date(p.created_at).getTime()
+}
+
+function money(amount: number, currency: string): string {
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: currency || 'USD', maximumFractionDigits: 0 }).format(amount)
+  } catch {
+    return String(Math.round(amount))
+  }
 }
 
 export default function DashboardPage() {
@@ -24,9 +32,18 @@ export default function DashboardPage() {
   const [syncMsg, setSyncMsg] = useState('')
   const [search, setSearch] = useState('')
   const [sortBy, setSortBy] = useState<SortKey>('number-desc')
+  const [stats, setStats] = useState<{
+    retestDue: number
+    retestOverdue: number
+    outstanding: number
+    currency: string
+  } | null>(null)
+  const [actionItems, setActionItems] = useState<Record<string, number>>({})
 
   useEffect(() => {
-    if (profile) fetchProjects()
+    if (!profile) return
+    fetchProjects()
+    if (profile.role === 'admin') fetchStats()
   }, [profile])
 
   async function fetchProjects() {
@@ -39,7 +56,48 @@ export default function DashboardPage() {
       .select('*, customer:customers(company, name)')
       .order('created_at', { ascending: false })
     setProjects(data ?? [])
+    fetchActionItems((data ?? []).map((p) => p.id))
     setLoading(false)
+  }
+
+  // Count outstanding required documents per project (missing PO + unmet checklist items).
+  async function fetchActionItems(ids: string[]) {
+    if (ids.length === 0) { setActionItems({}); return }
+    const [reqRes, fileRes] = await Promise.all([
+      supabase.from('document_requests').select('id, project_id').in('project_id', ids),
+      supabase.from('files').select('project_id, kind, document_request_id').in('project_id', ids),
+    ])
+    const reqs = reqRes.data ?? []
+    const files = fileRes.data ?? []
+    const result: Record<string, number> = {}
+    for (const pid of ids) {
+      const hasPO = files.some(f => f.project_id === pid && f.kind === 'purchase_order')
+      const fulfilled = new Set(files.filter(f => f.project_id === pid && f.document_request_id).map(f => f.document_request_id))
+      const unmet = reqs.filter(r => r.project_id === pid && !fulfilled.has(r.id)).length
+      result[pid] = (hasPO ? 0 : 1) + unmet
+    }
+    setActionItems(result)
+  }
+
+  async function fetchStats() {
+    const [certRes, invRes] = await Promise.all([
+      supabase.from('files').select('retest_due').eq('kind', 'certificate').not('retest_due', 'is', null),
+      supabase.from('invoices').select('balance, currency_code'),
+    ])
+    let retestDue = 0
+    let retestOverdue = 0
+    for (const c of certRes.data ?? []) {
+      const days = Math.ceil((new Date(c.retest_due + 'T00:00:00').getTime() - Date.now()) / 86400000)
+      if (days < 0) retestOverdue++
+      else if (days <= 30) retestDue++
+    }
+    let outstanding = 0
+    let currency = 'USD'
+    for (const i of invRes.data ?? []) {
+      const b = Number(i.balance)
+      if (!isNaN(b) && b > 0) { outstanding += b; if (i.currency_code) currency = i.currency_code }
+    }
+    setStats({ retestDue, retestOverdue, outstanding, currency })
   }
 
   async function createProject() {
@@ -57,7 +115,6 @@ export default function DashboardPage() {
     setSyncing(true)
     setSyncMsg('')
     const { data, error } = await supabase.functions.invoke('sync-zoho', { body: {} })
-    setSyncing(false)
     if (error) {
       let detail = error.message
       try {
@@ -69,12 +126,22 @@ export default function DashboardPage() {
       } catch {
         // ignore parse errors
       }
+      setSyncing(false)
       setSyncMsg(`Sync failed: ${detail}`)
       return
     }
+    // Also pull SharePoint lead descriptions (best-effort; ignored if not deployed yet)
+    let leadMsg = ''
+    try {
+      const { data: leadData } = await supabase.functions.invoke('sync-leads', { body: {} })
+      if (leadData?.projectsMatched != null) leadMsg = ` · matched ${leadData.projectsMatched} lead notes`
+    } catch {
+      // sync-leads not available
+    }
+    setSyncing(false)
     if (data?.synced) {
       const s = data.synced
-      setSyncMsg(`Synced ${s.customers} customers, ${s.projects} projects, ${s.invoices} invoices.`)
+      setSyncMsg(`Synced ${s.customers} customers, ${s.projects} projects, ${s.invoices} invoices${leadMsg}.`)
       fetchProjects()
     }
   }
@@ -102,6 +169,9 @@ export default function DashboardPage() {
       }
     })
 
+  const totalActionItems = Object.values(actionItems).reduce((a, b) => a + b, 0)
+  const projectsNeedingAction = Object.values(actionItems).filter(n => n > 0).length
+
   return (
     <div className="p-8 max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-8">
@@ -119,7 +189,7 @@ export default function DashboardPage() {
               className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-semibold hover:bg-gray-50 disabled:opacity-50 transition-colors"
             >
               <RefreshCw size={16} className={syncing ? 'animate-spin' : ''} />
-              {syncing ? 'Syncing...' : 'Sync from Zoho'}
+              {syncing ? 'Syncing...' : 'Sync now'}
             </button>
             <button
               onClick={() => setShowCreate(true)}
@@ -131,6 +201,36 @@ export default function DashboardPage() {
           </div>
         )}
       </div>
+      {!isAdmin && totalActionItems > 0 && (
+        <div className="mb-6 flex items-center gap-3 bg-amber-50 border border-amber-200 text-amber-800 rounded-xl px-4 py-3">
+          <AlertCircle size={18} className="flex-shrink-0" />
+          <p className="text-sm font-medium">
+            Action needed — {totalActionItems} document{totalActionItems === 1 ? '' : 's'} to upload across {projectsNeedingAction} project{projectsNeedingAction === 1 ? '' : 's'}.
+          </p>
+        </div>
+      )}
+
+      {isAdmin && stats && (
+        <div className="grid grid-cols-2 gap-4 mb-6 max-w-md">
+          <div className="bg-white border border-gray-200 rounded-xl p-4">
+            <div className="flex items-center gap-2 text-gray-400 mb-1">
+              <Award size={16} />
+              <span className="text-xs font-medium uppercase tracking-wide">Re-tests due</span>
+            </div>
+            <p className={`text-2xl font-bold ${stats.retestOverdue > 0 ? 'text-red-600' : stats.retestDue > 0 ? 'text-amber-600' : 'text-gray-900'}`}>
+              {stats.retestDue + stats.retestOverdue}
+            </p>
+          </div>
+          <div className="bg-white border border-gray-200 rounded-xl p-4">
+            <div className="flex items-center gap-2 text-gray-400 mb-1">
+              <Receipt size={16} />
+              <span className="text-xs font-medium uppercase tracking-wide">Outstanding</span>
+            </div>
+            <p className="text-2xl font-bold text-gray-900">{money(stats.outstanding, stats.currency)}</p>
+          </div>
+        </div>
+      )}
+
       {isAdmin && syncMsg && (
         <div className="mb-6 text-sm px-3 py-2 rounded-lg bg-gray-100 text-gray-700">{syncMsg}</div>
       )}
@@ -172,7 +272,7 @@ export default function DashboardPage() {
           </p>
         </div>
       ) : visibleProjects.length === 0 ? (
-        <div className="text-center py-16 text-gray-500 text-sm">No projects match your search.</div>
+        <div className="text-center py-16 text-gray-500 text-sm">No projects match.</div>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {visibleProjects.map(project => {
@@ -182,10 +282,15 @@ export default function DashboardPage() {
                 to={`/projects/${project.id}`}
                 className="bg-white border border-gray-200 rounded-xl p-5 hover:shadow-md hover:border-blue-200 transition-all group block"
               >
-                <div className="mb-3">
+                <div className="flex items-start justify-between mb-3">
                   <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center group-hover:bg-blue-100 transition-colors">
                     <FolderOpen size={20} className="text-blue-600" />
                   </div>
+                  {(actionItems[project.id] ?? 0) > 0 && (
+                    <span className="text-xs font-semibold px-2 py-1 rounded-full text-amber-700 bg-amber-100">
+                      {actionItems[project.id]} needed
+                    </span>
+                  )}
                 </div>
                 <h3 className="font-semibold text-gray-900 mb-1">{project.name}</h3>
                 {(project.customer?.company || project.customer?.name) && (
