@@ -14,6 +14,9 @@ export default function CustomersPage() {
   const [search, setSearch] = useState('')
   const [invitingId, setInvitingId] = useState<string | null>(null)
   const [msg, setMsg] = useState('')
+  // Confirmation modal before any invite actually fires. Holds the customer
+  // we're about to invite, or null when the modal is closed.
+  const [pendingInvite, setPendingInvite] = useState<Customer | null>(null)
 
   useEffect(() => {
     if (!profile) return
@@ -90,7 +93,7 @@ export default function CustomersPage() {
             <div className="text-center py-14">
               <Users className="mx-auto text-gray-300 mb-3" size={40} />
               <p className="text-gray-500 text-sm font-medium">No customers found</p>
-              <p className="text-gray-400 text-xs mt-1">Run "Sync from Zoho" on the dashboard to pull customers in.</p>
+              <p className="text-gray-400 text-xs mt-1">Customers sync automatically from Zoho each time the dashboard loads.</p>
             </div>
           ) : filtered.map(c => {
             const invited = c.email ? invitedEmails.has(c.email.toLowerCase()) : false
@@ -109,7 +112,7 @@ export default function CustomersPage() {
                     </span>
                   ) : (
                     <button
-                      onClick={() => invite(c)}
+                      onClick={() => setPendingInvite(c)}
                       disabled={invitingId === c.id}
                       className="inline-flex items-center gap-1.5 bg-blue-600 text-white text-sm font-semibold px-3 py-1.5 rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors"
                     >
@@ -120,6 +123,47 @@ export default function CustomersPage() {
               </div>
             )
           })}
+        </div>
+      )}
+
+      {/* Invite confirmation modal — opens before any invite actually fires */}
+      {pendingInvite && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setPendingInvite(null)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-gray-900 mb-1">Send invitation?</h2>
+            <p className="text-sm text-gray-500 mb-4">
+              An invitation email will be sent so this person can set a password and access the Hydro-Wates customer portal.
+            </p>
+
+            <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 mb-5">
+              <p className="text-sm font-medium text-gray-900">{pendingInvite.name || pendingInvite.company || pendingInvite.email}</p>
+              <p className="text-xs text-gray-500 mt-0.5 truncate">{pendingInvite.email}</p>
+              {pendingInvite.company && pendingInvite.name && (
+                <p className="text-xs text-gray-400 mt-0.5">{pendingInvite.company}</p>
+              )}
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setPendingInvite(null)}
+                disabled={invitingId === pendingInvite.id}
+                className="flex-1 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const target = pendingInvite
+                  setPendingInvite(null)
+                  await invite(target)
+                }}
+                disabled={invitingId === pendingInvite.id}
+                className="flex-1 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                Send invitation
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

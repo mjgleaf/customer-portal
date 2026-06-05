@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { LayoutDashboard, LogOut, Users, Menu, X } from 'lucide-react'
+import { LayoutDashboard, LogOut, Users, Menu, X, Settings, Award, Receipt, FilePlus, Inbox } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 
 export default function Layout({ children }: { children: React.ReactNode }) {
@@ -49,21 +49,70 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             <LayoutDashboard size={17} />
             Dashboard
           </Link>
+          {/* Customer-only aggregate views. Admins skip these — they have
+              everything they need inside individual project pages, and the
+              aggregate views would just be very long lists for them. */}
+          {profile?.role !== 'admin' && (
+            <>
+              <Link
+                to="/certificates"
+                onClick={() => setMobileOpen(false)}
+                className={navLinkClass(location.pathname.startsWith('/certificates'))}
+              >
+                <Award size={17} />
+                Certificates
+              </Link>
+              <Link
+                to="/invoices"
+                onClick={() => setMobileOpen(false)}
+                className={navLinkClass(location.pathname.startsWith('/invoices'))}
+              >
+                <Receipt size={17} />
+                Invoices
+              </Link>
+              <Link
+                to="/request-quote"
+                onClick={() => setMobileOpen(false)}
+                className={navLinkClass(location.pathname.startsWith('/request-quote'))}
+              >
+                <FilePlus size={17} />
+                Request Quote
+              </Link>
+            </>
+          )}
           {profile?.role === 'admin' && (
-            <Link
-              to="/customers"
-              onClick={() => setMobileOpen(false)}
-              className={navLinkClass(location.pathname.startsWith('/customers'))}
-            >
-              <Users size={17} />
-              Customers
-            </Link>
+            <>
+              <Link
+                to="/customers"
+                onClick={() => setMobileOpen(false)}
+                className={navLinkClass(location.pathname.startsWith('/customers'))}
+              >
+                <Users size={17} />
+                Customers
+              </Link>
+              <Link
+                to="/quote-requests"
+                onClick={() => setMobileOpen(false)}
+                className={navLinkClass(location.pathname.startsWith('/quote-requests'))}
+              >
+                <Inbox size={17} />
+                Quote Requests
+              </Link>
+            </>
           )}
         </nav>
 
         <div className="p-4 border-t border-slate-700">
           <p className="text-white text-sm font-medium truncate">{profile?.full_name || 'User'}</p>
           <p className="text-slate-400 text-xs truncate mb-3">{profile?.email}</p>
+          <Link
+            to="/account"
+            onClick={() => setMobileOpen(false)}
+            className="flex items-center gap-2 text-slate-400 hover:text-white text-sm transition-colors mb-2"
+          >
+            <Settings size={15} />
+            Account
+          </Link>
           <button
             onClick={signOut}
             className="flex items-center gap-2 text-slate-400 hover:text-white text-sm transition-colors"

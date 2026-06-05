@@ -5,6 +5,7 @@ export interface Profile {
   company: string | null
   role: 'customer' | 'admin'
   created_at: string
+  email_notifications?: boolean
 }
 
 export interface Project {
@@ -16,7 +17,21 @@ export interface Project {
   updated_at: string
   started_on?: string | null
   customer_id?: string | null
-  customer?: { company: string | null; name: string | null } | null
+  customer?: {
+    company: string | null
+    name: string | null
+    email?: string | null
+    shipping_address?: string | null
+    shipping_city?: string | null
+    shipping_state?: string | null
+    shipping_zip?: string | null
+    shipping_country?: string | null
+    billing_address?: string | null
+    billing_city?: string | null
+    billing_state?: string | null
+    billing_zip?: string | null
+    billing_country?: string | null
+  } | null
   lead_comments?: string | null
 }
 
@@ -32,6 +47,13 @@ export interface ProjectFile {
   kind?: string
   document_request_id?: string | null
   retest_due?: string | null
+  sharepoint_synced_at?: string | null
+  sharepoint_path?: string | null
+  sharepoint_error?: string | null
+  // For SharePoint-synced files, the createdDateTime from OneDrive — i.e.
+  // when the file was first added to SharePoint. Null for files uploaded
+  // directly through the portal (use created_at instead).
+  source_created_at?: string | null
 }
 
 export interface DocumentRequest {

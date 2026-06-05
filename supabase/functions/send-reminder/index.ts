@@ -1,9 +1,8 @@
-// Supabase Edge Function: notify-upload
-// Called by the app right after a file is uploaded to a project. Emails the
-// right party via Microsoft Graph (sends as the shared sales@ mailbox):
-//   - admin uploaded   -> notify the project's customer(s)
-//   - customer uploaded -> notify the Hydro-Wates team (ADMIN_NOTIFY_EMAIL)
-// Best-effort; no-op if the Graph mail credentials are unset.
+// Supabase Edge Function: send-reminder
+// Admin clicks "Remind" next to a missing required document on a project.
+// We email the project's customer (and any portal-member profiles) via
+// Microsoft Graph (as the shared sales@ mailbox), nudging them to upload that
+// document. Best-effort; no-op if the Graph mail credentials are unset.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { brandedEmail } from "../_shared/email-template.ts";
@@ -28,9 +27,6 @@ function json(body: unknown, status = 200) {
 // consent + an Application Access Policy scoping the app to sales@. Set
 // dedicated GRAPH_* secrets, or reuse the existing SHAREPOINT_* ones.
 const MAIL_SENDER = Deno.env.get("MAIL_SENDER") || "sales@hydrowates.com";
-// When a customer hits "Reply" in their email client, the reply goes here
-// instead of the sender. We point at the sales@ M365 Group so the whole
-// team sees customer responses, even though sales@ can't be the sender.
 const REPLY_TO = Deno.env.get("EMAIL_REPLY_TO") || "sales@hydrowates.com";
 
 async function graphToken(): Promise<string> {
@@ -63,8 +59,7 @@ async function sendEmail(
   html: string,
 ) {
   // Admin-controlled kill switch via app_settings.emails_paused. Defaults to
-  // paused — the admin flips it active from the portal's Account page when
-  // they're ready to start sending customer emails.
+  // paused — admin flips it active from the portal's Account page.
   const { data: setting } = await admin
     .from("app_settings").select("value").eq("key", "emails_paused").maybeSingle();
   if (setting?.value !== "false") {
@@ -114,35 +109,38 @@ Deno.serve(async (req) => {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const admin = createClient(supabaseUrl, serviceKey);
 
-  // Caller must be a logged-in user.
+  // Caller must be an admin.
   const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "").trim();
   if (!token) return json({ error: "Not authorized" }, 403);
   const { data: { user } } = await admin.auth.getUser(token);
   if (!user) return json({ error: "Not authorized" }, 403);
+  const { data: caller } = await admin.from("profiles").select("role").eq("id", user.id).single();
+  if (caller?.role !== "admin") return json({ error: "Admin only" }, 403);
 
   try {
-    const { projectId, fileName, portalUrl } = await req.json();
-    if (!projectId) return json({ error: "projectId is required" }, 400);
+    const { projectId, documentLabel, documentKey, recipients: explicitRecipients, portalUrl } = await req.json();
+    if (!projectId || !documentLabel) return json({ error: "projectId and documentLabel are required" }, 400);
 
-    const { data: uploader } = await admin
-      .from("profiles").select("role, full_name, email").eq("id", user.id).single();
     const { data: project } = await admin
       .from("projects").select("name, customer_id, description, lead_comments").eq("id", projectId).single();
     if (!project) return json({ error: "Project not found" }, 404);
 
-    const file = fileName || "a file";
-    const projectLink = portalUrl ? `${portalUrl}` : "";
-
-    if (uploader?.role === "admin") {
-      // Notify the project's customer(s) — but respect their email_notifications
-      // preference (true / null = send, false = skip).
-      const recipients = new Set<string>();
+    // Build the recipient set. If the admin explicitly chose recipients in
+    // the confirmation modal, trust their choice — they've already seen the
+    // list and unchecked anyone they didn't want to email. Otherwise fall
+    // back to auto-gather: project's customer + every portal member,
+    // respecting each profile's email_notifications opt-out preference.
+    const recipients = new Set<string>();
+    if (Array.isArray(explicitRecipients) && explicitRecipients.length > 0) {
+      for (const e of explicitRecipients) {
+        if (typeof e === "string" && e.trim()) recipients.add(e.trim());
+      }
+    } else {
       if (project.customer_id) {
         const { data: cust } = await admin.from("customers").select("email").eq("id", project.customer_id).single();
         if (cust?.email) {
-          const { data: custProf } = await admin
-            .from("profiles").select("email, email_notifications").ilike("email", cust.email).maybeSingle();
-          if (!custProf || custProf.email_notifications !== false) recipients.add(cust.email);
+          const { data: prof } = await admin.from("profiles").select("email, email_notifications").ilike("email", cust.email).maybeSingle();
+          if (!prof || prof.email_notifications !== false) recipients.add(cust.email);
         }
       }
       const { data: members } = await admin.from("project_members").select("user_id").eq("project_id", projectId);
@@ -155,39 +153,40 @@ Deno.serve(async (req) => {
           if (p.email && p.email_notifications !== false) recipients.add(p.email);
         }
       }
-      await sendEmail(
-        admin,
-        [...recipients],
-        `New document on ${project.name}`,
-        brandedEmail({
-          preheader: `${file} was just added to your project.`,
-          title: `New document on ${project.name}`,
-          bodyHtml: `<p>A new document <strong>${file}</strong> has been added to your project <strong>${project.name}</strong> by the Hydro-Wates team.</p>
-                     ${renderProjectInfoBlock(project)}`,
-          ctaLabel: projectLink ? "View in portal" : undefined,
-          ctaUrl: projectLink || undefined,
-        }),
-      );
-    } else {
-      // Customer uploaded -> notify the team's sales mailbox.
-      const adminEmail = Deno.env.get("ADMIN_NOTIFY_EMAIL") || "sales@hydrowates.com";
-      const who = uploader?.full_name || uploader?.email || "A customer";
-      await sendEmail(
-        admin,
-        [adminEmail],
-        `Customer uploaded a file to ${project.name}`,
-        brandedEmail({
-          preheader: `${who} uploaded ${file}.`,
-          title: `Customer upload on ${project.name}`,
-          bodyHtml: `<p><strong>${who}</strong> uploaded <strong>${file}</strong> to project <strong>${project.name}</strong>.</p>
-                     ${renderProjectInfoBlock(project)}`,
-          ctaLabel: projectLink ? "Review in portal" : undefined,
-          ctaUrl: projectLink || undefined,
-        }),
-      );
     }
 
-    return json({ ok: true });
+    // Log the reminder intent (admin clicked + confirmed) regardless of
+    // whether an email actually goes out. The frontend reads from this table
+    // to show "Reminded Xd ago" so admins don't double-remind. Delivery is a
+    // separate concern — pause switch on, no recipients, Graph failure all
+    // still constitute "we tried to remind" for UX purposes.
+    await admin.from("reminders").insert({
+      project_id: projectId,
+      document_key: documentKey || documentLabel,
+      document_label: documentLabel,
+      sent_by: user.id,
+    });
+
+    if (recipients.size === 0) return json({ ok: true, sent: 0, note: "No recipients (or all opted out)." });
+
+    await sendEmail(
+      admin,
+      [...recipients],
+      `Reminder: ${documentLabel} still needed for ${project.name}`,
+      brandedEmail({
+        preheader: `${documentLabel} is still needed for ${project.name}.`,
+        title: `Reminder: ${documentLabel} needed`,
+        bodyHtml: `<p>Hi,</p>
+                   <p>This is a friendly reminder that <strong>${documentLabel}</strong> is still needed for your project <strong>${project.name}</strong>.</p>
+                   ${renderProjectInfoBlock(project)}
+                   <p>You can upload it directly through the Hydro-Wates customer portal.</p>`,
+        ctaLabel: portalUrl ? "Upload document" : undefined,
+        ctaUrl: portalUrl || undefined,
+        footnote: "Thanks for keeping your project moving — the Hydro-Wates team.",
+      }),
+    );
+
+    return json({ ok: true, sent: recipients.size });
   } catch (e) {
     return json({ error: String((e as Error)?.message ?? e) }, 500);
   }

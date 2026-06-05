@@ -1,9 +1,12 @@
-// Supabase Edge Function: notify-upload
-// Called by the app right after a file is uploaded to a project. Emails the
-// right party via Microsoft Graph (sends as the shared sales@ mailbox):
-//   - admin uploaded   -> notify the project's customer(s)
-//   - customer uploaded -> notify the Hydro-Wates team (ADMIN_NOTIFY_EMAIL)
-// Best-effort; no-op if the Graph mail credentials are unset.
+// Supabase Edge Function: notify-project-note
+// Fired by the portal whenever a project note is added or updated. We:
+//   1. Authenticate the caller (must already be able to access the project)
+//   2. Identify whether the author is an admin or a customer
+//   3. Email the *other* side via Microsoft Graph:
+//        - admin authored  -> notify project's customer(s) + members
+//        - customer authored -> notify the Hydro-Wates team mailbox
+// Honors the app_settings.emails_paused kill switch and each profile's
+// email_notifications preference.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { brandedEmail } from "../_shared/email-template.ts";
@@ -22,15 +25,16 @@ function json(body: unknown, status = 200) {
   });
 }
 
+function esc(s: unknown): string {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 // --- Microsoft Graph (app-only) email sender -------------------------------
-// Sends as the shared mailbox sales@hydrowates.com using a client-credentials
-// app (the same kind used for SharePoint). Requires Mail.Send (Application)
-// consent + an Application Access Policy scoping the app to sales@. Set
-// dedicated GRAPH_* secrets, or reuse the existing SHAREPOINT_* ones.
 const MAIL_SENDER = Deno.env.get("MAIL_SENDER") || "sales@hydrowates.com";
-// When a customer hits "Reply" in their email client, the reply goes here
-// instead of the sender. We point at the sales@ M365 Group so the whole
-// team sees customer responses, even though sales@ can't be the sender.
 const REPLY_TO = Deno.env.get("EMAIL_REPLY_TO") || "sales@hydrowates.com";
 
 async function graphToken(): Promise<string> {
@@ -62,9 +66,6 @@ async function sendEmail(
   subject: string,
   html: string,
 ) {
-  // Admin-controlled kill switch via app_settings.emails_paused. Defaults to
-  // paused — the admin flips it active from the portal's Account page when
-  // they're ready to start sending customer emails.
   const { data: setting } = await admin
     .from("app_settings").select("value").eq("key", "emails_paused").maybeSingle();
   if (setting?.value !== "false") {
@@ -74,14 +75,8 @@ async function sendEmail(
   const list = to.filter(Boolean);
   if (list.length === 0) return;
   let token: string;
-  try {
-    token = await graphToken();
-  } catch (e) {
-    console.error("Graph token failed:", e);
-    return;
-  }
-  // Send one message per recipient so customers never see each other's
-  // addresses, and one failure doesn't block the rest.
+  try { token = await graphToken(); }
+  catch (e) { console.error("Graph token failed:", e); return; }
   for (const address of list) {
     try {
       const res = await fetch(
@@ -114,35 +109,54 @@ Deno.serve(async (req) => {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const admin = createClient(supabaseUrl, serviceKey);
 
-  // Caller must be a logged-in user.
+  // Caller must be logged in.
   const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "").trim();
-  if (!token) return json({ error: "Not authorized" }, 403);
+  if (!token) return json({ error: "Not authorized" }, 401);
   const { data: { user } } = await admin.auth.getUser(token);
-  if (!user) return json({ error: "Not authorized" }, 403);
+  if (!user) return json({ error: "Not authorized" }, 401);
 
   try {
-    const { projectId, fileName, portalUrl } = await req.json();
+    const { projectId, noteId, isUpdate, portalUrl } = await req.json();
     if (!projectId) return json({ error: "projectId is required" }, 400);
 
-    const { data: uploader } = await admin
-      .from("profiles").select("role, full_name, email").eq("id", user.id).single();
+    // Fetch the project (we'll need name + customer linkage for routing).
     const { data: project } = await admin
       .from("projects").select("name, customer_id, description, lead_comments").eq("id", projectId).single();
     if (!project) return json({ error: "Project not found" }, 404);
 
-    const file = fileName || "a file";
-    const projectLink = portalUrl ? `${portalUrl}` : "";
+    // The calling user is the note author.
+    const { data: authorProfile } = await admin
+      .from("profiles").select("full_name, email, role").eq("id", user.id).single();
+    if (!authorProfile) return json({ error: "Author profile not found" }, 404);
 
-    if (uploader?.role === "admin") {
-      // Notify the project's customer(s) — but respect their email_notifications
-      // preference (true / null = send, false = skip).
-      const recipients = new Set<string>();
+    // Fetch the note content for the email body. If a specific noteId was
+    // passed, use it; otherwise fall back to the most recent note on this
+    // project (covers the "just added" case).
+    let noteContent = "";
+    if (noteId) {
+      const { data: note } = await admin
+        .from("project_notes").select("content").eq("id", noteId).maybeSingle();
+      if (note) noteContent = note.content;
+    } else {
+      const { data: latest } = await admin
+        .from("project_notes").select("content")
+        .eq("project_id", projectId)
+        .order("created_at", { ascending: false })
+        .limit(1).maybeSingle();
+      if (latest) noteContent = latest.content;
+    }
+
+    // Build the recipient set. The author themselves is always excluded.
+    const recipients = new Set<string>();
+    if (authorProfile.role === "admin") {
+      // Admin authored -> notify customer + project members
       if (project.customer_id) {
         const { data: cust } = await admin.from("customers").select("email").eq("id", project.customer_id).single();
-        if (cust?.email) {
-          const { data: custProf } = await admin
-            .from("profiles").select("email, email_notifications").ilike("email", cust.email).maybeSingle();
-          if (!custProf || custProf.email_notifications !== false) recipients.add(cust.email);
+        if (cust?.email && cust.email.toLowerCase() !== authorProfile.email.toLowerCase()) {
+          const { data: prof } = await admin
+            .from("profiles").select("email, email_notifications")
+            .ilike("email", cust.email).maybeSingle();
+          if (!prof || prof.email_notifications !== false) recipients.add(cust.email);
         }
       }
       const { data: members } = await admin.from("project_members").select("user_id").eq("project_id", projectId);
@@ -152,42 +166,37 @@ Deno.serve(async (req) => {
           .select("email, email_notifications")
           .in("id", members.map((m) => m.user_id));
         for (const p of profs ?? []) {
-          if (p.email && p.email_notifications !== false) recipients.add(p.email);
+          if (p.email
+              && p.email_notifications !== false
+              && p.email.toLowerCase() !== authorProfile.email.toLowerCase()) {
+            recipients.add(p.email);
+          }
         }
       }
-      await sendEmail(
-        admin,
-        [...recipients],
-        `New document on ${project.name}`,
-        brandedEmail({
-          preheader: `${file} was just added to your project.`,
-          title: `New document on ${project.name}`,
-          bodyHtml: `<p>A new document <strong>${file}</strong> has been added to your project <strong>${project.name}</strong> by the Hydro-Wates team.</p>
-                     ${renderProjectInfoBlock(project)}`,
-          ctaLabel: projectLink ? "View in portal" : undefined,
-          ctaUrl: projectLink || undefined,
-        }),
-      );
     } else {
-      // Customer uploaded -> notify the team's sales mailbox.
-      const adminEmail = Deno.env.get("ADMIN_NOTIFY_EMAIL") || "sales@hydrowates.com";
-      const who = uploader?.full_name || uploader?.email || "A customer";
-      await sendEmail(
-        admin,
-        [adminEmail],
-        `Customer uploaded a file to ${project.name}`,
-        brandedEmail({
-          preheader: `${who} uploaded ${file}.`,
-          title: `Customer upload on ${project.name}`,
-          bodyHtml: `<p><strong>${who}</strong> uploaded <strong>${file}</strong> to project <strong>${project.name}</strong>.</p>
-                     ${renderProjectInfoBlock(project)}`,
-          ctaLabel: projectLink ? "Review in portal" : undefined,
-          ctaUrl: projectLink || undefined,
-        }),
-      );
+      // Customer authored -> notify the Hydro-Wates team mailbox
+      const teamEmail = Deno.env.get("ADMIN_NOTIFY_EMAIL") || "sales@hydrowates.com";
+      recipients.add(teamEmail);
     }
 
-    return json({ ok: true });
+    if (recipients.size === 0) return json({ ok: true, sent: 0, note: "No recipients (or all opted out)." });
+
+    const authorName = authorProfile.full_name || authorProfile.email || "Someone";
+    const action = isUpdate ? "updated a note" : "added a note";
+    const projectLink = portalUrl ? `${portalUrl}/projects/${projectId}` : "";
+    const subject = `${authorName} ${action} on ${project.name}`;
+    const html = brandedEmail({
+      preheader: `${authorName} ${action} on ${project.name}.`,
+      title: subject,
+      bodyHtml: `<p><strong>${esc(authorName)}</strong> ${action} on project <strong>${esc(project.name)}</strong>:</p>
+                 <blockquote style="border-left:3px solid #d1d5db;padding-left:12px;margin:12px 0;color:#4b5563;white-space:pre-wrap;background:#f9fafb;padding:12px 16px;border-radius:0 6px 6px 0;">${esc(noteContent)}</blockquote>
+                 ${renderProjectInfoBlock(project)}`,
+      ctaLabel: projectLink ? "Open project" : undefined,
+      ctaUrl: projectLink || undefined,
+    });
+
+    await sendEmail(admin, [...recipients], subject, html);
+    return json({ ok: true, sent: recipients.size });
   } catch (e) {
     return json({ error: String((e as Error)?.message ?? e) }, 500);
   }

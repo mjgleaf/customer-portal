@@ -1,6 +1,6 @@
-import { useEffect, useState, useRef, type ChangeEvent } from 'react'
+﻿import { useEffect, useState, useRef, type ChangeEvent } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award } from 'lucide-react'
+import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award, Eye, Send, MessageSquare, Sparkles, MapPin } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import type { Project, ProjectFile, ProjectMember, Profile, Invoice, DocumentRequest } from '../types'
@@ -14,6 +14,19 @@ function formatBytes(bytes: number | null): string {
 
 function formatDate(d: string) {
   return new Date(d).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
+}
+
+// Compact relative time for "Reminded X ago" labels.
+function formatRelativeTime(d: string) {
+  const ms = Date.now() - new Date(d).getTime()
+  const mins = Math.floor(ms / 60000)
+  const hours = Math.floor(mins / 60)
+  const days = Math.floor(hours / 24)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  if (hours < 24) return `${hours}h ago`
+  if (days < 30) return `${days}d ago`
+  return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 }
 
 function formatMoney(amount: number | null, currency: string | null): string {
@@ -41,7 +54,75 @@ function retestInfo(due: string | null | undefined): { label: string; color: str
   return null
 }
 
-type TabKey ='documents' | 'drawings' | 'certificates' | 'invoices' | 'members'
+// Decide how (or whether) we can preview a file inline in the browser.
+function previewKind(file: ProjectFile): 'pdf' | 'image' | 'unsupported' {
+  const name = file.name.toLowerCase()
+  const mime = (file.mime_type ?? '').toLowerCase()
+  if (mime === 'application/pdf' || name.endsWith('.pdf')) return 'pdf'
+  if (mime.startsWith('image/')) return 'image'
+  if (/\.(png|jpe?g|gif|webp|bmp|svg)$/.test(name)) return 'image'
+  return 'unsupported'
+}
+
+// Inline preview modal — shows PDFs in an iframe, images directly, and falls
+// back to a download prompt for anything else (e.g. .docx, .xlsx).
+function FilePreviewModal({ file, url, onClose, onDownload }: {
+  file: ProjectFile
+  url: string
+  onClose: () => void
+  onDownload: () => void
+}) {
+  const kind = previewKind(file)
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl w-full max-w-5xl h-[90vh] flex flex-col shadow-xl" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100 flex-shrink-0">
+          <p className="text-sm font-medium text-gray-900 truncate pr-4">{file.name}</p>
+          <div className="flex items-center gap-1 flex-shrink-0">
+            <button onClick={onDownload} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+              <Download size={18} />
+            </button>
+            <button onClick={onClose} className="p-2 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors" title="Close">
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-hidden bg-gray-100 rounded-b-2xl">
+          {kind === 'pdf' && (
+            <iframe src={url} title={file.name} className="w-full h-full border-0" />
+          )}
+          {kind === 'image' && (
+            <div className="w-full h-full flex items-center justify-center overflow-auto">
+              <img src={url} alt={file.name} className="max-w-full max-h-full object-contain" />
+            </div>
+          )}
+          {kind === 'unsupported' && (
+            <div className="w-full h-full flex flex-col items-center justify-center gap-3 text-gray-500 text-sm">
+              <FileText size={48} className="text-gray-300" />
+              <p>Preview isn't available for this file type.</p>
+              <button onClick={onDownload} className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 transition-colors">
+                <Download size={16} /> Download to open
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+type TabKey ='documents' | 'drawings' | 'certificates' | 'invoices' | 'notes' | 'members'
+
+type ProjectNote = {
+  id: string
+  project_id: string
+  author_id: string
+  content: string
+  created_at: string
+  updated_at: string
+  author?: { full_name: string | null; email: string; role: string } | null
+}
 
 export default function ProjectPage() {
   const { id } = useParams<{ id: string }>()
@@ -64,6 +145,89 @@ export default function ProjectPage() {
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState('')
   const [dragZone, setDragZone] = useState<string | null>(null)
+  const [previewing, setPreviewing] = useState<{ file: ProjectFile; url: string } | null>(null)
+  const [pendingUpload, setPendingUpload] = useState<{
+    files: File[]
+    ctx: { kind: string; requirementId: string | null }
+    notify: boolean
+  } | null>(null)
+  const [uploaderById, setUploaderById] = useState<Record<string, Profile>>({})
+  const [reminderState, setReminderState] = useState<{ key: string; status: 'sending' | 'sent' | 'error' } | null>(null)
+  const [pendingReminder, setPendingReminder] = useState<{ documentLabel: string; key: string } | null>(null)
+  // Map of document_key -> ISO timestamp of the most recent reminder we sent
+  // for that document on this project. Admin-only; populated from the
+  // `reminders` log table on mount and updated optimistically on send.
+  const [lastReminderByKey, setLastReminderByKey] = useState<Record<string, string>>({})
+  // Emails the admin has selected to receive the pending reminder.
+  // Defaults to every eligible recipient (customer + members) when the modal
+  // opens; admin can uncheck individuals before clicking Send reminder.
+  const [selectedReminderEmails, setSelectedReminderEmails] = useState<string[]>([])
+  // Every Zoho customer contact at this project's company, with status info
+  // so the Members tab can show "Member" / "Has account" / "Not signed up"
+  // and let the admin act on each (Invite / Add to project / nothing).
+  type CompanyContact = {
+    customerId: string
+    name: string | null
+    email: string | null
+    status: 'member' | 'has_account' | 'pending'
+    userId?: string
+  }
+  const [companyContacts, setCompanyContacts] = useState<CompanyContact[]>([])
+  const [contactActionId, setContactActionId] = useState<string | null>(null)
+  const [contactActionMsg, setContactActionMsg] = useState<string>('')
+  // Confirmation modal before any company-contact invite actually fires.
+  const [pendingContactInvite, setPendingContactInvite] = useState<CompanyContact | null>(null)
+  // Confirmation modal before adding an existing-account contact as a member.
+  // Mirrors the invite confirmation so an accidental click can't silently
+  // grant project access.
+  const [pendingAddMember, setPendingAddMember] = useState<CompanyContact | null>(null)
+  // Confirmation modal before removing a member. Carries enough info to show
+  // who's being removed without an extra lookup. Mirrors the other confirmations.
+  const [pendingRemoveMember, setPendingRemoveMember] = useState<{
+    memberId: string
+    name: string | null
+    email: string | null
+  } | null>(null)
+  const [removingMemberId, setRemovingMemberId] = useState<string | null>(null)
+  // Confirmation modal before deleting a file. Used by every Delete button
+  // on the page (PO, requirements, certs, quotes, drawings, other docs).
+  const [pendingDeleteFile, setPendingDeleteFile] = useState<ProjectFile | null>(null)
+  const [deletingFileId, setDeletingFileId] = useState<string | null>(null)
+  // Background sync that runs automatically when the project page loads.
+  // Shows a small indicator at the top — pulsing blue while running,
+  // steady green with timestamp when done, amber if the call failed so
+  // admins can see something is wrong (instead of silently hiding).
+  const [autoSyncing, setAutoSyncing] = useState(false)
+  // Timestamp of the most recent successful auto-sync.
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null)
+  // True if the last auto-sync errored (network blip, Graph error, etc.).
+  // Shown as an amber indicator. Refreshing the page retries.
+  const [lastSyncFailed, setLastSyncFailed] = useState(false)
+
+  // AI Purchase-Order review (admin-only): Claude's summary + concerns
+  // for the current project's PO file, if it exists.
+  type POReview = {
+    id: string
+    file_id: string
+    summary: string | null
+    concerns: string[]
+    extracted_fields: Record<string, unknown> | null
+    model: string | null
+    reviewed_at: string
+    reviewed_by: string | null
+  }
+  const [poReview, setPoReview] = useState<POReview | null>(null)
+  const [analyzingPO, setAnalyzingPO] = useState(false)
+  const [analyzeError, setAnalyzeError] = useState('')
+  const [showExtracted, setShowExtracted] = useState(false)
+
+  // Project notes — shared comment thread visible to both sides.
+  const [notes, setNotes] = useState<ProjectNote[]>([])
+  const [newNoteContent, setNewNoteContent] = useState('')
+  const [addingNote, setAddingNote] = useState(false)
+  const [noteError, setNoteError] = useState('')
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null)
+  const [editingNoteContent, setEditingNoteContent] = useState('')
   const [activeTab, setActiveTab] = useState<TabKey>('documents')
 
   const [editing, setEditing] = useState(false)
@@ -78,14 +242,190 @@ export default function ProjectPage() {
     fetchProject()
     fetchFiles()
     fetchDocumentRequests()
+    fetchNotes()
     if (isAdmin) {
       fetchMembers()
       fetchAvailableProfiles()
+      fetchLastReminders()
     }
   }, [id, isAdmin])
 
+  // Auto-sync from SharePoint in the background whenever the project loads.
+  // Fires once per (project id) — non-blocking, so the page renders existing
+  // files immediately and the list updates if any new ones land. Only runs
+  // when the project name starts with an HWI code (the sync function needs
+  // it to locate the matching SharePoint folder).
+  useEffect(() => {
+    if (!id || !project?.name) return
+    if (!/^HWI-\d{2}-\d+/i.test(project.name)) return
+    void autoSyncFromSharePoint(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, project?.name])
+
+  // Whenever the reminder confirmation card opens, default the recipient
+  // picker to every eligible recipient (the project's customer + every
+  // member with an email). Admin can uncheck individuals before sending.
+  useEffect(() => {
+    if (!pendingReminder) return
+    const emails: string[] = []
+    if (project?.customer?.email) emails.push(project.customer.email)
+    for (const m of members) {
+      const e = m.profile?.email
+      if (e && !emails.some(x => x.toLowerCase() === e.toLowerCase())) emails.push(e)
+    }
+    setSelectedReminderEmails(emails)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingReminder])
+
+  // Pull POs, certificates, and quotes from this project's matching
+  // SharePoint folder. Runs automatically on every project page load (both
+  // admins and customers — the edge function permits members to sync their
+  // own projects). Dedupes by SharePoint item id so re-running just picks
+  // up new files. Tracks success / failure so the header can show an
+  // accurate state indicator without needing a manual button.
+  async function autoSyncFromSharePoint(projectId: string) {
+    setAutoSyncing(true)
+    setLastSyncFailed(false)
+    try {
+      const { data, error } = await supabase.functions.invoke('sync-files-from-sharepoint', {
+        body: { projectId },
+      })
+      if (error || data?.error) {
+        console.warn('Auto-sync failed:', error?.message || data?.error)
+        setLastSyncFailed(true)
+        return
+      }
+      // Tally new files; if any landed, refresh the file list.
+      let addedAny = false
+      if (data?.summary) {
+        for (const stats of Object.values(data.summary as Record<string, { added: number }>)) {
+          if (stats.added > 0) { addedAny = true; break }
+        }
+      }
+      if (addedAny) await fetchFiles()
+      setLastSyncedAt(new Date())
+    } catch (e) {
+      console.warn('Auto-sync error:', e)
+      setLastSyncFailed(true)
+    } finally {
+      setAutoSyncing(false)
+    }
+  }
+
+  // AI PO review: fetch the current saved review (if any) for the PO file.
+  // Skips silently for customers (RLS blocks the read; setPoReview(null) is fine).
+  async function fetchPOReview(fileId: string) {
+    if (!isAdmin) { setPoReview(null); return }
+    const { data } = await supabase
+      .from('po_reviews')
+      .select('*')
+      .eq('file_id', fileId)
+      .maybeSingle()
+    setPoReview((data ?? null) as POReview | null)
+  }
+
+  async function analyzePO(fileId: string) {
+    setAnalyzingPO(true)
+    setAnalyzeError('')
+    try {
+      const { data, error } = await supabase.functions.invoke('review-po', {
+        body: { fileId },
+      })
+      if (error || data?.error) {
+        setAnalyzeError(error?.message || data?.error || 'Unknown error')
+        return
+      }
+      if (data?.review) setPoReview(data.review as POReview)
+    } catch (e) {
+      setAnalyzeError((e as Error).message)
+    } finally {
+      setAnalyzingPO(false)
+    }
+  }
+
+  // Project notes: fetch the thread and enrich each row with its author's
+  // profile (name, email, role) so the UI can label them appropriately.
+  async function fetchNotes() {
+    if (!id) return
+    const { data: rows } = await supabase
+      .from('project_notes')
+      .select('*')
+      .eq('project_id', id)
+      .order('created_at', { ascending: false })
+    const list = (rows ?? []) as ProjectNote[]
+    if (list.length === 0) { setNotes([]); return }
+    const authorIds = Array.from(new Set(list.map(n => n.author_id)))
+    const { data: profs } = await supabase
+      .from('profiles')
+      .select('id, full_name, email, role')
+      .in('id', authorIds)
+    const byId = new Map((profs ?? []).map(p => [p.id, p]))
+    setNotes(list.map(n => ({ ...n, author: byId.get(n.author_id) ?? null })))
+  }
+
+  async function addNote() {
+    if (!user || !id || !newNoteContent.trim()) return
+    setAddingNote(true)
+    setNoteError('')
+    const trimmed = newNoteContent.trim()
+    const { error } = await supabase
+      .from('project_notes')
+      .insert({ project_id: id, author_id: user.id, content: trimmed })
+    setAddingNote(false)
+    if (error) { setNoteError(error.message); return }
+    setNewNoteContent('')
+    fetchNotes()
+    // Best-effort: notify the other side via Microsoft Graph.
+    void supabase.functions.invoke('notify-project-note', {
+      body: { projectId: id, portalUrl: window.location.origin },
+    }).catch(() => { /* notification is best-effort */ })
+  }
+
+  async function saveEditedNote(noteId: string) {
+    if (!editingNoteContent.trim()) return
+    const trimmed = editingNoteContent.trim()
+    const { error } = await supabase
+      .from('project_notes')
+      .update({ content: trimmed, updated_at: new Date().toISOString() })
+      .eq('id', noteId)
+    if (error) { setNoteError(error.message); return }
+    setEditingNoteId(null)
+    setEditingNoteContent('')
+    fetchNotes()
+    void supabase.functions.invoke('notify-project-note', {
+      body: { projectId: id, noteId, isUpdate: true, portalUrl: window.location.origin },
+    }).catch(() => { /* best-effort */ })
+  }
+
+  async function deleteNote(noteId: string) {
+    if (!confirm('Delete this note?')) return
+    const { error } = await supabase.from('project_notes').delete().eq('id', noteId)
+    if (error) { setNoteError(error.message); return }
+    fetchNotes()
+  }
+
+  // Pull the latest reminder per document_key for this project so we can
+  // show "Reminded Xd ago" next to each missing-document row.
+  async function fetchLastReminders() {
+    if (!id) return
+    const { data } = await supabase
+      .from('reminders')
+      .select('document_key, sent_at')
+      .eq('project_id', id)
+      .order('sent_at', { ascending: false })
+    const map: Record<string, string> = {}
+    for (const r of data ?? []) {
+      if (!map[r.document_key]) map[r.document_key] = r.sent_at
+    }
+    setLastReminderByKey(map)
+  }
+
   async function fetchProject() {
-    const { data } = await supabase.from('projects').select('*, customer:customers(company, name)').eq('id', id).single()
+    const { data } = await supabase
+      .from('projects')
+      .select('*, customer:customers(company, name, email, shipping_address, shipping_city, shipping_state, shipping_zip, shipping_country, billing_address, billing_city, billing_state, billing_zip, billing_country)')
+      .eq('id', id)
+      .single()
     if (!data) { navigate('/'); return }
     setProject(data)
     setEditName(data.name)
@@ -100,7 +440,16 @@ export default function ProjectPage() {
       .select('*')
       .eq('project_id', id)
       .order('created_at', { ascending: false })
-    setFiles((data ?? []) as ProjectFile[])
+    const list = (data ?? []) as ProjectFile[]
+    setFiles(list)
+    // Fetch the names of everyone who uploaded a file here, so we can show
+    // "by Jane Doe" next to each row.
+    const ids = Array.from(new Set(list.map(f => f.uploaded_by).filter((v): v is string => !!v)))
+    if (ids.length === 0) { setUploaderById({}); return }
+    const { data: profs } = await supabase.from('profiles').select('*').in('id', ids)
+    const next: Record<string, Profile> = {}
+    for (const p of profs ?? []) next[p.id] = p
+    setUploaderById(next)
   }
 
   async function fetchDocumentRequests() {
@@ -175,6 +524,117 @@ export default function ProjectPage() {
     setAvailableProfiles((allProfiles ?? []).filter(p => !memberIds.has(p.id)))
   }
 
+  // Pull every Zoho customer contact whose company matches this project's
+  // company, then enrich with status info (member / has account / pending)
+  // so the Members tab can render the right action per row.
+  async function fetchCompanyContacts() {
+    const company = project?.customer?.company
+    if (!company) { setCompanyContacts([]); return }
+    const { data: customers } = await supabase
+      .from('customers')
+      .select('id, name, email, company')
+      .eq('company', company)
+    if (!customers || customers.length === 0) { setCompanyContacts([]); return }
+    const emails = customers.map(c => c.email).filter((e): e is string => !!e)
+    let profileByEmail = new Map<string, string>()
+    if (emails.length > 0) {
+      const { data: profs } = await supabase
+        .from('profiles').select('id, email').in('email', emails)
+      profileByEmail = new Map((profs ?? [])
+        .filter((p): p is { id: string; email: string } => !!p.email)
+        .map(p => [p.email.toLowerCase(), p.id]))
+    }
+    const memberUserIds = new Set(members.map(m => m.user_id))
+    const contacts: CompanyContact[] = customers.map(c => {
+      const userId = c.email ? profileByEmail.get(c.email.toLowerCase()) : undefined
+      let status: CompanyContact['status']
+      if (userId && memberUserIds.has(userId)) status = 'member'
+      else if (userId) status = 'has_account'
+      else status = 'pending'
+      return { customerId: c.id, name: c.name, email: c.email, status, userId }
+    })
+    setCompanyContacts(contacts)
+  }
+
+  // Recompute company contacts whenever the project or members change,
+  // so status badges stay in sync after Invite / Add / Remove actions.
+  useEffect(() => {
+    if (project) fetchCompanyContacts()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project, members])
+
+  // Whenever the PO file changes (uploaded, replaced), refetch its AI review.
+  useEffect(() => {
+    const po = files.find(f => f.kind === 'purchase_order')
+    if (po && isAdmin) {
+      fetchPOReview(po.id)
+    } else {
+      setPoReview(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files, isAdmin])
+
+  // Invite a customer who doesn't have a portal account yet AND immediately
+  // add them as a project member. invite-customer returns the auth user_id
+  // (Supabase's inviteUserByEmail creates the auth.users row right away,
+  // even before the customer accepts), so we can insert into project_members
+  // in the same click. By the time they accept the invite and log in for
+  // the first time, this project is already linked to their account — no
+  // separate "accept project" step required.
+  async function inviteContact(contact: CompanyContact) {
+    if (!contact.email || !id) return
+    setContactActionId(contact.customerId)
+    setContactActionMsg('')
+    const { data, error } = await supabase.functions.invoke('invite-customer', {
+      body: { email: contact.email, name: contact.name, redirectTo: `${window.location.origin}/set-password` },
+    })
+    if (error || data?.error) {
+      setContactActionId(null)
+      setContactActionMsg(`Invite failed: ${error?.message || data?.error}`)
+      return
+    }
+
+    // Add to project_members immediately if we got back a user_id. We swallow
+    // the unique-constraint case silently — if someone else already linked
+    // them, the invite is still useful (they may have lost the email).
+    const newUserId = data?.user_id as string | undefined
+    if (newUserId) {
+      const { error: memberError } = await supabase
+        .from('project_members')
+        .insert({ project_id: id, user_id: newUserId })
+      if (memberError && !memberError.message?.toLowerCase().includes('duplicate')) {
+        setContactActionId(null)
+        setContactActionMsg(`Invited, but couldn't add to project: ${memberError.message}`)
+        return
+      }
+    }
+
+    setContactActionId(null)
+    setContactActionMsg(`${contact.name || contact.email} invited and added to this project.`)
+    setTimeout(() => setContactActionMsg(''), 4000)
+    fetchMembers()
+    fetchAvailableProfiles()
+  }
+
+  // Promote a customer who already has a portal account into a member of
+  // this specific project. Adds the row to project_members and refreshes.
+  async function addContactAsMember(contact: CompanyContact) {
+    if (!contact.userId || !id) return
+    setContactActionId(contact.customerId)
+    const { error } = await supabase
+      .from('project_members')
+      .insert({ project_id: id, user_id: contact.userId })
+    setContactActionId(null)
+    if (error) {
+      setContactActionMsg(`Add failed: ${error.message}`)
+      return
+    }
+    setContactActionMsg(`${contact.name || contact.email} added.`)
+    setTimeout(() => setContactActionMsg(''), 4000)
+    fetchMembers()
+    fetchAvailableProfiles()
+  }
+
   // --- Uploads (shared input, driven by uploadCtx) ---
   function triggerUpload(ctx: { kind: string; requirementId: string | null }) {
     uploadCtx.current = ctx
@@ -183,16 +643,33 @@ export default function ProjectPage() {
 
   async function handleFileInput(e: ChangeEvent<HTMLInputElement>) {
     const files = e.target.files
-    if (files && files.length) await uploadFiles(Array.from(files), uploadCtx.current)
+    if (files && files.length) startUpload(Array.from(files), uploadCtx.current)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  async function uploadFiles(files: File[], ctx: { kind: string; requirementId: string | null }) {
+  // Admins get an in-between confirmation modal with a "Notify customer?"
+  // toggle (default OFF). Customers just upload straight away — the team is
+  // always notified via notify-upload.
+  function startUpload(files: File[], ctx: { kind: string; requirementId: string | null }) {
+    if (files.length === 0) return
+    if (isAdmin) {
+      setPendingUpload({ files, ctx, notify: false })
+    } else {
+      void uploadFiles(files, ctx, true)
+    }
+  }
+
+  async function uploadFiles(
+    files: File[],
+    ctx: { kind: string; requirementId: string | null },
+    notify: boolean,
+  ) {
     if (!id || !user || files.length === 0) return
     setUploading(true)
     setUploadError('')
 
     let uploaded = 0
+    const insertedPoFileIds: string[] = []
     for (const file of files) {
       const storagePath = `${id}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${file.name}`
       const { error: storageError } = await supabase.storage.from('project-files').upload(storagePath, file)
@@ -200,7 +677,7 @@ export default function ProjectPage() {
         setUploadError(storageError.message)
         continue
       }
-      await supabase.from('files').insert({
+      const { data: insertedFile } = await supabase.from('files').insert({
         project_id: id,
         name: file.name,
         storage_path: storagePath,
@@ -209,11 +686,14 @@ export default function ProjectPage() {
         uploaded_by: user.id,
         kind: ctx.kind,
         document_request_id: ctx.requirementId,
-      })
+      }).select('id').single()
+      if (insertedFile && ctx.kind === 'purchase_order') {
+        insertedPoFileIds.push(insertedFile.id)
+      }
       uploaded++
     }
 
-    if (uploaded > 0) {
+    if (uploaded > 0 && notify) {
       void supabase.functions.invoke('notify-upload', {
         body: {
           projectId: id,
@@ -221,6 +701,15 @@ export default function ProjectPage() {
           portalUrl: window.location.origin,
         },
       }).catch(() => { /* best-effort */ })
+    }
+
+    // Fire-and-forget SharePoint sync for any uploaded POs. Refetch files
+    // once it returns so the "Saved to SharePoint" badge appears on the row
+    // without the user having to refresh.
+    for (const poFileId of insertedPoFileIds) {
+      void supabase.functions.invoke('upload-po-to-sharepoint', {
+        body: { fileId: poFileId },
+      }).then(() => fetchFiles()).catch(() => { /* best-effort */ })
     }
 
     await fetchFiles()
@@ -237,10 +726,67 @@ export default function ProjectPage() {
     }
   }
 
-  async function handleDeleteFile(file: ProjectFile) {
-    if (!confirm(`Delete "${file.name}"?`)) return
+  // Open the inline preview modal for any file (PDF / image / fallback).
+  async function previewFile(file: ProjectFile) {
+    const { data } = await supabase.storage.from('project-files').createSignedUrl(file.storage_path, 300)
+    if (data?.signedUrl) setPreviewing({ file, url: data.signedUrl })
+  }
+
+  // Email the customer that a required document is still missing. Admin only.
+  // Clicking the Remind button just queues a confirmation card so the admin
+  // doesn't accidentally fire customer emails — the actual send happens in
+  // confirmReminder() when they click "Send reminder" in the dialog.
+  function sendReminder(documentLabel: string, key: string) {
+    if (!id) return
+    setPendingReminder({ documentLabel, key })
+  }
+
+  async function confirmReminder() {
+    if (!id || !pendingReminder) return
+    const { documentLabel, key } = pendingReminder
+    setPendingReminder(null)
+    setReminderState({ key, status: 'sending' })
+    try {
+      const { error } = await supabase.functions.invoke('send-reminder', {
+        body: {
+          projectId: id,
+          documentLabel,
+          documentKey: key,
+          recipients: selectedReminderEmails,
+          portalUrl: window.location.origin,
+        },
+      })
+      setReminderState({ key, status: error ? 'error' : 'sent' })
+      // Optimistically update the "Reminded X ago" label. The edge function
+      // logs the actual row server-side; this just avoids a refetch.
+      if (!error) {
+        setLastReminderByKey(prev => ({ ...prev, [key]: new Date().toISOString() }))
+      }
+    } catch {
+      setReminderState({ key, status: 'error' })
+    }
+    setTimeout(() => setReminderState(s => (s?.key === key ? null : s)), 4000)
+  }
+
+  // Render "by Jane Doe" under a file row.
+  function uploaderLabel(file: ProjectFile): string {
+    if (!file.uploaded_by) return ''
+    const p = uploaderById[file.uploaded_by]
+    if (!p) return ''
+    return p.full_name || p.email || ''
+  }
+
+  // Opens the styled delete-confirmation modal. The actual deletion runs in
+  // confirmDeleteFile when the user clicks the red Delete button.
+  function handleDeleteFile(file: ProjectFile) {
+    setPendingDeleteFile(file)
+  }
+
+  async function confirmDeleteFile(file: ProjectFile) {
+    setDeletingFileId(file.id)
     await supabase.storage.from('project-files').remove([file.storage_path])
     await supabase.from('files').delete().eq('id', file.id)
+    setDeletingFileId(null)
     fetchFiles()
   }
 
@@ -283,7 +829,9 @@ export default function ProjectPage() {
   }
 
   async function handleRemoveMember(memberId: string) {
+    setRemovingMemberId(memberId)
     await supabase.from('project_members').delete().eq('id', memberId)
+    setRemovingMemberId(null)
     fetchMembers()
     fetchAvailableProfiles()
   }
@@ -299,14 +847,16 @@ export default function ProjectPage() {
   if (!project) return null
 
   const tabList: TabKey[] = isAdmin
-    ? ['documents', 'drawings', 'certificates', 'invoices', 'members']
-    : ['documents', 'drawings', 'certificates', 'invoices']
+    ? ['documents', 'drawings', 'certificates', 'invoices', 'notes', 'members']
+    : ['documents', 'drawings', 'certificates', 'invoices', 'notes']
 
   const certificates = files.filter(f => f.kind === 'certificate')
+  const equipmentCertificates = files.filter(f => f.kind === 'equipment_certificate')
   const drawings = files.filter(f => f.kind === 'drawing')
   const poFile = files.find(f => f.kind === 'purchase_order')
+  const quotes = files.filter(f => f.kind === 'quote')
   const generalDocs = files.filter(f =>
-    f.kind !== 'certificate' && f.kind !== 'drawing' && f.kind !== 'purchase_order' && !f.document_request_id
+    f.kind !== 'certificate' && f.kind !== 'equipment_certificate' && f.kind !== 'drawing' && f.kind !== 'purchase_order' && f.kind !== 'quote' && !f.document_request_id
   )
   const fileByRequirement = new Map<string, ProjectFile>()
   for (const f of files) {
@@ -358,21 +908,44 @@ export default function ProjectPage() {
                 <p className="text-blue-600 text-sm font-medium mb-1">{project.customer?.company || project.customer?.name}</p>
               )}
               {project.description && <p className="text-gray-500">{project.description}</p>}
-              <p className="text-gray-400 text-sm mt-2">Last updated {formatDate(project.updated_at)}</p>
+              <p className="text-gray-400 text-sm mt-2">
+                Last updated {formatDate(project.updated_at)}
+                {autoSyncing ? (
+                  <span className="ml-3 inline-flex items-center gap-1.5 text-blue-600">
+                    <span className="inline-block w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+                    Checking SharePoint for new files…
+                  </span>
+                ) : lastSyncFailed ? (
+                  <span
+                    className="ml-3 inline-flex items-center gap-1.5 text-amber-700"
+                    title="The portal couldn't reach SharePoint on the last try. Refresh the page to retry, or check the Supabase function logs if this keeps happening."
+                  >
+                    <span className="inline-block w-2 h-2 rounded-full bg-amber-500" />
+                    SharePoint sync failed — refresh to retry
+                  </span>
+                ) : lastSyncedAt ? (
+                  <span className="ml-3 inline-flex items-center gap-1.5 text-gray-500">
+                    <span className="inline-block w-2 h-2 rounded-full bg-green-500" />
+                    SharePoint synced at {lastSyncedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+                  </span>
+                ) : null}
+              </p>
             </div>
             {isAdmin && (
-              <button onClick={() => setEditing(true)} className="flex items-center gap-2 text-gray-500 hover:text-gray-700 border border-gray-200 px-3 py-1.5 rounded-lg text-sm hover:bg-gray-50 transition-colors">
-                <Edit2 size={14} /> Edit
-              </button>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button onClick={() => setEditing(true)} className="flex items-center gap-2 text-gray-500 hover:text-gray-700 border border-gray-200 px-3 py-1.5 rounded-lg text-sm hover:bg-gray-50 transition-colors">
+                  <Edit2 size={14} /> Edit
+                </button>
+              </div>
             )}
           </div>
         )}
       </div>
 
-      {/* Lead notes (synced from SharePoint Lead List) */}
+      {/* Project scope (synced from SharePoint Lead List) */}
       {project.lead_comments && (
         <div className="bg-white border border-gray-200 rounded-xl p-5 mb-6">
-          <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">Lead notes</h2>
+          <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">Project scope</h2>
           <p className="text-gray-700 text-sm whitespace-pre-wrap">{project.lead_comments}</p>
         </div>
       )}
@@ -404,39 +977,161 @@ export default function ProjectPage() {
 
             <div className="divide-y divide-gray-50">
               {/* Purchase order — always required */}
-              <div className="flex items-center justify-between px-5 py-3.5">
-                <div className="flex items-center gap-3 min-w-0">
-                  {poFile
-                    ? <Check size={18} className="text-green-600 flex-shrink-0" />
-                    : <div className="w-[18px] h-[18px] rounded-full border-2 border-gray-300 flex-shrink-0" />}
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-gray-900 truncate">
-                      Purchase order <span className="text-xs font-normal text-gray-400">· required</span>
-                    </p>
+              <div className="px-5 py-3.5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3 min-w-0">
                     {poFile
-                      ? <p className="text-xs text-gray-400 truncate">{poFile.name} · {formatDate(poFile.created_at)}</p>
-                      : <p className="text-xs text-amber-600">Awaiting upload</p>}
+                      ? <Check size={18} className="text-green-600 flex-shrink-0" />
+                      : <div className="w-[18px] h-[18px] rounded-full border-2 border-gray-300 flex-shrink-0" />}
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-gray-900 truncate">
+                        Purchase order <span className="text-xs font-normal text-gray-400">· required</span>
+                      </p>
+                      {poFile
+                        ? <div className="text-xs text-gray-400 truncate">
+                            <span className="truncate">{poFile.name} · {formatDate(poFile.source_created_at || poFile.created_at)}</span>
+                            {uploaderLabel(poFile) && <span> · by {uploaderLabel(poFile)}</span>}
+                            {isAdmin && poFile.sharepoint_synced_at && poFile.sharepoint_path === 'emailed-to-sales' && (
+                              <span className="ml-1.5 text-amber-700">
+                                · Emailed to sales team (no folder match yet)
+                              </span>
+                            )}
+                            {isAdmin && poFile.sharepoint_synced_at && poFile.sharepoint_path !== 'emailed-to-sales' && (
+                              <span className="ml-1.5 text-green-700">
+                                · <Check size={11} className="inline -mt-0.5" /> Saved to SharePoint
+                              </span>
+                            )}
+                            {isAdmin && !poFile.sharepoint_synced_at && poFile.sharepoint_error && (
+                              <span
+                                className="ml-1.5 text-red-600"
+                                title={poFile.sharepoint_error}
+                              >
+                                · SharePoint sync failed (hover for details)
+                              </span>
+                            )}
+                          </div>
+                        : <p className="text-xs text-amber-600">
+                            Awaiting upload
+                            {isAdmin && lastReminderByKey['po'] && (
+                              <span className="text-gray-400 font-normal ml-1.5">· Reminded {formatRelativeTime(lastReminderByKey['po'])}</span>
+                            )}
+                          </p>}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                    {poFile && (
+                      <>
+                        <button onClick={() => previewFile(poFile)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Preview">
+                          <Eye size={16} />
+                        </button>
+                        <button onClick={() => handleDownload(poFile)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                          <Download size={16} />
+                        </button>
+                      </>
+                    )}
+                    {!poFile && isAdmin && (
+                      <button
+                        onClick={() => sendReminder('Purchase order', 'po')}
+                        disabled={reminderState?.key === 'po' && reminderState.status === 'sending'}
+                        className="flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-blue-600 px-2 py-1 disabled:opacity-50"
+                        title="Send reminder email"
+                      >
+                        {reminderState?.key === 'po' && reminderState.status === 'sent'
+                          ? <><Check size={13} /> Sent</>
+                          : <><Send size={13} /> Remind</>}
+                      </button>
+                    )}
+                    <button
+                      onClick={() => poFile ? handleDeleteFile(poFile) : triggerUpload({ kind: 'purchase_order', requirementId: null })}
+                      disabled={uploading}
+                      className={`text-xs font-semibold px-2 py-1 disabled:opacity-50 ${poFile ? 'text-red-600 hover:text-red-700' : 'text-blue-600 hover:text-blue-700'}`}
+                    >
+                      {poFile ? 'Delete' : 'Upload'}
+                    </button>
                   </div>
                 </div>
-                <div className="flex items-center gap-1 ml-4 flex-shrink-0">
-                  {poFile && (
-                    <button onClick={() => handleDownload(poFile)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
-                      <Download size={16} />
-                    </button>
-                  )}
-                  <button
-                    onClick={() => triggerUpload({ kind: 'purchase_order', requirementId: null })}
-                    disabled={uploading}
-                    className="text-xs font-semibold text-blue-600 hover:text-blue-700 px-2 py-1 disabled:opacity-50"
-                  >
-                    {poFile ? 'Replace' : 'Upload'}
-                  </button>
-                </div>
+
+                {/* AI Purchase-Order review (admin only) */}
+                {poFile && isAdmin && (
+                  <div className="mt-3 pt-3 border-t border-gray-100">
+                    {poReview ? (
+                      <div className="bg-gradient-to-br from-purple-50 to-blue-50 border border-purple-200 rounded-lg p-3">
+                        <div className="flex items-start gap-2.5">
+                          <div className="w-6 h-6 rounded-full bg-purple-600 flex items-center justify-center flex-shrink-0 mt-0.5">
+                            <Sparkles size={12} className="text-white" />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-baseline justify-between gap-2 mb-1">
+                              <p className="text-xs font-semibold text-purple-900">AI review</p>
+                              <span className="text-[10px] text-gray-500">{formatRelativeTime(poReview.reviewed_at)}</span>
+                            </div>
+                            {poReview.summary && (
+                              <p className="text-sm text-gray-700 mb-2 leading-relaxed">{poReview.summary}</p>
+                            )}
+                            {poReview.concerns.length > 0 && (
+                              <div className="bg-amber-50 border border-amber-200 rounded-md p-2.5 mb-2">
+                                <p className="text-xs font-semibold text-amber-800 mb-1.5">Things to check ({poReview.concerns.length})</p>
+                                <ul className="text-xs text-amber-900 space-y-1 list-disc list-inside marker:text-amber-600">
+                                  {poReview.concerns.map((c, i) => <li key={i}>{c}</li>)}
+                                </ul>
+                              </div>
+                            )}
+                            <div className="flex items-center gap-3 mt-2">
+                              <button
+                                onClick={() => analyzePO(poFile.id)}
+                                disabled={analyzingPO}
+                                className="text-xs font-medium text-purple-700 hover:text-purple-900 disabled:opacity-50 transition-colors"
+                              >
+                                {analyzingPO ? 'Re-analyzing…' : 'Re-analyze'}
+                              </button>
+                              {poReview.extracted_fields && Object.keys(poReview.extracted_fields).length > 0 && (
+                                <button
+                                  onClick={() => setShowExtracted(s => !s)}
+                                  className="text-xs text-gray-500 hover:text-gray-700"
+                                >
+                                  {showExtracted ? 'Hide extracted fields' : 'Show extracted fields'}
+                                </button>
+                              )}
+                            </div>
+                            {showExtracted && poReview.extracted_fields && (
+                              <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs bg-white border border-gray-200 rounded p-2">
+                                {Object.entries(poReview.extracted_fields).map(([k, v]) => (
+                                  <div key={k} className="min-w-0">
+                                    <span className="text-gray-500 capitalize">{k.replace(/_/g, ' ')}:</span>{' '}
+                                    <span className="text-gray-900 break-words">{v != null && v !== '' ? String(v) : '—'}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {analyzeError && <p className="text-xs text-red-600 mt-2">{analyzeError}</p>}
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-between gap-3 bg-gray-50 border border-gray-200 rounded-lg p-2.5">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Sparkles size={14} className="text-purple-600 flex-shrink-0" />
+                          <p className="text-xs text-gray-600 truncate">Use AI to summarize and check this PO.</p>
+                        </div>
+                        <button
+                          onClick={() => analyzePO(poFile.id)}
+                          disabled={analyzingPO}
+                          className="bg-purple-600 text-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-purple-700 disabled:opacity-50 transition-colors flex-shrink-0 flex items-center gap-1.5"
+                        >
+                          <Sparkles size={12} />
+                          {analyzingPO ? 'Analyzing…' : 'Analyze with AI'}
+                        </button>
+                      </div>
+                    )}
+                    {analyzeError && !poReview && <p className="text-xs text-red-600 mt-2">{analyzeError}</p>}
+                  </div>
+                )}
               </div>
 
               {/* Admin-defined required documents */}
               {documentRequests.map(req => {
                 const f = fileByRequirement.get(req.id)
+                const reminderKey = `req-${req.id}`
                 return (
                   <div key={req.id} className="flex items-center justify-between px-5 py-3.5">
                     <div className="flex items-center gap-3 min-w-0">
@@ -446,22 +1141,47 @@ export default function ProjectPage() {
                       <div className="min-w-0">
                         <p className="text-sm font-medium text-gray-900 truncate">{req.label}</p>
                         {f
-                          ? <p className="text-xs text-gray-400 truncate">{f.name} · {formatDate(f.created_at)}</p>
-                          : <p className="text-xs text-amber-600">Awaiting upload</p>}
+                          ? <p className="text-xs text-gray-400 truncate">
+                              {f.name} · {formatDate(f.source_created_at || f.created_at)}
+                              {uploaderLabel(f) && ` · by ${uploaderLabel(f)}`}
+                            </p>
+                          : <p className="text-xs text-amber-600">
+                              Awaiting upload
+                              {isAdmin && lastReminderByKey[reminderKey] && (
+                                <span className="text-gray-400 font-normal ml-1.5">· Reminded {formatRelativeTime(lastReminderByKey[reminderKey])}</span>
+                              )}
+                            </p>}
                       </div>
                     </div>
                     <div className="flex items-center gap-1 ml-4 flex-shrink-0">
                       {f && (
-                        <button onClick={() => handleDownload(f)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
-                          <Download size={16} />
+                        <>
+                          <button onClick={() => previewFile(f)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Preview">
+                            <Eye size={16} />
+                          </button>
+                          <button onClick={() => handleDownload(f)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                            <Download size={16} />
+                          </button>
+                        </>
+                      )}
+                      {!f && isAdmin && (
+                        <button
+                          onClick={() => sendReminder(req.label, reminderKey)}
+                          disabled={reminderState?.key === reminderKey && reminderState.status === 'sending'}
+                          className="flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-blue-600 px-2 py-1 disabled:opacity-50"
+                          title="Send reminder email"
+                        >
+                          {reminderState?.key === reminderKey && reminderState.status === 'sent'
+                            ? <><Check size={13} /> Sent</>
+                            : <><Send size={13} /> Remind</>}
                         </button>
                       )}
                       <button
-                        onClick={() => triggerUpload({ kind: 'general', requirementId: req.id })}
+                        onClick={() => f ? handleDeleteFile(f) : triggerUpload({ kind: 'general', requirementId: req.id })}
                         disabled={uploading}
-                        className="text-xs font-semibold text-blue-600 hover:text-blue-700 px-2 py-1 disabled:opacity-50"
+                        className={`text-xs font-semibold px-2 py-1 disabled:opacity-50 ${f ? 'text-red-600 hover:text-red-700' : 'text-blue-600 hover:text-blue-700'}`}
                       >
-                        {f ? 'Replace' : 'Upload'}
+                        {f ? 'Delete' : 'Upload'}
                       </button>
                       {isAdmin && (
                         <button onClick={() => deleteRequirement(req.id)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Remove requirement">
@@ -490,11 +1210,69 @@ export default function ProjectPage() {
             )}
           </div>
 
+          {/* Quotes — synced from SharePoint, PDF only */}
+          <div className="bg-white border border-gray-200 rounded-xl">
+            <div className="flex items-center justify-between p-5 border-b border-gray-100">
+              <div>
+                <h2 className="font-semibold text-gray-900">Quotes &amp; proposals</h2>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {isAdmin
+                    ? 'Synced from this project\'s SharePoint Quote folder (PDFs only). Auto-syncs on every page load.'
+                    : 'Proposal PDFs from Hydro-Wates for this project.'}
+                </p>
+              </div>
+            </div>
+
+            {quotes.length === 0 ? (
+              <div className="text-center py-14">
+                <FileText className="mx-auto text-gray-300 mb-3" size={40} />
+                <p className="text-gray-500 text-sm font-medium">No quotes yet</p>
+                <p className="text-gray-400 text-xs mt-1">
+                  {isAdmin
+                    ? 'Quote PDFs at the project root in SharePoint will sync here automatically. Refresh the page to retry.'
+                    : 'Your proposal will appear here once Hydro-Wates sends it.'}
+                </p>
+              </div>
+            ) : (
+              <div className="divide-y divide-gray-50">
+                {quotes.map(file => (
+                  <div key={file.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
+                    <button onClick={() => previewFile(file)} className="flex items-center gap-3 min-w-0 text-left flex-1">
+                      <div className="w-9 h-9 bg-purple-50 rounded-lg flex items-center justify-center flex-shrink-0">
+                        <FileText size={16} className="text-purple-600" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-gray-900 truncate hover:text-blue-600 transition-colors">{file.name}</p>
+                        <p className="text-xs text-gray-400">
+                          {formatBytes(file.size)} · {formatDate(file.source_created_at || file.created_at)}
+                          {isAdmin && file.sharepoint_source_id && <span> · from SharePoint</span>}
+                        </p>
+                      </div>
+                    </button>
+                    <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                      <button onClick={() => previewFile(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Preview">
+                        <Eye size={16} />
+                      </button>
+                      <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                        <Download size={16} />
+                      </button>
+                      {isAdmin && (
+                        <button onClick={() => handleDeleteFile(file)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete">
+                          <Trash2 size={16} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* Other documents */}
           <div
             onDragOver={e => { e.preventDefault(); setDragZone('general') }}
             onDragLeave={() => setDragZone(null)}
-            onDrop={e => { e.preventDefault(); setDragZone(null); const fs = Array.from(e.dataTransfer.files); if (fs.length) uploadFiles(fs, { kind: 'general', requirementId: null }) }}
+            onDrop={e => { e.preventDefault(); setDragZone(null); const fs = Array.from(e.dataTransfer.files); if (fs.length) startUpload(fs, { kind: 'general', requirementId: null }) }}
             className={`bg-white border rounded-xl transition-colors ${dragZone === 'general' ? 'border-blue-400 ring-2 ring-blue-200' : 'border-gray-200'}`}
           >
             <div className="flex items-center justify-between p-5 border-b border-gray-100">
@@ -505,7 +1283,7 @@ export default function ProjectPage() {
                 className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
               >
                 <Upload size={15} />
-                {uploading ? 'Uploading...' : 'Upload files'}
+                {uploading ? 'Uploading...' : 'Select files'}
               </button>
             </div>
 
@@ -517,22 +1295,28 @@ export default function ProjectPage() {
               <div className="text-center py-14">
                 <FileText className="mx-auto text-gray-300 mb-3" size={40} />
                 <p className="text-gray-500 text-sm font-medium">No other documents</p>
-                <p className="text-gray-400 text-xs mt-1">Click "Upload files" or drag files here</p>
+                <p className="text-gray-400 text-xs mt-1">Click "Select files" or drag files here</p>
               </div>
             ) : (
               <div className="divide-y divide-gray-50">
                 {generalDocs.map(file => (
                   <div key={file.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
-                    <div className="flex items-center gap-3 min-w-0">
+                    <button onClick={() => previewFile(file)} className="flex items-center gap-3 min-w-0 text-left flex-1">
                       <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
                         <FileText size={16} className="text-blue-500" />
                       </div>
                       <div className="min-w-0">
-                        <p className="text-sm font-medium text-gray-900 truncate">{file.name}</p>
-                        <p className="text-xs text-gray-400">{formatBytes(file.size)} · {formatDate(file.created_at)}</p>
+                        <p className="text-sm font-medium text-gray-900 truncate hover:text-blue-600 transition-colors">{file.name}</p>
+                        <p className="text-xs text-gray-400">
+                          {formatBytes(file.size)} · {formatDate(file.source_created_at || file.created_at)}
+                          {uploaderLabel(file) && ` · by ${uploaderLabel(file)}`}
+                        </p>
                       </div>
-                    </div>
+                    </button>
                     <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                      <button onClick={() => previewFile(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Preview">
+                        <Eye size={16} />
+                      </button>
                       <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
                         <Download size={16} />
                       </button>
@@ -555,7 +1339,7 @@ export default function ProjectPage() {
         <div
           onDragOver={e => { e.preventDefault(); setDragZone('drawing') }}
           onDragLeave={() => setDragZone(null)}
-          onDrop={e => { e.preventDefault(); setDragZone(null); const fs = Array.from(e.dataTransfer.files); if (fs.length) uploadFiles(fs, { kind: 'drawing', requirementId: null }) }}
+          onDrop={e => { e.preventDefault(); setDragZone(null); const fs = Array.from(e.dataTransfer.files); if (fs.length) startUpload(fs, { kind: 'drawing', requirementId: null }) }}
           className={`bg-white border rounded-xl transition-colors ${dragZone === 'drawing' ? 'border-blue-400 ring-2 ring-blue-200' : 'border-gray-200'}`}
         >
           <div className="flex items-center justify-between p-5 border-b border-gray-100">
@@ -584,16 +1368,22 @@ export default function ProjectPage() {
             <div className="divide-y divide-gray-50">
               {drawings.map(file => (
                 <div key={file.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
-                  <div className="flex items-center gap-3 min-w-0">
+                  <button onClick={() => previewFile(file)} className="flex items-center gap-3 min-w-0 text-left flex-1">
                     <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
                       <FileText size={16} className="text-blue-500" />
                     </div>
                     <div className="min-w-0">
-                      <p className="text-sm font-medium text-gray-900 truncate">{file.name}</p>
-                      <p className="text-xs text-gray-400">{formatBytes(file.size)} · {formatDate(file.created_at)}</p>
+                      <p className="text-sm font-medium text-gray-900 truncate hover:text-blue-600 transition-colors">{file.name}</p>
+                      <p className="text-xs text-gray-400">
+                        {formatBytes(file.size)} · {formatDate(file.source_created_at || file.created_at)}
+                        {uploaderLabel(file) && ` · by ${uploaderLabel(file)}`}
+                      </p>
                     </div>
-                  </div>
+                  </button>
                   <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                    <button onClick={() => previewFile(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Preview">
+                      <Eye size={16} />
+                    </button>
                     <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
                       <Download size={16} />
                     </button>
@@ -611,82 +1401,177 @@ export default function ProjectPage() {
       )}
 
       {/* Certificates tab */}
-      {activeTab === 'certificates' && (
-        <div className="bg-white border border-gray-200 rounded-xl">
-          <div className="flex items-center justify-between p-5 border-b border-gray-100">
-            <h2 className="font-semibold text-gray-900">Certificates &amp; reports</h2>
-            {isAdmin && (
-              <button
-                onClick={() => triggerUpload({ kind: 'certificate', requirementId: null })}
-                disabled={uploading}
-                className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
-              >
-                <Upload size={15} />
-                {uploading ? 'Uploading...' : 'Upload certificate'}
+      {activeTab === 'certificates' && (() => {
+        // Same row layout for both sections — extracted to avoid duplicating
+        // ~45 lines of JSX. Uses the project page's existing helpers
+        // (previewFile, handleDownload, updateRetestDue, etc.) via closure.
+        const renderCertRow = (file: ProjectFile) => {
+          const due = retestInfo(file.retest_due)
+          return (
+            <div key={file.id} className="flex items-center justify-between gap-3 px-5 py-3.5 hover:bg-gray-50 transition-colors">
+              <button onClick={() => previewFile(file)} className="flex items-center gap-3 min-w-0 text-left">
+                <div className="w-9 h-9 bg-green-50 rounded-lg flex items-center justify-center flex-shrink-0">
+                  <Award size={16} className="text-green-600" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-gray-900 truncate hover:text-blue-600 transition-colors">{file.name}</p>
+                  <p className="text-xs text-gray-400">
+                    {formatBytes(file.size)} · {formatDate(file.source_created_at || file.created_at)}
+                    {uploaderLabel(file) && ` · by ${uploaderLabel(file)}`}
+                  </p>
+                </div>
               </button>
-            )}
-          </div>
-
-          {uploadError && (
-            <div className="mx-5 mt-4 bg-red-50 text-red-600 text-sm px-3 py-2 rounded-lg">{uploadError}</div>
-          )}
-
-          {certificates.length === 0 ? (
-            <div className="text-center py-14">
-              <Award className="mx-auto text-gray-300 mb-3" size={40} />
-              <p className="text-gray-500 text-sm font-medium">No certificates yet</p>
-              <p className="text-gray-400 text-xs mt-1">
-                {isAdmin ? 'Upload the proof-load test report here when it\'s ready.' : 'Your test reports will appear here once issued.'}
-              </p>
-            </div>
-          ) : (
-            <div className="divide-y divide-gray-50">
-              {certificates.map(file => {
-                const due = retestInfo(file.retest_due)
-                return (
-                  <div key={file.id} className="flex items-center justify-between gap-3 px-5 py-3.5 hover:bg-gray-50 transition-colors">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div className="w-9 h-9 bg-green-50 rounded-lg flex items-center justify-center flex-shrink-0">
-                        <Award size={16} className="text-green-600" />
-                      </div>
-                      <div className="min-w-0">
-                        <p className="text-sm font-medium text-gray-900 truncate">{file.name}</p>
-                        <p className="text-xs text-gray-400">{formatBytes(file.size)} · {formatDate(file.created_at)}</p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-3 flex-shrink-0">
-                      {isAdmin ? (
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-xs text-gray-400 hidden sm:inline">Re-test due</span>
-                          <input
-                            type="date"
-                            value={file.retest_due ?? ''}
-                            onChange={e => updateRetestDue(file.id, e.target.value || null)}
-                            className="border border-gray-300 rounded-lg px-2 py-1 text-xs text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                          />
-                        </div>
-                      ) : (
-                        file.retest_due && <span className="text-xs text-gray-500 whitespace-nowrap">Re-test due {formatDate(file.retest_due)}</span>
-                      )}
-                      {due && (
-                        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full whitespace-nowrap ${due.color}`}>{due.label}</span>
-                      )}
-                      <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
-                        <Download size={16} />
-                      </button>
-                      {isAdmin && (
-                        <button onClick={() => handleDeleteFile(file)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete">
-                          <Trash2 size={16} />
-                        </button>
-                      )}
-                    </div>
+              <div className="flex items-center gap-3 flex-shrink-0">
+                {isAdmin ? (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-gray-400 hidden sm:inline">Re-test due</span>
+                    <input
+                      type="date"
+                      value={file.retest_due ?? ''}
+                      onChange={e => updateRetestDue(file.id, e.target.value || null)}
+                      className="border border-gray-300 rounded-lg px-2 py-1 text-xs text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
                   </div>
-                )
-              })}
+                ) : (
+                  file.retest_due && <span className="text-xs text-gray-500 whitespace-nowrap">Re-test due {formatDate(file.retest_due)}</span>
+                )}
+                {due && (
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full whitespace-nowrap ${due.color}`}>{due.label}</span>
+                )}
+                <button onClick={() => previewFile(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Preview">
+                  <Eye size={16} />
+                </button>
+                <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                  <Download size={16} />
+                </button>
+                {isAdmin && (
+                  <button onClick={() => handleDeleteFile(file)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete">
+                    <Trash2 size={16} />
+                  </button>
+                )}
+              </div>
             </div>
-          )}
-        </div>
-      )}
+          )
+        }
+
+        // Format the customer's shipping address from the Zoho-synced fields.
+        // Returns null if no usable address is on file (so the card can
+        // collapse to a friendly empty state).
+        const ship = project?.customer
+        const hasShipAddr = !!(ship && (ship.shipping_address || ship.shipping_city || ship.shipping_state || ship.shipping_zip))
+        const cityStateZip = ship
+          ? [
+              [ship.shipping_city, ship.shipping_state].filter(Boolean).join(', '),
+              ship.shipping_zip,
+            ].filter(Boolean).join(' ').trim()
+          : ''
+
+        return (
+          <div className="space-y-5">
+            {/* --- Ship-to address (read-only, synced from Zoho) --- */}
+            <div className="bg-white border border-gray-200 rounded-xl p-5">
+              <div className="flex items-start gap-3">
+                <MapPin size={18} className="text-gray-400 mt-1 flex-shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <h3 className="text-sm font-semibold text-gray-900">Ship to</h3>
+                    <span className="text-[10px] uppercase tracking-wide text-gray-400">From Zoho Books</span>
+                  </div>
+                  {hasShipAddr ? (
+                    <address className="text-sm text-gray-700 not-italic leading-relaxed">
+                      {ship?.company && (
+                        <div className="font-medium text-gray-900">{ship.company}</div>
+                      )}
+                      {ship?.name && ship.name !== ship.company && (
+                        <div className="text-gray-700">{ship.name}</div>
+                      )}
+                      {ship?.shipping_address && <div>{ship.shipping_address}</div>}
+                      {cityStateZip && <div>{cityStateZip}</div>}
+                      {ship?.shipping_country && (
+                        <div className="text-gray-500">{ship.shipping_country}</div>
+                      )}
+                    </address>
+                  ) : (
+                    <p className="text-sm text-gray-500">
+                      {isAdmin
+                        ? 'No shipping address on file yet. Set the customer\'s shipping address in Zoho Books — it\'ll appear here after the next sync.'
+                        : 'No shipping address on file. Contact Hydro-Wates to confirm where you want certificates shipped.'}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* --- Test certificates & reports --- */}
+            <div className="bg-white border border-gray-200 rounded-xl">
+              <div className="flex items-center justify-between p-5 border-b border-gray-100">
+                <h2 className="font-semibold text-gray-900">Certificates &amp; reports</h2>
+                {isAdmin && (
+                  <button
+                    onClick={() => triggerUpload({ kind: 'certificate', requirementId: null })}
+                    disabled={uploading}
+                    className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                  >
+                    <Upload size={15} />
+                    {uploading ? 'Uploading...' : 'Upload certificate'}
+                  </button>
+                )}
+              </div>
+
+              {uploadError && (
+                <div className="mx-5 mt-4 bg-red-50 text-red-600 text-sm px-3 py-2 rounded-lg">{uploadError}</div>
+              )}
+
+              {certificates.length === 0 ? (
+                <div className="text-center py-14">
+                  <Award className="mx-auto text-gray-300 mb-3" size={40} />
+                  <p className="text-gray-500 text-sm font-medium">No certificates yet</p>
+                  <p className="text-gray-400 text-xs mt-1">
+                    {isAdmin ? 'Upload the proof-load test report here when it\'s ready.' : 'Your test reports will appear here once issued.'}
+                  </p>
+                </div>
+              ) : (
+                <div className="divide-y divide-gray-50">
+                  {certificates.map(renderCertRow)}
+                </div>
+              )}
+            </div>
+
+            {/* --- Equipment certificates --- */}
+            <div className="bg-white border border-gray-200 rounded-xl">
+              <div className="flex items-center justify-between p-5 border-b border-gray-100">
+                <h2 className="font-semibold text-gray-900">Equipment certificates</h2>
+                {isAdmin && (
+                  <button
+                    onClick={() => triggerUpload({ kind: 'equipment_certificate', requirementId: null })}
+                    disabled={uploading}
+                    className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                  >
+                    <Upload size={15} />
+                    {uploading ? 'Uploading...' : 'Upload equipment cert'}
+                  </button>
+                )}
+              </div>
+
+              {equipmentCertificates.length === 0 ? (
+                <div className="text-center py-14">
+                  <Award className="mx-auto text-gray-300 mb-3" size={40} />
+                  <p className="text-gray-500 text-sm font-medium">No equipment certificates yet</p>
+                  <p className="text-gray-400 text-xs mt-1">
+                    {isAdmin
+                      ? 'Calibration certs, inspection reports, manufacturer documentation — anything specific to a piece of equipment.'
+                      : 'Equipment certificates for any gear on this project will appear here.'}
+                  </p>
+                </div>
+              ) : (
+                <div className="divide-y divide-gray-50">
+                  {equipmentCertificates.map(renderCertRow)}
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Invoices tab */}
       {activeTab === 'invoices' && (
@@ -749,6 +1634,126 @@ export default function ProjectPage() {
         </div>
       )}
 
+      {/* Notes tab (visible to admins + project members) */}
+      {activeTab === 'notes' && (
+        <div className="bg-white border border-gray-200 rounded-xl">
+          <div className="p-5 border-b border-gray-100">
+            <h2 className="font-semibold text-gray-900">Notes</h2>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Headroom, water source, site access — anything everyone working on this project should know. Both sides can see and edit.
+            </p>
+          </div>
+
+          {/* Compose */}
+          <div className="p-5 border-b border-gray-100">
+            <textarea
+              value={newNoteContent}
+              onChange={e => setNewNoteContent(e.target.value)}
+              placeholder="Add a note (everyone on this project sees it)…"
+              rows={3}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            {noteError && <p className="text-red-600 text-xs mt-1">{noteError}</p>}
+            <div className="flex justify-end mt-2">
+              <button
+                onClick={addNote}
+                disabled={addingNote || !newNoteContent.trim()}
+                className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                {addingNote ? 'Saving…' : 'Add note'}
+              </button>
+            </div>
+          </div>
+
+          {/* List */}
+          {notes.length === 0 ? (
+            <div className="text-center py-14">
+              <MessageSquare className="mx-auto text-gray-300 mb-3" size={40} />
+              <p className="text-gray-500 text-sm font-medium">No notes yet</p>
+              <p className="text-gray-400 text-xs mt-1">Be the first to add one — the other side will get an email.</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-gray-50">
+              {notes.map(n => {
+                const isOwn = n.author_id === user?.id
+                const isEditing = editingNoteId === n.id
+                const isAdminAuthor = n.author?.role === 'admin'
+                const authorName = n.author?.full_name || n.author?.email || 'Unknown'
+                const initial = (n.author?.full_name?.[0] ?? n.author?.email?.[0] ?? '?').toUpperCase()
+                return (
+                  <div key={n.id} className="px-5 py-4">
+                    <div className="flex items-start gap-3">
+                      <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-semibold ${isAdminAuthor ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}`}>
+                        {initial}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap mb-0.5">
+                          <span className="text-sm font-medium text-gray-900">{authorName}</span>
+                          <span className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded font-medium ${isAdminAuthor ? 'bg-blue-50 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
+                            {isAdminAuthor ? 'Hydro-Wates' : 'Customer'}
+                          </span>
+                          <span className="text-xs text-gray-400">{formatRelativeTime(n.created_at)}</span>
+                          {n.updated_at !== n.created_at && (
+                            <span className="text-xs text-gray-400">· edited</span>
+                          )}
+                        </div>
+                        {isEditing ? (
+                          <div className="mt-2">
+                            <textarea
+                              value={editingNoteContent}
+                              onChange={e => setEditingNoteContent(e.target.value)}
+                              rows={3}
+                              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <div className="flex gap-2 mt-2 justify-end">
+                              <button
+                                onClick={() => { setEditingNoteId(null); setEditingNoteContent(''); setNoteError('') }}
+                                className="text-xs text-gray-600 hover:text-gray-900 px-3 py-1.5"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                onClick={() => saveEditedNote(n.id)}
+                                disabled={!editingNoteContent.trim()}
+                                className="bg-blue-600 text-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                              >
+                                Save
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-700 whitespace-pre-wrap">{n.content}</p>
+                        )}
+                      </div>
+                      {!isEditing && (isOwn || isAdmin) && (
+                        <div className="flex items-center gap-1 flex-shrink-0">
+                          {isOwn && (
+                            <button
+                              onClick={() => { setEditingNoteId(n.id); setEditingNoteContent(n.content); setNoteError('') }}
+                              className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors"
+                              title="Edit"
+                            >
+                              <Edit2 size={13} />
+                            </button>
+                          )}
+                          <button
+                            onClick={() => deleteNote(n.id)}
+                            className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
+                            title="Delete"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Members tab (admin only) */}
       {activeTab === 'members' && isAdmin && (
         <div className="bg-white border border-gray-200 rounded-xl">
@@ -763,33 +1768,474 @@ export default function ProjectPage() {
             </button>
           </div>
 
-          {members.length === 0 ? (
-            <div className="text-center py-14">
-              <Users className="mx-auto text-gray-300 mb-3" size={40} />
-              <p className="text-gray-500 text-sm font-medium">No members yet</p>
-              <p className="text-gray-400 text-xs mt-1">Add customers to give them access</p>
-            </div>
-          ) : (
-            <div className="divide-y divide-gray-50">
-              {members.map(member => {
-                const p = member.profile as Profile | undefined
-                return (
-                  <div key={member.id} className="flex items-center justify-between px-5 py-3.5">
-                    <div>
-                      <p className="text-sm font-medium text-gray-900">{p?.full_name || 'Unknown'}</p>
-                      <p className="text-xs text-gray-400">{p?.email}</p>
-                    </div>
-                    <button
-                      onClick={() => handleRemoveMember(member.id)}
-                      className="text-xs text-red-500 hover:text-red-700 transition-colors"
-                    >
-                      Remove
-                    </button>
-                  </div>
-                )
-              })}
+          {contactActionMsg && (
+            <div className="mx-5 mt-4 text-xs text-gray-700 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
+              {contactActionMsg}
             </div>
           )}
+
+          {/* Unified list: every project member + every Zoho contact at this
+              project's company. Status badge + contextual action button per row. */}
+          {(() => {
+            const memberRows = members.map(m => {
+              const p = m.profile as Profile | undefined
+              return {
+                key: `m:${m.id}`,
+                name: p?.full_name ?? null,
+                email: p?.email ?? null,
+                status: 'member' as const,
+                memberId: m.id,
+              }
+            })
+            const memberUserIds = new Set(members.map(m => m.user_id))
+            const extraRows = companyContacts
+              .filter(c => !(c.userId && memberUserIds.has(c.userId)))
+              .map(c => ({
+                key: `c:${c.customerId}`,
+                name: c.name,
+                email: c.email,
+                status: c.status,
+                userId: c.userId,
+                customerId: c.customerId,
+              }))
+            const rows: Array<{
+              key: string
+              name: string | null
+              email: string | null
+              status: 'member' | 'has_account' | 'pending'
+              memberId?: string
+              userId?: string
+              customerId?: string
+            }> = [...memberRows, ...extraRows]
+
+            if (rows.length === 0) {
+              return (
+                <div className="text-center py-14">
+                  <Users className="mx-auto text-gray-300 mb-3" size={40} />
+                  <p className="text-gray-500 text-sm font-medium">No members yet</p>
+                  <p className="text-gray-400 text-xs mt-1">
+                    {project?.customer?.company
+                      ? `No Zoho contacts found at ${project.customer.company} yet — they'll appear here once synced.`
+                      : 'Add customers to give them access.'}
+                  </p>
+                </div>
+              )
+            }
+
+            return (
+              <div className="divide-y divide-gray-50">
+                {rows.map(row => (
+                  <div key={row.key} className="flex items-center justify-between px-5 py-3.5 gap-4">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-gray-900 truncate">{row.name || row.email || 'Unknown'}</p>
+                      {row.name && row.email && (
+                        <p className="text-xs text-gray-400 truncate">{row.email}</p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-3 flex-shrink-0">
+                      {row.status === 'member' && (
+                        <>
+                          <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-green-50 text-green-700 font-medium">Member</span>
+                          {row.memberId && (
+                            <button
+                              onClick={() => setPendingRemoveMember({
+                                memberId: row.memberId!,
+                                name: row.name,
+                                email: row.email,
+                              })}
+                              disabled={removingMemberId === row.memberId}
+                              className="text-xs text-red-500 hover:text-red-700 disabled:opacity-50 transition-colors"
+                            >
+                              {removingMemberId === row.memberId ? 'Removing…' : 'Remove'}
+                            </button>
+                          )}
+                        </>
+                      )}
+                      {row.status === 'has_account' && (
+                        <>
+                          <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 font-medium">Has account</span>
+                          <button
+                            onClick={() => setPendingAddMember({
+                              customerId: row.customerId!,
+                              name: row.name,
+                              email: row.email,
+                              status: 'has_account',
+                              userId: row.userId,
+                            })}
+                            disabled={contactActionId === row.customerId}
+                            className="text-xs font-semibold text-blue-600 hover:text-blue-700 disabled:opacity-50 transition-colors"
+                          >
+                            {contactActionId === row.customerId ? 'Adding…' : 'Add to project'}
+                          </button>
+                        </>
+                      )}
+                      {row.status === 'pending' && (
+                        <>
+                          <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 font-medium">Not signed up</span>
+                          <button
+                            onClick={() => setPendingContactInvite({
+                              customerId: row.customerId!,
+                              name: row.name,
+                              email: row.email,
+                              status: 'pending',
+                            })}
+                            disabled={contactActionId === row.customerId || !row.email}
+                            className="text-xs font-semibold text-amber-600 hover:text-amber-700 disabled:opacity-50 transition-colors"
+                          >
+                            {contactActionId === row.customerId ? 'Adding…' : 'Invite to portal & add'}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+          })()}
+        </div>
+      )}
+
+      {/* Inline file preview modal */}
+      {previewing && (
+        <FilePreviewModal
+          file={previewing.file}
+          url={previewing.url}
+          onClose={() => setPreviewing(null)}
+          onDownload={() => handleDownload(previewing.file)}
+        />
+      )}
+
+      {/* Upload confirmation modal (admin only) */}
+      {pendingUpload && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => !uploading && setPendingUpload(null)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-gray-900 mb-1">Confirm upload</h2>
+            <p className="text-sm text-gray-500 mb-4">
+              {pendingUpload.files.length === 1
+                ? 'Ready to upload 1 file to this project.'
+                : `Ready to upload ${pendingUpload.files.length} files to this project.`}
+            </p>
+
+            {/* File list */}
+            <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 mb-5 max-h-40 overflow-auto">
+              <ul className="space-y-1.5">
+                {pendingUpload.files.map((f, i) => (
+                  <li key={i} className="flex items-center gap-2 text-xs text-gray-700 min-w-0">
+                    <FileText size={12} className="text-gray-400 flex-shrink-0" />
+                    <span className="truncate">{f.name}</span>
+                    <span className="text-gray-400 flex-shrink-0 ml-auto">{formatBytes(f.size)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {/* Notify customer toggle */}
+            <div className="flex items-start justify-between gap-4 mb-5 pb-5 border-b border-gray-100">
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-gray-900">Notify customer?</p>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {pendingUpload.notify
+                    ? 'An email will be sent to the customer when this uploads.'
+                    : 'The customer will not receive an email about this upload.'}
+                </p>
+              </div>
+              <button
+                onClick={() => setPendingUpload(p => p ? { ...p, notify: !p.notify } : null)}
+                role="switch"
+                aria-checked={pendingUpload.notify}
+                disabled={uploading}
+                className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors ${pendingUpload.notify ? 'bg-blue-600' : 'bg-gray-300'} disabled:opacity-50`}
+              >
+                <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${pendingUpload.notify ? 'translate-x-6' : 'translate-x-1'}`} />
+              </button>
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setPendingUpload(null)}
+                disabled={uploading}
+                className="flex-1 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const p = pendingUpload
+                  await uploadFiles(p.files, p.ctx, p.notify)
+                  setPendingUpload(null)
+                }}
+                disabled={uploading}
+                className="flex-1 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                {uploading ? 'Uploading…' : 'Confirm upload'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reminder confirmation modal (admin only) */}
+      {pendingReminder && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setPendingReminder(null)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-gray-900 mb-1">Send reminder?</h2>
+            <p className="text-sm text-gray-500 mb-4">
+              Reminder about <strong className="font-medium text-gray-700">{pendingReminder.documentLabel}</strong>. Pick who to email:
+            </p>
+
+            {/* Recipient picker — customer + each project member, all checked
+                by default. Admin can uncheck individuals before sending. */}
+            {(() => {
+              const potential: { email: string; name: string | null; role: 'customer' | 'member' }[] = []
+              if (project?.customer?.email) {
+                potential.push({
+                  email: project.customer.email,
+                  name: project.customer.company || project.customer.name,
+                  role: 'customer',
+                })
+              }
+              for (const m of members) {
+                const e = m.profile?.email
+                if (e && !potential.some(r => r.email.toLowerCase() === e.toLowerCase())) {
+                  potential.push({ email: e, name: m.profile?.full_name || null, role: 'member' })
+                }
+              }
+              return (
+                <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 mb-5 max-h-56 overflow-auto">
+                  {potential.length === 0 ? (
+                    <p className="text-xs text-gray-500 py-2 text-center">No customer email or members to send to.</p>
+                  ) : (
+                    <ul className="space-y-0.5">
+                      {potential.map(r => {
+                        const checked = selectedReminderEmails.includes(r.email)
+                        return (
+                          <li key={r.email}>
+                            <label className="flex items-center gap-2.5 text-xs cursor-pointer hover:bg-gray-100 px-2 py-1.5 rounded">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => setSelectedReminderEmails(prev =>
+                                  checked ? prev.filter(e => e !== r.email) : [...prev, r.email]
+                                )}
+                                className="rounded border-gray-300 text-blue-600 focus:ring-blue-500 flex-shrink-0"
+                              />
+                              <span className="min-w-0 flex-1 truncate">
+                                <span className="font-medium text-gray-900">{r.name || r.email}</span>
+                                {r.name && <span className="text-gray-400 ml-1.5">{r.email}</span>}
+                              </span>
+                              <span className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded flex-shrink-0 ${r.role === 'customer' ? 'bg-blue-50 text-blue-700' : 'bg-gray-100 text-gray-500'}`}>
+                                {r.role}
+                              </span>
+                            </label>
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  )}
+                </div>
+              )
+            })()}
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setPendingReminder(null)}
+                className="flex-1 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmReminder}
+                disabled={selectedReminderEmails.length === 0}
+                className="flex-1 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                Send reminder{selectedReminderEmails.length > 0 ? ` (${selectedReminderEmails.length})` : ''}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Invite confirmation modal — appears before any company-contact invite fires */}
+      {pendingContactInvite && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setPendingContactInvite(null)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-gray-900 mb-1">Invite to portal & add to project?</h2>
+            <p className="text-sm text-gray-500 mb-4">
+              We'll send this person a one-time link to set their password, and add them to this project right away. The moment they log in for the first time, this project will already be on their dashboard — no separate acceptance step.
+            </p>
+
+            <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 mb-5">
+              <p className="text-sm font-medium text-gray-900">{pendingContactInvite.name || pendingContactInvite.email || 'Unnamed contact'}</p>
+              {pendingContactInvite.email && (
+                <p className="text-xs text-gray-500 mt-0.5 truncate">{pendingContactInvite.email}</p>
+              )}
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setPendingContactInvite(null)}
+                disabled={contactActionId === pendingContactInvite.customerId}
+                className="flex-1 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const target = pendingContactInvite
+                  setPendingContactInvite(null)
+                  await inviteContact(target)
+                }}
+                disabled={contactActionId === pendingContactInvite.customerId || !pendingContactInvite.email}
+                className="flex-1 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                Invite & add
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add-to-project confirmation modal — for contacts who already have a
+          portal account. Mirrors the invite-confirmation flow so an
+          accidental click can't silently grant access to a project. */}
+      {pendingAddMember && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setPendingAddMember(null)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-gray-900 mb-1">Add to this project?</h2>
+            <p className="text-sm text-gray-500 mb-4">
+              This person already has a portal account. Adding them will give them access to every file, certificate, invoice, and note on this project the next time they log in. No email is sent.
+            </p>
+
+            <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 mb-5">
+              <p className="text-sm font-medium text-gray-900">{pendingAddMember.name || pendingAddMember.email || 'Unnamed contact'}</p>
+              {pendingAddMember.email && (
+                <p className="text-xs text-gray-500 mt-0.5 truncate">{pendingAddMember.email}</p>
+              )}
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setPendingAddMember(null)}
+                disabled={contactActionId === pendingAddMember.customerId}
+                className="flex-1 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const target = pendingAddMember
+                  setPendingAddMember(null)
+                  await addContactAsMember(target)
+                }}
+                disabled={contactActionId === pendingAddMember.customerId || !pendingAddMember.userId}
+                className="flex-1 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                Add to project
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete-file confirmation modal — every Delete button on the page
+          routes through here. Replaces the browser's native confirm(). */}
+      {pendingDeleteFile && (() => {
+        const f = pendingDeleteFile
+        const fromSharePoint = !!f.sharepoint_source_id
+        const kindLabel = ({
+          purchase_order: 'Purchase order',
+          quote: 'Quote',
+          certificate: 'Certificate',
+          equipment_certificate: 'Equipment certificate',
+          drawing: 'Drawing',
+          general: 'Document',
+        } as Record<string, string>)[f.kind ?? 'general'] ?? 'Document'
+        return (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setPendingDeleteFile(null)}>
+            <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+              <h2 className="text-lg font-semibold text-gray-900 mb-1">Delete this file?</h2>
+              <p className="text-sm text-gray-500 mb-4">
+                This permanently removes the file from the portal. The portal copy can't be recovered.
+                {fromSharePoint && (
+                  <> The original in SharePoint stays where it is — only the portal copy is removed.</>
+                )}
+              </p>
+
+              <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 mb-5">
+                <div className="flex items-start gap-2.5">
+                  <FileText size={16} className="text-gray-400 mt-0.5 flex-shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-gray-900 truncate">{f.name}</p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      {kindLabel} · {formatBytes(f.size)} · {formatDate(f.source_created_at || f.created_at)}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setPendingDeleteFile(null)}
+                  disabled={deletingFileId === f.id}
+                  className="flex-1 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={async () => {
+                    const target = f
+                    setPendingDeleteFile(null)
+                    await confirmDeleteFile(target)
+                  }}
+                  disabled={deletingFileId === f.id}
+                  className="flex-1 bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-red-700 disabled:opacity-50 transition-colors"
+                >
+                  {deletingFileId === f.id ? 'Deleting…' : 'Delete'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* Remove-member confirmation modal — destructive action, so we always
+          confirm. Red button matches the danger of revoking access. */}
+      {pendingRemoveMember && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => setPendingRemoveMember(null)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-gray-900 mb-1">Remove from project?</h2>
+            <p className="text-sm text-gray-500 mb-4">
+              They'll lose access to this project's files, certificates, invoices, and notes immediately. Their portal account stays active — you can re-add them later from the same list. No email is sent.
+            </p>
+
+            <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 mb-5">
+              <p className="text-sm font-medium text-gray-900">{pendingRemoveMember.name || pendingRemoveMember.email || 'Unknown member'}</p>
+              {pendingRemoveMember.email && pendingRemoveMember.name && (
+                <p className="text-xs text-gray-500 mt-0.5 truncate">{pendingRemoveMember.email}</p>
+              )}
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setPendingRemoveMember(null)}
+                disabled={removingMemberId === pendingRemoveMember.memberId}
+                className="flex-1 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const target = pendingRemoveMember
+                  setPendingRemoveMember(null)
+                  await handleRemoveMember(target.memberId)
+                }}
+                disabled={removingMemberId === pendingRemoveMember.memberId}
+                className="flex-1 bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-red-700 disabled:opacity-50 transition-colors"
+              >
+                Remove
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

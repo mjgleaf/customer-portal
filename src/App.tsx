@@ -8,6 +8,11 @@ import CustomersPage from './pages/CustomersPage'
 import CustomerDetailPage from './pages/CustomerDetailPage'
 import SetPasswordPage from './pages/SetPasswordPage'
 import ForgotPasswordPage from './pages/ForgotPasswordPage'
+import AccountPage from './pages/AccountPage'
+import CertificatesPage from './pages/CertificatesPage'
+import InvoicesPage from './pages/InvoicesPage'
+import RequestQuotePage from './pages/RequestQuotePage'
+import QuoteRequestsPage from './pages/QuoteRequestsPage'
 
 export default function App() {
   return (
@@ -21,6 +26,11 @@ export default function App() {
           <Route path="/projects/:id" element={<ProtectedRoute><ProjectPage /></ProtectedRoute>} />
           <Route path="/customers" element={<ProtectedRoute><CustomersPage /></ProtectedRoute>} />
           <Route path="/customers/:id" element={<ProtectedRoute><CustomerDetailPage /></ProtectedRoute>} />
+          <Route path="/certificates" element={<ProtectedRoute><CertificatesPage /></ProtectedRoute>} />
+          <Route path="/invoices" element={<ProtectedRoute><InvoicesPage /></ProtectedRoute>} />
+          <Route path="/request-quote" element={<ProtectedRoute><RequestQuotePage /></ProtectedRoute>} />
+          <Route path="/quote-requests" element={<ProtectedRoute><QuoteRequestsPage /></ProtectedRoute>} />
+          <Route path="/account" element={<ProtectedRoute><AccountPage /></ProtectedRoute>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </AuthProvider>

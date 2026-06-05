@@ -1,6 +1,9 @@
 // Supabase Edge Function: sync-leads
-// Pulls "LeadComments" from the SharePoint "Lead List" (via Microsoft Graph)
-// into projects.lead_comments, matching each lead's QuoteNum to a project name.
+// Pulls fields from the SharePoint "Lead List" (via Microsoft Graph) into
+// each matched project. For each lead matched by QuoteNum -> project.name:
+//   - LeadComments -> projects.lead_comments (shown as "Project scope")
+//   - LeadEmail    -> auto-add the user to project_members (only if a
+//                     profile with that email already exists in the portal)
 // Read-only against SharePoint. Callable by an admin or the scheduled cron.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -12,8 +15,11 @@ const CLIENT_SECRET = Deno.env.get("SHAREPOINT_CLIENT_SECRET")!;
 // Discovered IDs for the Hydro-Wates "Lead List" (stable):
 const SITE_ID = "hydrowates.sharepoint.com,4cf8dd27-3d13-4243-8f37-6ec35f0d1ece,f2e7a899-93ae-47c6-bae1-e7df6ecfe451";
 const LIST_ID = "039ab20f-42ee-404a-a4dd-ee47d7463084";
-const MATCH_FIELD = "QuoteNum";        // matched (trimmed, case-insensitive) against a project's name
-const COMMENTS_FIELD = "LeadComments"; // the description text shown as "Lead notes"
+const MATCH_FIELD = "QuoteNum";         // matched (trimmed, case-insensitive) against a project's name
+const COMMENTS_FIELD = "LeadComments";  // the description text shown as "Project scope"
+// SharePoint may expose the column under any of these internal names — we
+// try them in order. If your column is named differently, add it here.
+const EMAIL_FIELDS = ["LeadEmail", "leademail", "Lead_x0020_Email", "Email"];
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -83,17 +89,54 @@ Deno.serve(async (req) => {
     for (const p of projects ?? []) byName.set(String(p.name).trim().toLowerCase(), p.id);
 
     let matched = 0;
+    let membersAdded = 0;
     for (const f of leads) {
       const q = String(f[MATCH_FIELD] ?? "").trim();
-      const comments = String(f[COMMENTS_FIELD] ?? "").trim();
-      if (!q || !comments) continue;
+      if (!q) continue;
       const projectId = byName.get(q.toLowerCase());
       if (!projectId) continue;
-      const { error } = await admin.from("projects").update({ lead_comments: comments }).eq("id", projectId);
-      if (!error) matched++;
+
+      // 1. LeadComments -> project_scope
+      const comments = String(f[COMMENTS_FIELD] ?? "").trim();
+      if (comments) {
+        const { error } = await admin.from("projects").update({ lead_comments: comments }).eq("id", projectId);
+        if (!error) matched++;
+      }
+
+      // 2. LeadEmail -> auto-add as a project member (only if a portal profile
+      //    already exists for that email). We don't auto-invite people who
+      //    haven't signed up — that's still an admin decision.
+      let email = "";
+      for (const key of EMAIL_FIELDS) {
+        const v = f[key];
+        if (typeof v === "string" && v.trim()) { email = v.trim(); break; }
+      }
+      if (email) {
+        const { data: prof } = await admin
+          .from("profiles").select("id").ilike("email", email).maybeSingle();
+        if (prof?.id) {
+          const { data: existing } = await admin
+            .from("project_members")
+            .select("id")
+            .eq("project_id", projectId)
+            .eq("user_id", prof.id)
+            .maybeSingle();
+          if (!existing) {
+            const { error } = await admin
+              .from("project_members").insert({ project_id: projectId, user_id: prof.id });
+            if (!error) membersAdded++;
+          }
+        }
+      }
     }
 
-    return json({ ok: true, leadsScanned: leads.length, projectsMatched: matched, at: new Date().toISOString() });
+    return json({
+      ok: true,
+      leadsScanned: leads.length,
+      projectsMatched: matched,
+      membersAdded,
+      at: new Date().toISOString(),
+    });
   } catch (e) {
     return json({ error: String((e as Error)?.message ?? e) }, 500);
   }

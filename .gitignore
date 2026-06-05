@@ -1,6 +1,13 @@
 .env
 .env.local
 
+# Supabase CLI runtime/temp directory
+supabase/.temp/
+
+# Local test / personal files that shouldn't ship to GitHub
+public/maybe PO.pdf
+public/*Receipt*.pdf
+
 # Logs
 logs
 *.log
