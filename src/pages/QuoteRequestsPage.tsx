@@ -69,7 +69,7 @@ export default function QuoteRequestsPage() {
   async function fetchRequests() {
     setLoading(true)
     const { data } = await supabase
-      .from('quote_requests')
+      .from('cportal_quote_requests')
       .select('*')
       .order('created_at', { ascending: false })
     setRequests((data ?? []) as QuoteRequest[])
@@ -78,7 +78,7 @@ export default function QuoteRequestsPage() {
 
   async function updateAdminNotes(id: string, admin_notes: string) {
     const { error } = await supabase
-      .from('quote_requests')
+      .from('cportal_quote_requests')
       .update({ admin_notes, updated_at: new Date().toISOString() })
       .eq('id', id)
     if (error) return
@@ -86,7 +86,7 @@ export default function QuoteRequestsPage() {
   }
 
   async function downloadAttachment(path: string) {
-    const { data } = await supabase.storage.from('quote-attachments').createSignedUrl(path, 60)
+    const { data } = await supabase.storage.from('cportal-quote-attachments').createSignedUrl(path, 60)
     if (data?.signedUrl) {
       const a = document.createElement('a')
       a.href = data.signedUrl

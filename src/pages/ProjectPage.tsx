@@ -1,6 +1,6 @@
-﻿import { useEffect, useState, useRef, type ChangeEvent } from 'react'
+import { useEffect, useState, useRef, type ChangeEvent } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award, Eye, Send, MessageSquare, Sparkles, MapPin } from 'lucide-react'
+import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award, Eye, Send, MessageSquare, Sparkles, MapPin, Lock, User, Phone } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import type { Project, ProjectFile, ProjectMember, Profile, Invoice, DocumentRequest } from '../types'
@@ -119,6 +119,7 @@ type ProjectNote = {
   project_id: string
   author_id: string
   content: string
+  internal: boolean
   created_at: string
   updated_at: string
   author?: { full_name: string | null; email: string; role: string } | null
@@ -129,6 +130,14 @@ export default function ProjectPage() {
   const { user, profile } = useAuth()
   const navigate = useNavigate()
   const isAdmin = profile?.role === 'admin'
+  // Service techs use the portal as a logistics view. They read everything
+  // (scope, ship-to, equipment certs, notes, files) but don't interact with
+  // customer/admin workflows like uploading docs or sending reminders.
+  const isServiceTech = profile?.role === 'service_tech'
+  // canUpload covers anyone who actively manages docs (customers + admins).
+  // Service techs are intentionally excluded — keeps the UI focused on
+  // "where am I going + what do I need" instead of paperwork.
+  const canUpload = isAdmin || profile?.role === 'customer'
   const fileInputRef = useRef<HTMLInputElement>(null)
   const uploadCtx = useRef<{ kind: string; requirementId: string | null }>({ kind: 'general', requirementId: null })
 
@@ -221,9 +230,11 @@ export default function ProjectPage() {
   const [analyzeError, setAnalyzeError] = useState('')
   const [showExtracted, setShowExtracted] = useState(false)
 
-  // Project notes — shared comment thread visible to both sides.
+  // Project notes — shared comment thread. Notes marked `internal` are
+  // hidden from customers; admins + techs both see and can author them.
   const [notes, setNotes] = useState<ProjectNote[]>([])
   const [newNoteContent, setNewNoteContent] = useState('')
+  const [newNoteInternal, setNewNoteInternal] = useState(false)
   const [addingNote, setAddingNote] = useState(false)
   const [noteError, setNoteError] = useState('')
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null)
@@ -317,7 +328,7 @@ export default function ProjectPage() {
   async function fetchPOReview(fileId: string) {
     if (!isAdmin) { setPoReview(null); return }
     const { data } = await supabase
-      .from('po_reviews')
+      .from('cportal_po_reviews')
       .select('*')
       .eq('file_id', fileId)
       .maybeSingle()
@@ -348,7 +359,7 @@ export default function ProjectPage() {
   async function fetchNotes() {
     if (!id) return
     const { data: rows } = await supabase
-      .from('project_notes')
+      .from('cportal_project_notes')
       .select('*')
       .eq('project_id', id)
       .order('created_at', { ascending: false })
@@ -356,7 +367,7 @@ export default function ProjectPage() {
     if (list.length === 0) { setNotes([]); return }
     const authorIds = Array.from(new Set(list.map(n => n.author_id)))
     const { data: profs } = await supabase
-      .from('profiles')
+      .from('cportal_profiles')
       .select('id, full_name, email, role')
       .in('id', authorIds)
     const byId = new Map((profs ?? []).map(p => [p.id, p]))
@@ -368,24 +379,32 @@ export default function ProjectPage() {
     setAddingNote(true)
     setNoteError('')
     const trimmed = newNoteContent.trim()
+    // Customers can never insert an internal note (RLS blocks it anyway,
+    // but the checkbox isn't even rendered for them).
+    const internalFlag = newNoteInternal && (isAdmin || isServiceTech)
     const { error } = await supabase
-      .from('project_notes')
-      .insert({ project_id: id, author_id: user.id, content: trimmed })
+      .from('cportal_project_notes')
+      .insert({ project_id: id, author_id: user.id, content: trimmed, internal: internalFlag })
     setAddingNote(false)
     if (error) { setNoteError(error.message); return }
     setNewNoteContent('')
+    setNewNoteInternal(false)
     fetchNotes()
-    // Best-effort: notify the other side via Microsoft Graph.
-    void supabase.functions.invoke('notify-project-note', {
-      body: { projectId: id, portalUrl: window.location.origin },
-    }).catch(() => { /* notification is best-effort */ })
+    // Best-effort: notify the other side via Microsoft Graph. Skip on
+    // internal notes — customers shouldn't be pinged about a note they
+    // can't see, and team-to-team notifications aren't wired up.
+    if (!internalFlag) {
+      void supabase.functions.invoke('notify-project-note', {
+        body: { projectId: id, portalUrl: window.location.origin },
+      }).catch(() => { /* notification is best-effort */ })
+    }
   }
 
   async function saveEditedNote(noteId: string) {
     if (!editingNoteContent.trim()) return
     const trimmed = editingNoteContent.trim()
     const { error } = await supabase
-      .from('project_notes')
+      .from('cportal_project_notes')
       .update({ content: trimmed, updated_at: new Date().toISOString() })
       .eq('id', noteId)
     if (error) { setNoteError(error.message); return }
@@ -399,7 +418,7 @@ export default function ProjectPage() {
 
   async function deleteNote(noteId: string) {
     if (!confirm('Delete this note?')) return
-    const { error } = await supabase.from('project_notes').delete().eq('id', noteId)
+    const { error } = await supabase.from('cportal_project_notes').delete().eq('id', noteId)
     if (error) { setNoteError(error.message); return }
     fetchNotes()
   }
@@ -409,7 +428,7 @@ export default function ProjectPage() {
   async function fetchLastReminders() {
     if (!id) return
     const { data } = await supabase
-      .from('reminders')
+      .from('cportal_reminders')
       .select('document_key, sent_at')
       .eq('project_id', id)
       .order('sent_at', { ascending: false })
@@ -422,8 +441,8 @@ export default function ProjectPage() {
 
   async function fetchProject() {
     const { data } = await supabase
-      .from('projects')
-      .select('*, customer:customers(company, name, email, shipping_address, shipping_city, shipping_state, shipping_zip, shipping_country, billing_address, billing_city, billing_state, billing_zip, billing_country)')
+      .from('cportal_projects')
+      .select('*, customer:cportal_customers(company, name, email, shipping_address, shipping_city, shipping_state, shipping_zip, shipping_country, billing_address, billing_city, billing_state, billing_zip, billing_country)')
       .eq('id', id)
       .single()
     if (!data) { navigate('/'); return }
@@ -436,7 +455,7 @@ export default function ProjectPage() {
 
   async function fetchFiles() {
     const { data } = await supabase
-      .from('files')
+      .from('cportal_files')
       .select('*')
       .eq('project_id', id)
       .order('created_at', { ascending: false })
@@ -446,7 +465,7 @@ export default function ProjectPage() {
     // "by Jane Doe" next to each row.
     const ids = Array.from(new Set(list.map(f => f.uploaded_by).filter((v): v is string => !!v)))
     if (ids.length === 0) { setUploaderById({}); return }
-    const { data: profs } = await supabase.from('profiles').select('*').in('id', ids)
+    const { data: profs } = await supabase.from('cportal_profiles').select('*').in('id', ids)
     const next: Record<string, Profile> = {}
     for (const p of profs ?? []) next[p.id] = p
     setUploaderById(next)
@@ -454,7 +473,7 @@ export default function ProjectPage() {
 
   async function fetchDocumentRequests() {
     const { data } = await supabase
-      .from('document_requests')
+      .from('cportal_document_requests')
       .select('*')
       .eq('project_id', id)
       .order('created_at', { ascending: true })
@@ -464,7 +483,7 @@ export default function ProjectPage() {
   async function fetchInvoices(customerId: string | null) {
     if (!customerId) { setInvoices([]); return }
     const { data } = await supabase
-      .from('invoices')
+      .from('cportal_invoices')
       .select('*')
       .eq('customer_id', customerId)
       .order('invoice_date', { ascending: false })
@@ -502,7 +521,7 @@ export default function ProjectPage() {
 
   async function fetchMembers() {
     const { data: rows } = await supabase
-      .from('project_members')
+      .from('cportal_project_members')
       .select('id, project_id, user_id, created_at')
       .eq('project_id', id)
     const list = rows ?? []
@@ -510,7 +529,7 @@ export default function ProjectPage() {
     // project_members.user_id points at auth.users, not profiles, so we can't
     // embed the profile directly — fetch profiles separately and merge.
     const { data: profs } = await supabase
-      .from('profiles')
+      .from('cportal_profiles')
       .select('*')
       .in('id', list.map(r => r.user_id))
     const byId = new Map((profs ?? []).map(p => [p.id, p]))
@@ -518,8 +537,8 @@ export default function ProjectPage() {
   }
 
   async function fetchAvailableProfiles() {
-    const { data: allProfiles } = await supabase.from('profiles').select('*').eq('role', 'customer')
-    const { data: currentMembers } = await supabase.from('project_members').select('user_id').eq('project_id', id)
+    const { data: allProfiles } = await supabase.from('cportal_profiles').select('*').eq('role', 'customer')
+    const { data: currentMembers } = await supabase.from('cportal_project_members').select('user_id').eq('project_id', id)
     const memberIds = new Set(currentMembers?.map(m => m.user_id) ?? [])
     setAvailableProfiles((allProfiles ?? []).filter(p => !memberIds.has(p.id)))
   }
@@ -531,7 +550,7 @@ export default function ProjectPage() {
     const company = project?.customer?.company
     if (!company) { setCompanyContacts([]); return }
     const { data: customers } = await supabase
-      .from('customers')
+      .from('cportal_customers')
       .select('id, name, email, company')
       .eq('company', company)
     if (!customers || customers.length === 0) { setCompanyContacts([]); return }
@@ -539,7 +558,7 @@ export default function ProjectPage() {
     let profileByEmail = new Map<string, string>()
     if (emails.length > 0) {
       const { data: profs } = await supabase
-        .from('profiles').select('id, email').in('email', emails)
+        .from('cportal_profiles').select('id, email').in('email', emails)
       profileByEmail = new Map((profs ?? [])
         .filter((p): p is { id: string; email: string } => !!p.email)
         .map(p => [p.email.toLowerCase(), p.id]))
@@ -600,7 +619,7 @@ export default function ProjectPage() {
     const newUserId = data?.user_id as string | undefined
     if (newUserId) {
       const { error: memberError } = await supabase
-        .from('project_members')
+        .from('cportal_project_members')
         .insert({ project_id: id, user_id: newUserId })
       if (memberError && !memberError.message?.toLowerCase().includes('duplicate')) {
         setContactActionId(null)
@@ -622,7 +641,7 @@ export default function ProjectPage() {
     if (!contact.userId || !id) return
     setContactActionId(contact.customerId)
     const { error } = await supabase
-      .from('project_members')
+      .from('cportal_project_members')
       .insert({ project_id: id, user_id: contact.userId })
     setContactActionId(null)
     if (error) {
@@ -672,12 +691,12 @@ export default function ProjectPage() {
     const insertedPoFileIds: string[] = []
     for (const file of files) {
       const storagePath = `${id}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${file.name}`
-      const { error: storageError } = await supabase.storage.from('project-files').upload(storagePath, file)
+      const { error: storageError } = await supabase.storage.from('cportal-project-files').upload(storagePath, file)
       if (storageError) {
         setUploadError(storageError.message)
         continue
       }
-      const { data: insertedFile } = await supabase.from('files').insert({
+      const { data: insertedFile } = await supabase.from('cportal_files').insert({
         project_id: id,
         name: file.name,
         storage_path: storagePath,
@@ -717,7 +736,25 @@ export default function ProjectPage() {
   }
 
   async function handleDownload(file: ProjectFile) {
-    const { data } = await supabase.storage.from('project-files').createSignedUrl(file.storage_path, 60)
+    // SharePoint reference-only file: bytes live in SharePoint, storage_path is NULL.
+    // Ask the edge function for a short-lived Graph download URL.
+    if (file.sharepoint_source_id) {
+      const { data, error } = await supabase.functions.invoke('get-sharepoint-download-url', {
+        body: { fileId: file.id, mode: 'download' },
+      })
+      const url = (data as { url?: string; downloadUrl?: string } | null)?.url
+        ?? (data as { downloadUrl?: string } | null)?.downloadUrl
+      if (error || !url) {
+        alert("Couldn't get download URL for this file. " + (error?.message ?? ''))
+        return
+      }
+      const a = document.createElement('a')
+      a.href = url
+      a.download = file.name
+      a.click()
+      return
+    }
+    const { data } = await supabase.storage.from('cportal-project-files').createSignedUrl(file.storage_path, 60)
     if (data?.signedUrl) {
       const a = document.createElement('a')
       a.href = data.signedUrl
@@ -728,7 +765,22 @@ export default function ProjectPage() {
 
   // Open the inline preview modal for any file (PDF / image / fallback).
   async function previewFile(file: ProjectFile) {
-    const { data } = await supabase.storage.from('project-files').createSignedUrl(file.storage_path, 300)
+    // SharePoint reference-only file: use Graph's /preview endpoint, which
+    // returns an embeddable iframe URL (same renderer SharePoint uses inline).
+    if (file.sharepoint_source_id) {
+      const { data, error } = await supabase.functions.invoke('get-sharepoint-download-url', {
+        body: { fileId: file.id, mode: 'preview' },
+      })
+      const url = (data as { url?: string; downloadUrl?: string } | null)?.url
+        ?? (data as { downloadUrl?: string } | null)?.downloadUrl
+      if (error || !url) {
+        alert("Couldn't load preview for this file. " + (error?.message ?? ''))
+        return
+      }
+      setPreviewing({ file, url })
+      return
+    }
+    const { data } = await supabase.storage.from('cportal-project-files').createSignedUrl(file.storage_path, 300)
     if (data?.signedUrl) setPreviewing({ file, url: data.signedUrl })
   }
 
@@ -784,33 +836,33 @@ export default function ProjectPage() {
 
   async function confirmDeleteFile(file: ProjectFile) {
     setDeletingFileId(file.id)
-    await supabase.storage.from('project-files').remove([file.storage_path])
-    await supabase.from('files').delete().eq('id', file.id)
+    await supabase.storage.from('cportal-project-files').remove([file.storage_path])
+    await supabase.from('cportal_files').delete().eq('id', file.id)
     setDeletingFileId(null)
     fetchFiles()
   }
 
   async function updateRetestDue(fileId: string, due: string | null) {
-    await supabase.from('files').update({ retest_due: due }).eq('id', fileId)
+    await supabase.from('cportal_files').update({ retest_due: due }).eq('id', fileId)
     fetchFiles()
   }
 
   async function addRequirement() {
     const label = newRequirement.trim()
     if (!label || !id) return
-    await supabase.from('document_requests').insert({ project_id: id, label })
+    await supabase.from('cportal_document_requests').insert({ project_id: id, label })
     setNewRequirement('')
     fetchDocumentRequests()
   }
 
   async function deleteRequirement(reqId: string) {
-    await supabase.from('document_requests').delete().eq('id', reqId)
+    await supabase.from('cportal_document_requests').delete().eq('id', reqId)
     fetchDocumentRequests()
   }
 
   async function handleSaveEdit() {
     if (!project) return
-    await supabase.from('projects').update({
+    await supabase.from('cportal_projects').update({
       name: editName.trim(),
       description: editDesc.trim() || null,
       updated_at: new Date().toISOString(),
@@ -821,7 +873,7 @@ export default function ProjectPage() {
 
   async function handleAddMember() {
     if (!selectedUserId || !id) return
-    await supabase.from('project_members').insert({ project_id: id, user_id: selectedUserId })
+    await supabase.from('cportal_project_members').insert({ project_id: id, user_id: selectedUserId })
     setShowAddMember(false)
     setSelectedUserId('')
     fetchMembers()
@@ -830,7 +882,7 @@ export default function ProjectPage() {
 
   async function handleRemoveMember(memberId: string) {
     setRemovingMemberId(memberId)
-    await supabase.from('project_members').delete().eq('id', memberId)
+    await supabase.from('cportal_project_members').delete().eq('id', memberId)
     setRemovingMemberId(null)
     fetchMembers()
     fetchAvailableProfiles()
@@ -846,9 +898,16 @@ export default function ProjectPage() {
 
   if (!project) return null
 
+  // Tabs are role-aware:
+  //   admin       → everything (members + invoices + admin reminders)
+  //   customer    → everything except members tab
+  //   service_tech → logistics view: documents, drawings, certs, notes.
+  //                  No invoices (billing isn't their concern), no members tab.
   const tabList: TabKey[] = isAdmin
     ? ['documents', 'drawings', 'certificates', 'invoices', 'notes', 'members']
-    : ['documents', 'drawings', 'certificates', 'invoices', 'notes']
+    : isServiceTech
+      ? ['documents', 'drawings', 'certificates', 'notes']
+      : ['documents', 'drawings', 'certificates', 'invoices', 'notes']
 
   const certificates = files.filter(f => f.kind === 'certificate')
   const equipmentCertificates = files.filter(f => f.kind === 'equipment_certificate')
@@ -1044,7 +1103,7 @@ export default function ProjectPage() {
                     <button
                       onClick={() => poFile ? handleDeleteFile(poFile) : triggerUpload({ kind: 'purchase_order', requirementId: null })}
                       disabled={uploading}
-                      className={`text-xs font-semibold px-2 py-1 disabled:opacity-50 ${poFile ? 'text-red-600 hover:text-red-700' : 'text-blue-600 hover:text-blue-700'}`}
+                      className={`text-xs font-semibold px-2 py-1 disabled:opacity-50 ${poFile ? 'text-red-600 hover:text-red-700' : 'text-blue-600 hover:text-blue-700'} ${!canUpload ? 'hidden' : ''}`}
                     >
                       {poFile ? 'Delete' : 'Upload'}
                     </button>
@@ -1128,8 +1187,9 @@ export default function ProjectPage() {
                 )}
               </div>
 
-              {/* Admin-defined required documents */}
-              {documentRequests.map(req => {
+              {/* Admin-defined required documents. Hidden from service techs
+                  — they don't deal with the missing-docs workflow. */}
+              {!isServiceTech && documentRequests.map(req => {
                 const f = fileByRequirement.get(req.id)
                 const reminderKey = `req-${req.id}`
                 return (
@@ -1498,6 +1558,31 @@ export default function ProjectPage() {
                         : 'No shipping address on file. Contact Hydro-Wates to confirm where you want certificates shipped.'}
                     </p>
                   )}
+
+                  {/* Site contact — pulled from the SharePoint Lead List
+                      (ContactNameOnSite + ContactPhoneOnSite). Service-tech
+                      view only; admins/customers don't need this on the
+                      project page. */}
+                  {isServiceTech && (project?.site_contact || project?.site_contact_phone) && (
+                    <div className="mt-4 pt-4 border-t border-gray-100">
+                      <div className="flex items-center gap-1.5 mb-1.5">
+                        <User size={13} className="text-gray-400" />
+                        <span className="text-[10px] uppercase tracking-wide text-gray-500 font-medium">Site contact</span>
+                      </div>
+                      {project?.site_contact && (
+                        <p className="text-sm font-medium text-gray-900">{project.site_contact}</p>
+                      )}
+                      {project?.site_contact_phone && (
+                        <a
+                          href={`tel:${project.site_contact_phone.replace(/[^+\d]/g, '')}`}
+                          className="inline-flex items-center gap-1.5 mt-1.5 text-sm font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 active:bg-blue-200 rounded-lg px-3 py-1.5 transition-colors"
+                        >
+                          <Phone size={13} />
+                          {project.site_contact_phone}
+                        </a>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1616,7 +1701,7 @@ export default function ProjectPage() {
                   <div className="flex items-center gap-4 ml-4 flex-shrink-0">
                     <div className="text-right">
                       <p className="text-sm font-medium text-gray-900">{formatMoney(inv.total, inv.currency_code)}</p>
-                      {inv.balance != null && inv.balance > 0 && (
+                      {inv.balance != null && inv.balance > 0 && inv.status !== 'void' && inv.status !== 'draft' && (
                         <p className="text-xs text-gray-400">{formatMoney(inv.balance, inv.currency_code)} due</p>
                       )}
                     </div>
@@ -1641,6 +1726,9 @@ export default function ProjectPage() {
             <h2 className="font-semibold text-gray-900">Notes</h2>
             <p className="text-xs text-gray-500 mt-0.5">
               Headroom, water source, site access — anything everyone working on this project should know. Both sides can see and edit.
+              {(isAdmin || isServiceTech) && (
+                <> Use <span className="font-medium text-gray-700">Private</span> notes for team-only context — those stay hidden from the customer.</>
+              )}
             </p>
           </div>
 
@@ -1649,49 +1737,79 @@ export default function ProjectPage() {
             <textarea
               value={newNoteContent}
               onChange={e => setNewNoteContent(e.target.value)}
-              placeholder="Add a note (everyone on this project sees it)…"
+              placeholder={
+                newNoteInternal
+                  ? 'Private note — visible to admins and service techs only…'
+                  : 'Add a note (everyone on this project sees it)…'
+              }
               rows={3}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className={`w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 ${
+                newNoteInternal
+                  ? 'border-amber-300 bg-amber-50/40 focus:ring-amber-500'
+                  : 'border-gray-300 focus:ring-blue-500'
+              }`}
             />
             {noteError && <p className="text-red-600 text-xs mt-1">{noteError}</p>}
-            <div className="flex justify-end mt-2">
+            <div className="flex items-center justify-between gap-3 mt-2 flex-wrap">
+              {(isAdmin || isServiceTech) ? (
+                <label className="inline-flex items-center gap-2 text-xs text-gray-700 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={newNoteInternal}
+                    onChange={e => setNewNoteInternal(e.target.checked)}
+                    className="h-4 w-4 rounded border-gray-300 text-amber-600 focus:ring-amber-500"
+                  />
+                  <Lock size={12} className="text-amber-600" />
+                  <span>Private note <span className="text-gray-400">(techs &amp; admins only)</span></span>
+                </label>
+              ) : <span />}
               <button
                 onClick={addNote}
                 disabled={addingNote || !newNoteContent.trim()}
-                className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                className={`px-4 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-50 transition-colors ${
+                  newNoteInternal ? 'bg-amber-600 hover:bg-amber-700' : 'bg-blue-600 hover:bg-blue-700'
+                }`}
               >
-                {addingNote ? 'Saving…' : 'Add note'}
+                {addingNote ? 'Saving…' : newNoteInternal ? 'Post private note' : 'Add note'}
               </button>
             </div>
           </div>
 
-          {/* List */}
-          {notes.length === 0 ? (
-            <div className="text-center py-14">
-              <MessageSquare className="mx-auto text-gray-300 mb-3" size={40} />
-              <p className="text-gray-500 text-sm font-medium">No notes yet</p>
-              <p className="text-gray-400 text-xs mt-1">Be the first to add one — the other side will get an email.</p>
-            </div>
-          ) : (
-            <div className="divide-y divide-gray-50">
-              {notes.map(n => {
-                const isOwn = n.author_id === user?.id
-                const isEditing = editingNoteId === n.id
-                const isAdminAuthor = n.author?.role === 'admin'
-                const authorName = n.author?.full_name || n.author?.email || 'Unknown'
-                const initial = (n.author?.full_name?.[0] ?? n.author?.email?.[0] ?? '?').toUpperCase()
-                return (
-                  <div key={n.id} className="px-5 py-4">
+          {/* Split into Private (team-only) and Shared sections so it's
+              obvious at a glance who can see what. Customers don't get the
+              Private header since RLS already hides those notes from them. */}
+          {(() => {
+            const privateNotes = notes.filter(n => n.internal)
+            const sharedNotes = notes.filter(n => !n.internal)
+            const isTeamMember = isAdmin || isServiceTech
+
+            const renderNote = (n: ProjectNote) => {
+              const isOwn = n.author_id === user?.id
+              const isEditing = editingNoteId === n.id
+              const authorRole = n.author?.role
+              const isAdminAuthor = authorRole === 'admin'
+              const isTechAuthor = authorRole === 'service_tech'
+              const isTeamAuthor = isAdminAuthor || isTechAuthor
+              const authorName = n.author?.full_name || n.author?.email || 'Unknown'
+              const initial = (n.author?.full_name?.[0] ?? n.author?.email?.[0] ?? '?').toUpperCase()
+              return (
+                <div key={n.id} className={`px-5 py-4 ${n.internal ? 'bg-amber-50/30 border-l-4 border-amber-400' : ''}`}>
                     <div className="flex items-start gap-3">
-                      <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-semibold ${isAdminAuthor ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}`}>
+                      <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-semibold ${isTeamAuthor ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}`}>
                         {initial}
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2 flex-wrap mb-0.5">
                           <span className="text-sm font-medium text-gray-900">{authorName}</span>
-                          <span className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded font-medium ${isAdminAuthor ? 'bg-blue-50 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
-                            {isAdminAuthor ? 'Hydro-Wates' : 'Customer'}
+                          <span className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded font-medium ${isTeamAuthor ? 'bg-blue-50 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
+                            {isTechAuthor ? 'Service Tech' : isAdminAuthor ? 'Hydro-Wates' : 'Customer'}
                           </span>
+                          {n.internal && (
+                            <span className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded font-medium bg-amber-100 text-amber-800">
+                              <Lock size={10} />
+                              Private
+                            </span>
+                          )}
                           <span className="text-xs text-gray-400">{formatRelativeTime(n.created_at)}</span>
                           {n.updated_at !== n.created_at && (
                             <span className="text-xs text-gray-400">· edited</span>
@@ -1748,9 +1866,58 @@ export default function ProjectPage() {
                     </div>
                   </div>
                 )
-              })}
-            </div>
-          )}
+            }
+
+            return (
+              <>
+                {/* Private notes section — team members only */}
+                {isTeamMember && (
+                  <div>
+                    <div className="flex items-center gap-2 px-5 py-3 bg-amber-50/60 border-b border-amber-100">
+                      <Lock size={13} className="text-amber-700" />
+                      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-amber-800">Private notes</h3>
+                      <span className="text-[11px] text-amber-700/80">· team only</span>
+                      <span className="ml-auto text-[11px] text-amber-700/80">{privateNotes.length}</span>
+                    </div>
+                    {privateNotes.length === 0 ? (
+                      <div className="px-5 py-6 text-center">
+                        <p className="text-xs text-gray-400">No private notes yet — these stay hidden from the customer.</p>
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-gray-50">
+                        {privateNotes.map(renderNote)}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Shared notes section — visible to everyone */}
+                <div>
+                  <div className="flex items-center gap-2 px-5 py-3 bg-gray-50 border-b border-gray-100">
+                    <MessageSquare size={13} className="text-gray-600" />
+                    <h3 className="text-[11px] font-semibold uppercase tracking-wider text-gray-700">Project notes</h3>
+                    <span className="text-[11px] text-gray-500">· everyone on this project</span>
+                    <span className="ml-auto text-[11px] text-gray-500">{sharedNotes.length}</span>
+                  </div>
+                  {sharedNotes.length === 0 ? (
+                    <div className="text-center py-12">
+                      <MessageSquare className="mx-auto text-gray-300 mb-3" size={36} />
+                      <p className="text-gray-500 text-sm font-medium">No notes yet</p>
+                      <p className="text-gray-400 text-xs mt-1">
+                        {isTeamMember
+                          ? 'Add one above — the customer will get an email.'
+                          : 'Be the first to add one — Hydro-Wates will get an email.'}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-gray-50">
+                      {sharedNotes.map(renderNote)}
+                    </div>
+                  )}
+                </div>
+              </>
+            )
+          })()}
         </div>
       )}
 

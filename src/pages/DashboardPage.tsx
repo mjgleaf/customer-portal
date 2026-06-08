@@ -38,6 +38,11 @@ const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')
 export default function DashboardPage() {
   const { profile } = useAuth()
   const isAdmin = profile?.role === 'admin'
+  const isServiceTech = profile?.role === 'service_tech'
+  // Service techs use the dashboard as a job list. They don't deal with
+  // "missing documents" reminders — that's the customer/admin paperwork
+  // workflow. Suppress action items + the action banner for them.
+  const showActionItems = profile?.role !== 'service_tech'
   const [projects, setProjects] = useState<Project[]>([])
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
@@ -82,11 +87,13 @@ export default function DashboardPage() {
     // RLS returns exactly the projects this user may see: admins get all;
     // customers get their own (matched by Zoho contact email, or manual membership).
     const { data } = await supabase
-      .from('projects')
-      .select('*, customer:customers(company, name)')
+      .from('cportal_projects')
+      .select('*, customer:cportal_customers(company, name)')
       .order('created_at', { ascending: false })
     setProjects(data ?? [])
-    fetchActionItems((data ?? []).map((p) => p.id))
+    // Skip action-items fetch for techs — they don't care about missing
+    // documents (it's a customer/admin paperwork concern, not theirs).
+    if (showActionItems) fetchActionItems((data ?? []).map((p) => p.id))
     setLoading(false)
   }
 
@@ -94,8 +101,8 @@ export default function DashboardPage() {
   async function fetchActionItems(ids: string[]) {
     if (ids.length === 0) { setActionItems({}); return }
     const [reqRes, fileRes] = await Promise.all([
-      supabase.from('document_requests').select('id, project_id').in('project_id', ids),
-      supabase.from('files').select('project_id, kind, document_request_id').in('project_id', ids),
+      supabase.from('cportal_document_requests').select('id, project_id').in('project_id', ids),
+      supabase.from('cportal_files').select('project_id, kind, document_request_id').in('project_id', ids),
     ])
     const reqs = reqRes.data ?? []
     const files = fileRes.data ?? []
@@ -110,11 +117,15 @@ export default function DashboardPage() {
   }
 
   async function fetchStats() {
-    const { data } = await supabase.from('invoices').select('balance, currency_code')
+    const { data } = await supabase.from('cportal_invoices').select('balance, currency_code, status')
     let outstanding = 0
     let currency = 'USD'
     for (const i of data ?? []) {
       const b = Number(i.balance)
+      // Void = cancelled, draft = not yet sent. Both carry a balance in
+      // Zoho but neither represents money the customer actually owes,
+      // so skip them when totalling outstanding.
+      if (i.status === 'void' || i.status === 'draft') continue
       if (!isNaN(b) && b > 0) { outstanding += b; if (i.currency_code) currency = i.currency_code }
     }
     setStats({ outstanding, currency })
@@ -172,7 +183,7 @@ export default function DashboardPage() {
         <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center group-hover:bg-blue-100 transition-colors">
           <FolderOpen size={20} className="text-blue-600" />
         </div>
-        {!isAdmin && (actionItems[project.id] ?? 0) > 0 && (
+        {showActionItems && !isAdmin && (actionItems[project.id] ?? 0) > 0 && (
           <span className="text-xs font-semibold px-2 py-1 rounded-full text-amber-700 bg-amber-100">
             {actionItems[project.id]} needed
           </span>
@@ -262,7 +273,7 @@ export default function DashboardPage() {
           </p>
         )}
       </div>
-      {!isAdmin && totalActionItems > 0 && (
+      {showActionItems && !isAdmin && totalActionItems > 0 && (
         <div className="mb-6 flex items-center gap-3 bg-amber-50 border border-amber-200 text-amber-800 rounded-xl px-4 py-3">
           <AlertCircle size={18} className="flex-shrink-0" />
           <p className="text-sm font-medium">
@@ -289,14 +300,14 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {isAdmin && !loading && projects.length > 0 && (
+      {(isAdmin || isServiceTech) && !loading && projects.length > 0 && (
         <div className="mb-5">
           <div className="relative max-w-sm">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
             <input
               value={search}
               onChange={e => setSearch(e.target.value)}
-              placeholder="Search by company or HWI number..."
+              placeholder={isServiceTech ? 'Search by company, HWI #, or site…' : 'Search by company or HWI number...'}
               className="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
           </div>

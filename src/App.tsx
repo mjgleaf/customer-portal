@@ -13,6 +13,7 @@ import CertificatesPage from './pages/CertificatesPage'
 import InvoicesPage from './pages/InvoicesPage'
 import RequestQuotePage from './pages/RequestQuotePage'
 import QuoteRequestsPage from './pages/QuoteRequestsPage'
+import TeamPage from './pages/TeamPage'
 
 export default function App() {
   return (
@@ -30,6 +31,7 @@ export default function App() {
           <Route path="/invoices" element={<ProtectedRoute><InvoicesPage /></ProtectedRoute>} />
           <Route path="/request-quote" element={<ProtectedRoute><RequestQuotePage /></ProtectedRoute>} />
           <Route path="/quote-requests" element={<ProtectedRoute><QuoteRequestsPage /></ProtectedRoute>} />
+          <Route path="/team" element={<ProtectedRoute><TeamPage /></ProtectedRoute>} />
           <Route path="/account" element={<ProtectedRoute><AccountPage /></ProtectedRoute>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

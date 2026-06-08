@@ -26,8 +26,8 @@ export default function CustomersPage() {
 
   async function fetchData() {
     setLoading(true)
-    const { data: custs } = await supabase.from('customers').select('*').order('company', { ascending: true })
-    const { data: profs } = await supabase.from('profiles').select('email')
+    const { data: custs } = await supabase.from('cportal_customers').select('*').order('company', { ascending: true })
+    const { data: profs } = await supabase.from('cportal_profiles').select('email')
     setInvitedEmails(new Set((profs ?? []).map(p => (p.email ?? '').toLowerCase()).filter(Boolean)))
     setCustomers((custs ?? []) as Customer[])
     setLoading(false)

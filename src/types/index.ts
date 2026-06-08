@@ -3,7 +3,8 @@ export interface Profile {
   email: string | null
   full_name: string | null
   company: string | null
-  role: 'customer' | 'admin'
+  phone: string | null
+  role: 'customer' | 'admin' | 'service_tech'
   created_at: string
   email_notifications?: boolean
 }
@@ -17,6 +18,8 @@ export interface Project {
   updated_at: string
   started_on?: string | null
   customer_id?: string | null
+  site_contact?: string | null
+  site_contact_phone?: string | null
   customer?: {
     company: string | null
     name: string | null

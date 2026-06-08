@@ -1,5 +1,6 @@
 .env
 .env.local
+.env.backup*
 
 # Supabase CLI runtime/temp directory
 supabase/.temp/

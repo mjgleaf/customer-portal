@@ -58,8 +58,8 @@ export default function InvoicesPage() {
     // RLS gates rows: customer sees own; admin sees all. The customer
     // embed pulls company name so admins can scan whose invoice is whose.
     const { data } = await supabase
-      .from('invoices')
-      .select('*, project:projects(id, name), customer:customers(company, name)')
+      .from('cportal_invoices')
+      .select('*, project:cportal_projects(id, name), customer:cportal_customers(company, name)')
       .order('invoice_date', { ascending: false, nullsFirst: false })
     setInvoices((data ?? []) as InvoiceWithRelations[])
     setLoading(false)
@@ -106,12 +106,18 @@ export default function InvoicesPage() {
   })
 
   // Summary stats — only meaningful when filter is empty (full list).
+  // Void/draft invoices carry a Zoho balance but represent no real
+  // money owed, so exclude them from "Outstanding".
+  const isOutstanding = (inv: Invoice) =>
+    inv.status !== 'void'
+    && inv.status !== 'draft'
+    && Number(inv.balance) > 0
   const outstandingTotal = invoices.reduce((sum, inv) => {
     const b = Number(inv.balance)
-    return !isNaN(b) && b > 0 ? sum + b : sum
+    return isOutstanding(inv) && !isNaN(b) ? sum + b : sum
   }, 0)
-  const outstandingCurrency = invoices.find(i => Number(i.balance) > 0)?.currency_code || 'USD'
-  const outstandingCount = invoices.filter(i => Number(i.balance) > 0).length
+  const outstandingCurrency = invoices.find(isOutstanding)?.currency_code || 'USD'
+  const outstandingCount = invoices.filter(isOutstanding).length
 
   return (
     <div className="p-8 max-w-5xl mx-auto">
@@ -212,7 +218,7 @@ export default function InvoicesPage() {
                 <div className="flex items-center gap-3 flex-shrink-0">
                   <div className="text-right">
                     <p className="text-sm font-semibold text-gray-900">{formatMoney(inv.total, inv.currency_code)}</p>
-                    {Number(inv.balance) > 0 && (
+                    {isOutstanding(inv) && (
                       <p className="text-xs text-amber-600">{formatMoney(inv.balance, inv.currency_code)} due</p>
                     )}
                   </div>

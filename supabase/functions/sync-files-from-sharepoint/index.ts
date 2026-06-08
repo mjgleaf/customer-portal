@@ -102,6 +102,58 @@ function findProjectFolder(
   return null;
 }
 
+// ---- SharePoint List helpers (for the equipment cert pipeline) ----
+
+const listIdCache = new Map<string, string>();
+async function getListId(siteId: string, listName: string, token: string): Promise<string | null> {
+  const cacheKey = `${siteId}/${listName}`;
+  if (listIdCache.has(cacheKey)) return listIdCache.get(cacheKey)!;
+  const r = await fetch(
+    `https://graph.microsoft.com/v1.0/sites/${siteId}/lists?$select=id,displayName,name`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!r.ok) throw new Error(`Lists query failed (${r.status}): ${await r.text()}`);
+  const j = await r.json();
+  const lower = listName.trim().toLowerCase();
+  const found = (j.value ?? []).find((l: { displayName?: string; name?: string }) =>
+    l.displayName?.toLowerCase() === lower || l.name?.toLowerCase() === lower,
+  );
+  if (!found?.id) return null;
+  listIdCache.set(cacheKey, found.id as string);
+  return found.id as string;
+}
+
+// Generic paginated list-items fetch with a $filter. Uses the
+// HonorNonIndexedQueriesWarningMayFailRandomly Prefer header so we don't
+// have to maintain SharePoint column indexes; for low-volume admin use
+// that's a fine trade-off.
+async function fetchListItems(
+  siteId: string,
+  listId: string,
+  filterClause: string,
+  selectFields: string[],
+  token: string,
+): Promise<Array<Record<string, unknown>>> {
+  const expand = `fields(select=${selectFields.join(",")})`;
+  let url = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items?expand=${expand}&$filter=${encodeURIComponent(filterClause)}&$top=500`;
+  const out: Array<Record<string, unknown>> = [];
+  for (let page = 0; page < 20 && url; page++) {
+    const r = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Prefer: "HonorNonIndexedQueriesWarningMayFailRandomly",
+      },
+    });
+    if (!r.ok) {
+      throw new Error(`List items fetch failed (${r.status}): ${(await r.text()).slice(0, 200)}`);
+    }
+    const j = await r.json();
+    for (const it of (j.value ?? [])) out.push(it.fields ?? {});
+    url = (j["@odata.nextLink"] as string) || "";
+  }
+  return out;
+}
+
 async function listChildren(driveId: string, path: string, token: string) {
   const url = path
     ? `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${encodeURI(path)}:/children?$top=999`
@@ -121,14 +173,17 @@ async function listChildren(driveId: string, path: string, token: string) {
   }>;
 }
 
-// Map SharePoint subfolder name -> portal file kind + format filter
-// (whether to PDF-only filter for that category).
+// Map SharePoint subfolder name -> portal file kind + format filter.
 //
-// Note: "Inspection Documents" in SharePoint holds per-job equipment
-// calibration certs (Load Cell, Waterbag, Sling, etc.) — not customer
-// test reports — so it maps to equipment_certificate. Customer-facing
-// test certificates / reports live elsewhere and are synced separately
-// (see future sync entries below).
+// Equipment certificates are NOT pulled from the project's "Inspection
+// Documents" subfolder anymore — that turned out to be a brittle data
+// source (humans had to file calibration certs into each project's folder
+// manually, with no validation against what actually shipped).
+//
+// The new pipeline (handled below the subfolder loop):
+//   Load Out List (SharePoint List) -> equipment assembly SNs actually shipped
+//   -> Hydro-Wates Inventory (SharePoint List) -> per-equipment FolderPath
+//   -> walk that folder for PDF cert files.
 const SUBFOLDER_MAP: Array<{
   spName: string;
   portalKind: string;
@@ -136,9 +191,19 @@ const SUBFOLDER_MAP: Array<{
   label: string;
 }> = [
   { spName: "Purchase Order",      portalKind: "purchase_order",         pdfOnly: false, label: "POs" },
-  { spName: "Inspection Documents", portalKind: "equipment_certificate", pdfOnly: false, label: "equipment certificates" },
   { spName: "Quote",               portalKind: "quote",                  pdfOnly: true,  label: "quotes (PDF only)" },
 ];
+
+// SharePoint List names used by the equipment-cert pipeline.
+const LOADOUT_LIST_NAME   = "Load Out List";
+const INVENTORY_LIST_NAME = "Hydro-Wates Inventory";
+
+// Hydro-Wates' SharePoint stores FolderPath values as
+// "/Shared Documents/<rest of path>". The Drive API walks paths
+// relative to the document library root, so strip the prefix.
+function stripSharedDocsPrefix(path: string): string {
+  return path.replace(/^\/?Shared Documents\/?/i, "").replace(/^\/+/, "");
+}
 
 function isPdf(file: { name?: string; file?: { mimeType?: string } }): boolean {
   const mime = (file.file?.mimeType ?? "").toLowerCase();
@@ -332,67 +397,153 @@ Deno.serve(async (req) => {
           continue;
         }
 
+        // Reference-only insert: we don't download bytes or upload to
+        // Supabase Storage. The frontend fetches a fresh Graph download URL
+        // when the customer clicks the file. sharepoint_source_id is the
+        // lookup key for that download URL.
         try {
-          // Download bytes from SharePoint
-          const contentResp = await fetch(
-            `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${item.id}/content`,
-            { headers: { Authorization: `Bearer ${token}` } },
-          );
-          if (!contentResp.ok) {
-            console.error(`Download failed for ${item.name}: ${contentResp.status}`);
-            summary[sub.spName].errors++;
-            continue;
-          }
-          const bytes = new Uint8Array(await contentResp.arrayBuffer());
-
-          // Upload to Supabase Storage under the project's folder
-          const safeName = item.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-          const storagePath = `${projectId}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safeName}`;
-          const { error: upErr } = await admin.storage
-            .from("project-files")
-            .upload(storagePath, bytes, {
-              contentType: item.file?.mimeType || "application/octet-stream",
-              upsert: false,
-            });
-          if (upErr) {
-            console.error(`Storage upload failed for ${item.name}: ${upErr.message}`);
-            summary[sub.spName].errors++;
-            continue;
-          }
-
-          // Insert files row. source_created_at holds the SharePoint
-          // createdDateTime — the "real" upload date the user wants to see,
-          // distinct from created_at which is when we inserted this row.
           const { data: insertedRow, error: insErr } = await admin.from("files").insert({
             project_id: projectId,
             name: item.name,
-            storage_path: storagePath,
-            size: item.size ?? bytes.length,
+            storage_path: null,
+            size: item.size ?? null,
             mime_type: item.file?.mimeType || null,
             kind: sub.portalKind,
             sharepoint_source_id: item.id,
             source_created_at: item.createdDateTime || null,
-            // For files synced from SharePoint, we also mark them as "synced
-            // back to SharePoint" (they're literally already there) so the
-            // PO sync function won't try to re-upload them. The sentinel
-            // value here is the SharePoint webUrl for easy navigation.
             sharepoint_synced_at: new Date().toISOString(),
             sharepoint_path: item.webUrl || "synced-from-sharepoint",
           }).select("id").single();
           if (insErr || !insertedRow) {
             console.error(`Files insert failed for ${item.name}: ${insErr?.message}`);
-            // Clean up the orphaned Storage file
-            await admin.storage.from("project-files").remove([storagePath]);
             summary[sub.spName].errors++;
             continue;
           }
-
           existing.set(item.id, { id: insertedRow.id, needsSourceDate: false });
           summary[sub.spName].added++;
         } catch (e) {
           console.error(`Sync failed for ${item.name}:`, e);
           summary[sub.spName].errors++;
         }
+      }
+    }
+
+    // 3.5 Equipment certificates via loadout → inventory → asset folder.
+    // This is the reference-only pipeline: we don't download PDF bytes,
+    // we just record metadata in the files table with sharepoint_source_id
+    // set. The frontend fetches a fresh Graph download URL on click via
+    // get-sharepoint-download-url.
+    //
+    // Skipped when certsOnly is set (the cert-only bulk run is specifically
+    // for project-root test reports, not equipment).
+    summary["Equipment certificates (loadout)"] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, errors: 0 };
+    if (!certsOnly) {
+      try {
+        const loadoutListId = await getListId(siteId, LOADOUT_LIST_NAME, token);
+        const inventoryListId = await getListId(siteId, INVENTORY_LIST_NAME, token);
+        if (!loadoutListId || !inventoryListId) {
+          throw new Error(`SharePoint list lookup failed (loadout=${!!loadoutListId}, inventory=${!!inventoryListId})`);
+        }
+
+        // (a) Find the equipment shipped on this job. JobNumber is text on
+        // the Load Out List, so we filter on it directly.
+        const loadoutRows = await fetchListItems(
+          siteId,
+          loadoutListId,
+          `fields/JobNumber eq '${hwiCode}'`,
+          ["JobNumber", "AssemblySN", "Description", "CartEqCateg"],
+          token,
+        );
+        const assemblySNs = new Set<string>();
+        for (const row of loadoutRows) {
+          const sn = (row.AssemblySN as string | undefined)?.trim();
+          if (sn) assemblySNs.add(sn);
+        }
+
+        // (b) For each unique equipment assembly SN, look up its FolderPath
+        // in the Inventory list and walk that folder for cert PDFs.
+        for (const sn of assemblySNs) {
+          let folderPath: string | null = null;
+          try {
+            const invRows = await fetchListItems(
+              siteId,
+              inventoryListId,
+              `fields/Title eq '${sn.replace(/'/g, "''")}'`,
+              ["Title", "AssemblySerialNumber", "FolderPath"],
+              token,
+            );
+            folderPath = (invRows[0]?.FolderPath as string | undefined) ?? null;
+          } catch (e) {
+            console.warn(`Inventory lookup failed for ${sn}: ${(e as Error).message}`);
+            continue;
+          }
+          if (!folderPath) continue; // equipment isn't in inventory, or no folder configured
+
+          // FolderPath comes in as "/Shared Documents/<rest>" — strip the
+          // library prefix so the Drive walk works from the doc root.
+          const drivePath = stripSharedDocsPrefix(folderPath);
+          let assetItems: Awaited<ReturnType<typeof listChildren>> = [];
+          try {
+            assetItems = await listChildren(driveId, drivePath, token);
+          } catch (e) {
+            // Folder may have been moved/renamed/deleted — skip quietly,
+            // don't fail the entire sync.
+            console.warn(`Asset folder walk failed for ${sn} at "${drivePath}": ${(e as Error).message}`);
+            continue;
+          }
+
+          for (const item of assetItems) {
+            if (item.folder || !item.id || !item.name) continue;
+            if (!isPdf(item)) continue; // PDFs only
+
+            const prior = existing.get(item.id);
+            if (prior) {
+              if (prior.needsSourceDate && item.createdDateTime) {
+                const { error: updErr } = await admin
+                  .from("files")
+                  .update({ source_created_at: item.createdDateTime })
+                  .eq("id", prior.id);
+                if (!updErr) {
+                  prior.needsSourceDate = false;
+                  summary["Equipment certificates (loadout)"].backfilled++;
+                }
+              }
+              summary["Equipment certificates (loadout)"].skipped++;
+              continue;
+            }
+
+            // Reference-only insert: no storage upload, no bytes downloaded.
+            // storage_path is null on purpose; the frontend hits
+            // get-sharepoint-download-url when a customer clicks the file.
+            try {
+              const { data: insertedRow, error: insErr } = await admin.from("files").insert({
+                project_id: projectId,
+                name: item.name,
+                storage_path: null,
+                size: item.size ?? null,
+                mime_type: item.file?.mimeType || "application/pdf",
+                kind: "equipment_certificate",
+                sharepoint_source_id: item.id,
+                source_created_at: item.createdDateTime || null,
+                sharepoint_synced_at: new Date().toISOString(),
+                sharepoint_path: item.webUrl || folderPath,
+              }).select("id").single();
+              if (insErr || !insertedRow) {
+                console.error(`Equipment cert insert failed for ${item.name}: ${insErr?.message}`);
+                summary["Equipment certificates (loadout)"].errors++;
+                continue;
+              }
+              existing.set(item.id, { id: insertedRow.id, needsSourceDate: false });
+              summary["Equipment certificates (loadout)"].added++;
+            } catch (e) {
+              console.error(`Equipment cert sync failed for ${item.name}:`, e);
+              summary["Equipment certificates (loadout)"].errors++;
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Loadout-based equipment cert sync failed:", e);
+        summary["Equipment certificates (loadout)"].errors++;
       }
     }
 
@@ -434,36 +585,13 @@ Deno.serve(async (req) => {
         continue;
       }
 
+      // Reference-only insert: no bytes downloaded, no Supabase Storage.
       try {
-        const contentResp = await fetch(
-          `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${item.id}/content`,
-          { headers: { Authorization: `Bearer ${token}` } },
-        );
-        if (!contentResp.ok) {
-          console.error(`Download failed for ${item.name}: ${contentResp.status}`);
-          summary[ROOT_CERT_KEY].errors++;
-          continue;
-        }
-        const bytes = new Uint8Array(await contentResp.arrayBuffer());
-        const safeName = item.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-        const storagePath = `${projectId}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safeName}`;
-        const { error: upErr } = await admin.storage
-          .from("project-files")
-          .upload(storagePath, bytes, {
-            contentType: item.file?.mimeType || "application/pdf",
-            upsert: false,
-          });
-        if (upErr) {
-          console.error(`Storage upload failed for ${item.name}: ${upErr.message}`);
-          summary[ROOT_CERT_KEY].errors++;
-          continue;
-        }
-
         const { data: insertedRow, error: insErr } = await admin.from("files").insert({
           project_id: projectId,
           name: item.name,
-          storage_path: storagePath,
-          size: item.size ?? bytes.length,
+          storage_path: null,
+          size: item.size ?? null,
           mime_type: item.file?.mimeType || "application/pdf",
           kind: "certificate",
           sharepoint_source_id: item.id,
@@ -473,11 +601,9 @@ Deno.serve(async (req) => {
         }).select("id").single();
         if (insErr || !insertedRow) {
           console.error(`Files insert failed for ${item.name}: ${insErr?.message}`);
-          await admin.storage.from("project-files").remove([storagePath]);
           summary[ROOT_CERT_KEY].errors++;
           continue;
         }
-
         existing.set(item.id, { id: insertedRow.id, needsSourceDate: false });
         summary[ROOT_CERT_KEY].added++;
       } catch (e) {

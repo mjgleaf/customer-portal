@@ -78,8 +78,8 @@ export default function CertificatesPage() {
     // every cert in view belongs to the same customer (typical for a
     // customer user — they're tied to a single company).
     const { data } = await supabase
-      .from('files')
-      .select('*, project:projects(id, name, customer:customers(id, company, name, shipping_address, shipping_city, shipping_state, shipping_zip, shipping_country))')
+      .from('cportal_files')
+      .select('*, project:cportal_projects(id, name, customer:cportal_customers(id, company, name, shipping_address, shipping_city, shipping_state, shipping_zip, shipping_country))')
       .in('kind', ['certificate', 'equipment_certificate'])
       .order('created_at', { ascending: false })
     // Sort client-side by the displayed date so newest-in-SharePoint comes
@@ -95,7 +95,7 @@ export default function CertificatesPage() {
   }
 
   async function handleDownload(file: ProjectFile) {
-    const { data } = await supabase.storage.from('project-files').createSignedUrl(file.storage_path, 60)
+    const { data } = await supabase.storage.from('cportal-project-files').createSignedUrl(file.storage_path, 60)
     if (data?.signedUrl) {
       const a = document.createElement('a')
       a.href = data.signedUrl
@@ -105,7 +105,7 @@ export default function CertificatesPage() {
   }
 
   async function previewFile(file: ProjectFile) {
-    const { data } = await supabase.storage.from('project-files').createSignedUrl(file.storage_path, 300)
+    const { data } = await supabase.storage.from('cportal-project-files').createSignedUrl(file.storage_path, 300)
     if (data?.signedUrl) setPreviewing({ file, url: data.signedUrl })
   }
 

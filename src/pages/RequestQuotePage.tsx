@@ -72,7 +72,7 @@ export default function RequestQuotePage() {
     let cancelled = false
     ;(async () => {
       const { data } = await supabase
-        .from('customers')
+        .from('cportal_customers')
         .select('name, company, email, phone, shipping_address, shipping_city, shipping_state, shipping_zip')
         .ilike('email', profile.email!)
         .maybeSingle()
@@ -152,7 +152,7 @@ export default function RequestQuotePage() {
       const attachmentPaths: string[] = []
       for (const f of files) {
         const path = `${user.id}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${f.name}`
-        const { error: upErr } = await supabase.storage.from('quote-attachments').upload(path, f)
+        const { error: upErr } = await supabase.storage.from('cportal-quote-attachments').upload(path, f)
         if (upErr) {
           setError(`Couldn't upload "${f.name}": ${upErr.message}`)
           setSubmitting(false)

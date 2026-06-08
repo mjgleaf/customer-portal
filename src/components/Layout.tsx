@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { LayoutDashboard, LogOut, Users, Menu, X, Settings, Award, Receipt, FilePlus, Inbox } from 'lucide-react'
+import { LayoutDashboard, LogOut, Users, Menu, X, Settings, Award, Receipt, FilePlus, Inbox, Shield } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 
 export default function Layout({ children }: { children: React.ReactNode }) {
@@ -49,10 +49,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             <LayoutDashboard size={17} />
             Dashboard
           </Link>
-          {/* Customer-only aggregate views. Admins skip these — they have
-              everything they need inside individual project pages, and the
-              aggregate views would just be very long lists for them. */}
-          {profile?.role !== 'admin' && (
+          {/* Customer-only aggregate views. Admins and service techs both
+              skip these — admins have everything they need inside individual
+              project pages, and techs don't deal with invoices or RFQs at
+              all. Customers see them because they want the aggregate view
+              across their company's projects. */}
+          {profile?.role === 'customer' && (
             <>
               <Link
                 to="/certificates"
@@ -99,6 +101,18 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 Quote Requests
               </Link>
             </>
+          )}
+          {/* Team directory — admins manage roles + invite; service techs
+              get a read-only view so they have phone numbers handy on site. */}
+          {(profile?.role === 'admin' || profile?.role === 'service_tech') && (
+            <Link
+              to="/team"
+              onClick={() => setMobileOpen(false)}
+              className={navLinkClass(location.pathname.startsWith('/team'))}
+            >
+              <Shield size={17} />
+              Team
+            </Link>
           )}
         </nav>
 

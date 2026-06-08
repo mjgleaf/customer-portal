@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowLeft, Check, User, Lock, Bell, Mail, AlertCircle } from 'lucide-react'
+import { ArrowLeft, Check, User, Lock, Bell, Mail, AlertCircle, Phone } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 
@@ -9,8 +9,11 @@ import { useAuth } from '../context/AuthContext'
 export default function AccountPage() {
   const { user, profile, refreshProfile } = useAuth()
 
-  // --- Profile (name) ---
+  const isTeamMember = profile?.role === 'admin' || profile?.role === 'service_tech'
+
+  // --- Profile (name + phone) ---
   const [fullName, setFullName] = useState('')
+  const [phone, setPhone] = useState('')
   const [savingName, setSavingName] = useState(false)
   const [nameSavedAt, setNameSavedAt] = useState<number | null>(null)
   const [nameError, setNameError] = useState('')
@@ -36,6 +39,7 @@ export default function AccountPage() {
   useEffect(() => {
     if (!profile) return
     setFullName(profile.full_name ?? '')
+    setPhone(profile.phone ?? '')
     setEmailOn(profile.email_notifications !== false) // default true
   }, [profile])
 
@@ -43,7 +47,7 @@ export default function AccountPage() {
   useEffect(() => {
     if (!profile || profile.role !== 'admin') return
     supabase
-      .from('app_settings')
+      .from('cportal_app_settings')
       .select('value')
       .eq('key', 'emails_paused')
       .maybeSingle()
@@ -58,14 +62,21 @@ export default function AccountPage() {
     setSavingName(true)
     setNameError('')
     const { error } = await supabase
-      .from('profiles')
-      .update({ full_name: fullName.trim() || null })
+      .from('cportal_profiles')
+      .update({
+        full_name: fullName.trim() || null,
+        phone: phone.trim() || null,
+      })
       .eq('id', user.id)
     setSavingName(false)
     if (error) { setNameError(error.message); return }
     setNameSavedAt(Date.now())
     refreshProfile?.()
   }
+
+  const nameDirty = fullName.trim() !== (profile?.full_name ?? '').trim()
+  const phoneDirty = phone.trim() !== (profile?.phone ?? '').trim()
+  const detailsDirty = nameDirty || phoneDirty
 
   async function savePassword() {
     setPasswordError('')
@@ -85,7 +96,7 @@ export default function AccountPage() {
     setEmailOn(next) // optimistic
     setSavingPref(true)
     const { error } = await supabase
-      .from('profiles')
+      .from('cportal_profiles')
       .update({ email_notifications: next })
       .eq('id', user.id)
     setSavingPref(false)
@@ -104,7 +115,7 @@ export default function AccountPage() {
     setPauseError('')
     setEmailsActive(next) // optimistic
     const { error } = await supabase
-      .from('app_settings')
+      .from('cportal_app_settings')
       .upsert(
         { key: 'emails_paused', value: String(!next), updated_at: new Date().toISOString() },
         { onConflict: 'key' },
@@ -133,26 +144,46 @@ export default function AccountPage() {
       <h1 className="text-2xl font-bold text-gray-900 mb-1">Account</h1>
       <p className="text-gray-500 text-sm mb-8">{profile.email}</p>
 
-      {/* Name */}
+      {/* Name + phone */}
       <div className="bg-white border border-gray-200 rounded-xl p-6 mb-5">
         <div className="flex items-center gap-2 mb-4">
           <User size={18} className="text-gray-400" />
-          <h2 className="font-semibold text-gray-900">Your name</h2>
+          <h2 className="font-semibold text-gray-900">Your details</h2>
         </div>
+
+        <label className="block text-xs font-medium text-gray-700 mb-1">Full name</label>
         <input
           value={fullName}
           onChange={e => setFullName(e.target.value)}
           placeholder="Full name"
           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
+
+        <label className="block text-xs font-medium text-gray-700 mb-1 mt-3 flex items-center gap-1.5">
+          <Phone size={12} className="text-gray-400" />
+          Phone
+        </label>
+        <input
+          type="tel"
+          value={phone}
+          onChange={e => setPhone(e.target.value)}
+          placeholder="(555) 555-0123"
+          className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        />
+        {isTeamMember && (
+          <p className="text-[11px] text-gray-500 mt-1">
+            Visible to other admins and service techs on the Team page so they can reach you on site.
+          </p>
+        )}
+
         {nameError && <p className="text-red-600 text-xs mt-2">{nameError}</p>}
-        <div className="flex items-center gap-3 mt-3">
+        <div className="flex items-center gap-3 mt-4">
           <button
             onClick={saveName}
-            disabled={savingName || fullName.trim() === (profile.full_name ?? '').trim()}
+            disabled={savingName || !detailsDirty}
             className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
           >
-            {savingName ? 'Saving...' : 'Save name'}
+            {savingName ? 'Saving...' : 'Save'}
           </button>
           {nameSavedAt && Date.now() - nameSavedAt < 4000 && (
             <span className="flex items-center gap-1 text-green-600 text-xs"><Check size={14} /> Saved</span>

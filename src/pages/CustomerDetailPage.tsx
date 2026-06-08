@@ -22,14 +22,14 @@ export default function CustomerDetailPage() {
 
   async function fetchData() {
     setLoading(true)
-    const { data: cust } = await supabase.from('customers').select('*').eq('id', id).single()
+    const { data: cust } = await supabase.from('cportal_customers').select('*').eq('id', id).single()
     if (!cust) { navigate('/customers'); return }
     setCustomer(cust as Customer)
     const { data: projs } = await supabase
-      .from('projects').select('*').eq('customer_id', id).order('name', { ascending: true })
+      .from('cportal_projects').select('*').eq('customer_id', id).order('name', { ascending: true })
     setProjects((projs ?? []) as Project[])
     if (cust.email) {
-      const { data: prof } = await supabase.from('profiles').select('id').ilike('email', cust.email).maybeSingle()
+      const { data: prof } = await supabase.from('cportal_profiles').select('id').ilike('email', cust.email).maybeSingle()
       setInvited(!!prof)
     }
     setLoading(false)
