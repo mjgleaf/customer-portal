@@ -66,7 +66,7 @@ async function sendEmail(
   // paused — the admin flips it active from the portal's Account page when
   // they're ready to start sending customer emails.
   const { data: setting } = await admin
-    .from("app_settings").select("value").eq("key", "emails_paused").maybeSingle();
+    .from("cportal_app_settings").select("value").eq("key", "emails_paused").maybeSingle();
   if (setting?.value !== "false") {
     console.log(`[emails paused] would send "${subject}" to: ${to.join(", ")}`);
     return;
@@ -125,9 +125,9 @@ Deno.serve(async (req) => {
     if (!projectId) return json({ error: "projectId is required" }, 400);
 
     const { data: uploader } = await admin
-      .from("profiles").select("role, full_name, email").eq("id", user.id).single();
+      .from("cportal_profiles").select("role, full_name, email").eq("id", user.id).single();
     const { data: project } = await admin
-      .from("projects").select("name, customer_id, description, lead_comments").eq("id", projectId).single();
+      .from("cportal_projects").select("name, customer_id, description, lead_comments").eq("id", projectId).single();
     if (!project) return json({ error: "Project not found" }, 404);
 
     const file = fileName || "a file";
@@ -138,17 +138,17 @@ Deno.serve(async (req) => {
       // preference (true / null = send, false = skip).
       const recipients = new Set<string>();
       if (project.customer_id) {
-        const { data: cust } = await admin.from("customers").select("email").eq("id", project.customer_id).single();
+        const { data: cust } = await admin.from("cportal_customers").select("email").eq("id", project.customer_id).single();
         if (cust?.email) {
           const { data: custProf } = await admin
-            .from("profiles").select("email, email_notifications").ilike("email", cust.email).maybeSingle();
+            .from("cportal_profiles").select("email, email_notifications").ilike("email", cust.email).maybeSingle();
           if (!custProf || custProf.email_notifications !== false) recipients.add(cust.email);
         }
       }
-      const { data: members } = await admin.from("project_members").select("user_id").eq("project_id", projectId);
+      const { data: members } = await admin.from("cportal_project_members").select("user_id").eq("project_id", projectId);
       if (members && members.length) {
         const { data: profs } = await admin
-          .from("profiles")
+          .from("cportal_profiles")
           .select("email, email_notifications")
           .in("id", members.map((m) => m.user_id));
         for (const p of profs ?? []) {

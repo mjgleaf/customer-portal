@@ -102,7 +102,7 @@ Deno.serve(async (req) => {
     // Look up the file row. We use the admin client to read it (service
     // role bypasses RLS), then manually verify access against the project.
     const { data: file } = await admin
-      .from("files")
+      .from("cportal_files")
       .select("id, project_id, name, sharepoint_source_id")
       .eq("id", fileId)
       .single();
@@ -111,23 +111,42 @@ Deno.serve(async (req) => {
       return json({ error: "This file is not in SharePoint; use Supabase Storage signed URL instead" }, 400);
     }
 
-    // Access check: admin, project_member, OR customer email match.
-    const { data: profile } = await admin.from("profiles").select("role, email").eq("id", user.id).single();
+    // Access check: admin, service tech (Service-type project only),
+    // project_member, OR customer email match.
+    const { data: profile } = await admin.from("cportal_profiles").select("role, email").eq("id", user.id).single();
     const isAdmin = profile?.role === "admin";
+    const isServiceTech = profile?.role === "service_tech";
     if (!isAdmin) {
-      const { data: member } = await admin
-        .from("project_members")
-        .select("id")
-        .eq("project_id", file.project_id)
-        .eq("user_id", user.id)
-        .maybeSingle();
-      let hasAccess = !!member;
+      let hasAccess = false;
+
+      // Check 1: service tech on a Service-type project?
+      if (isServiceTech) {
+        const { data: projectRow } = await admin
+          .from("cportal_projects")
+          .select("project_type")
+          .eq("id", file.project_id)
+          .single();
+        if (projectRow?.project_type === "Service") hasAccess = true;
+      }
+
+      // Check 2: explicit project_members row?
+      if (!hasAccess) {
+        const { data: member } = await admin
+          .from("cportal_project_members")
+          .select("id")
+          .eq("project_id", file.project_id)
+          .eq("user_id", user.id)
+          .maybeSingle();
+        if (member) hasAccess = true;
+      }
+
+      // Check 3: email match on the project's customer record?
       if (!hasAccess) {
         const callerEmail = (profile?.email ?? "").toLowerCase();
         if (callerEmail) {
           const { data: project } = await admin
-            .from("projects")
-            .select("customer:customers(email)")
+            .from("cportal_projects")
+            .select("customer:cportal_customers(email)")
             .eq("id", file.project_id)
             .single();
           const projCustomerEmail = (project?.customer as { email?: string } | null)?.email?.toLowerCase() ?? "";

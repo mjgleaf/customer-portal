@@ -192,7 +192,7 @@ async function sendEmailWithAttachment(
   },
 ): Promise<void> {
   const { data: setting } = await admin
-    .from("app_settings").select("value").eq("key", "emails_paused").maybeSingle();
+    .from("cportal_app_settings").select("value").eq("key", "emails_paused").maybeSingle();
   if (setting?.value !== "false") {
     console.log(`[emails paused] would send "${opts.subject}" to: ${opts.to}`);
     return;
@@ -316,7 +316,7 @@ Deno.serve(async (req) => {
 
     // Fetch file + project + customer context.
     const { data: file } = await admin
-      .from("files")
+      .from("cportal_files")
       .select("id, project_id, name, kind, storage_path")
       .eq("id", fileId)
       .single();
@@ -326,7 +326,7 @@ Deno.serve(async (req) => {
     }
 
     const { data: project } = await admin
-      .from("projects")
+      .from("cportal_projects")
       .select("id, name, customer_id, description, lead_comments")
       .eq("id", file.project_id)
       .single();
@@ -335,7 +335,7 @@ Deno.serve(async (req) => {
     let customerName = "Uncategorized";
     if (project.customer_id) {
       const { data: cust } = await admin
-        .from("customers")
+        .from("cportal_customers")
         .select("company, name")
         .eq("id", project.customer_id)
         .maybeSingle();
@@ -396,7 +396,7 @@ Deno.serve(async (req) => {
     // We need the bytes either way: to upload to SharePoint OR to attach to
     // the email notification.
     const { data: urlData, error: urlErr } = await admin.storage
-      .from("project-files")
+      .from("cportal-project-files")
       .createSignedUrl(file.storage_path, 300);
     if (urlErr || !urlData?.signedUrl) {
       throw new Error(`Could not get signed URL: ${urlErr?.message ?? "unknown"}`);
@@ -445,7 +445,7 @@ Deno.serve(async (req) => {
 
       // Record on the file row that we routed via email instead of SharePoint.
       await admin
-        .from("files")
+        .from("cportal_files")
         .update({
           sharepoint_synced_at: new Date().toISOString(),
           sharepoint_path: SENTINEL_EMAILED,
@@ -493,7 +493,7 @@ Deno.serve(async (req) => {
     // next sync-files-from-sharepoint run dedupes correctly and doesn't
     // pull the mirrored file back as a brand-new portal entry.
     await admin
-      .from("files")
+      .from("cportal_files")
       .update({
         sharepoint_synced_at: new Date().toISOString(),
         sharepoint_path: fullPath,
@@ -514,7 +514,7 @@ Deno.serve(async (req) => {
     // Record the failure on the file row so the admin UI can surface it.
     if (fileId) {
       await admin
-        .from("files")
+        .from("cportal_files")
         .update({
           sharepoint_error: msg.slice(0, 500),
           sharepoint_synced_at: null,

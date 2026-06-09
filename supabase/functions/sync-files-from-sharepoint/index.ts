@@ -236,12 +236,14 @@ Deno.serve(async (req) => {
 
   let callerUserId: string | null = null;
   let callerIsAdmin = false;
+  let callerIsServiceTech = false;
   if (!isServiceRole) {
     const { data: { user } } = await admin.auth.getUser(authToken);
     if (!user) return json({ error: "Not authorized" }, 401);
     callerUserId = user.id;
-    const { data: profile } = await admin.from("profiles").select("role").eq("id", user.id).single();
+    const { data: profile } = await admin.from("cportal_profiles").select("role").eq("id", user.id).single();
     callerIsAdmin = profile?.role === "admin";
+    callerIsServiceTech = profile?.role === "service_tech";
   }
 
   try {
@@ -254,31 +256,42 @@ Deno.serve(async (req) => {
     const certsOnly = body?.certsOnly === true;
     if (!projectId) return json({ error: "projectId is required" }, 400);
 
-    // Non-admin, non-service callers must be a member of the project they're
-    // trying to sync. Mirrors the can_access_project() RLS helper, but
-    // inlined here because we're calling from a service-role client and
-    // auth.uid() isn't available inside the helper from that context.
+    // Non-admin, non-service callers must be allowed to access this
+    // specific project. Mirrors cportal_can_access_project(), inlined.
     if (!isServiceRole && !callerIsAdmin && callerUserId) {
-      // Check 1: explicit project_members row?
-      const { data: memberRow } = await admin
-        .from("project_members")
-        .select("id")
-        .eq("project_id", projectId)
-        .eq("user_id", callerUserId)
-        .maybeSingle();
-      let hasAccess = !!memberRow;
-      // Check 2: email match on the project's customer record?
+      let hasAccess = false;
+      // Check 1: service tech + project is Service-type? Techs get blanket
+      // access to every Service-type project (no per-project assignment).
+      if (callerIsServiceTech) {
+        const { data: projectRow } = await admin
+          .from("cportal_projects")
+          .select("project_type")
+          .eq("id", projectId)
+          .single();
+        if (projectRow?.project_type === "Service") hasAccess = true;
+      }
+      // Check 2: explicit project_members row?
+      if (!hasAccess) {
+        const { data: memberRow } = await admin
+          .from("cportal_project_members")
+          .select("id")
+          .eq("project_id", projectId)
+          .eq("user_id", callerUserId)
+          .maybeSingle();
+        if (memberRow) hasAccess = true;
+      }
+      // Check 3: email match on the project's customer record?
       if (!hasAccess) {
         const { data: callerProfile } = await admin
-          .from("profiles")
+          .from("cportal_profiles")
           .select("email")
           .eq("id", callerUserId)
           .single();
         const callerEmail = (callerProfile?.email ?? "").toLowerCase();
         if (callerEmail) {
           const { data: projectRow } = await admin
-            .from("projects")
-            .select("customer:customers(email)")
+            .from("cportal_projects")
+            .select("customer:cportal_customers(email)")
             .eq("id", projectId)
             .single();
           const projectCustomerEmail = (projectRow?.customer as { email?: string | null } | null)?.email?.toLowerCase() ?? "";
@@ -289,7 +302,7 @@ Deno.serve(async (req) => {
     }
 
     const { data: project } = await admin
-      .from("projects")
+      .from("cportal_projects")
       .select("id, name")
       .eq("id", projectId)
       .single();
@@ -328,7 +341,7 @@ Deno.serve(async (req) => {
     // 2. Pre-fetch already-synced items so we can dedupe AND opportunistically
     // backfill source_created_at on rows that pre-date that column.
     const { data: existingRows } = await admin
-      .from("files")
+      .from("cportal_files")
       .select("id, sharepoint_source_id, source_created_at")
       .eq("project_id", projectId)
       .not("sharepoint_source_id", "is", null);
@@ -385,7 +398,7 @@ Deno.serve(async (req) => {
           // for rows that pre-date the source_created_at column).
           if (prior.needsSourceDate && item.createdDateTime) {
             const { error: updErr } = await admin
-              .from("files")
+              .from("cportal_files")
               .update({ source_created_at: item.createdDateTime })
               .eq("id", prior.id);
             if (!updErr) {
@@ -402,7 +415,7 @@ Deno.serve(async (req) => {
         // when the customer clicks the file. sharepoint_source_id is the
         // lookup key for that download URL.
         try {
-          const { data: insertedRow, error: insErr } = await admin.from("files").insert({
+          const { data: insertedRow, error: insErr } = await admin.from("cportal_files").insert({
             project_id: projectId,
             name: item.name,
             storage_path: null,
@@ -500,7 +513,7 @@ Deno.serve(async (req) => {
             if (prior) {
               if (prior.needsSourceDate && item.createdDateTime) {
                 const { error: updErr } = await admin
-                  .from("files")
+                  .from("cportal_files")
                   .update({ source_created_at: item.createdDateTime })
                   .eq("id", prior.id);
                 if (!updErr) {
@@ -516,7 +529,7 @@ Deno.serve(async (req) => {
             // storage_path is null on purpose; the frontend hits
             // get-sharepoint-download-url when a customer clicks the file.
             try {
-              const { data: insertedRow, error: insErr } = await admin.from("files").insert({
+              const { data: insertedRow, error: insErr } = await admin.from("cportal_files").insert({
                 project_id: projectId,
                 name: item.name,
                 storage_path: null,
@@ -573,7 +586,7 @@ Deno.serve(async (req) => {
       if (prior) {
         if (prior.needsSourceDate && item.createdDateTime) {
           const { error: updErr } = await admin
-            .from("files")
+            .from("cportal_files")
             .update({ source_created_at: item.createdDateTime })
             .eq("id", prior.id);
           if (!updErr) {
@@ -587,7 +600,7 @@ Deno.serve(async (req) => {
 
       // Reference-only insert: no bytes downloaded, no Supabase Storage.
       try {
-        const { data: insertedRow, error: insErr } = await admin.from("files").insert({
+        const { data: insertedRow, error: insErr } = await admin.from("cportal_files").insert({
           project_id: projectId,
           name: item.name,
           storage_path: null,

@@ -67,7 +67,7 @@ async function sendEmail(
   html: string,
 ) {
   const { data: setting } = await admin
-    .from("app_settings").select("value").eq("key", "emails_paused").maybeSingle();
+    .from("cportal_app_settings").select("value").eq("key", "emails_paused").maybeSingle();
   if (setting?.value !== "false") {
     console.log(`[emails paused] would send "${subject}" to: ${to.join(", ")}`);
     return;
@@ -121,12 +121,12 @@ Deno.serve(async (req) => {
 
     // Fetch the project (we'll need name + customer linkage for routing).
     const { data: project } = await admin
-      .from("projects").select("name, customer_id, description, lead_comments").eq("id", projectId).single();
+      .from("cportal_projects").select("name, customer_id, description, lead_comments").eq("id", projectId).single();
     if (!project) return json({ error: "Project not found" }, 404);
 
     // The calling user is the note author.
     const { data: authorProfile } = await admin
-      .from("profiles").select("full_name, email, role").eq("id", user.id).single();
+      .from("cportal_profiles").select("full_name, email, role").eq("id", user.id).single();
     if (!authorProfile) return json({ error: "Author profile not found" }, 404);
 
     // Fetch the note content for the email body. If a specific noteId was
@@ -135,11 +135,11 @@ Deno.serve(async (req) => {
     let noteContent = "";
     if (noteId) {
       const { data: note } = await admin
-        .from("project_notes").select("content").eq("id", noteId).maybeSingle();
+        .from("cportal_project_notes").select("content").eq("id", noteId).maybeSingle();
       if (note) noteContent = note.content;
     } else {
       const { data: latest } = await admin
-        .from("project_notes").select("content")
+        .from("cportal_project_notes").select("content")
         .eq("project_id", projectId)
         .order("created_at", { ascending: false })
         .limit(1).maybeSingle();
@@ -147,22 +147,26 @@ Deno.serve(async (req) => {
     }
 
     // Build the recipient set. The author themselves is always excluded.
+    // Service techs are routed the same as admins — they're on the company
+    // side, so a tech leaving a note should email the customer, not the
+    // shared team mailbox.
+    const authorIsTeam = authorProfile.role === "admin" || authorProfile.role === "service_tech";
     const recipients = new Set<string>();
-    if (authorProfile.role === "admin") {
-      // Admin authored -> notify customer + project members
+    if (authorIsTeam) {
+      // Team member authored -> notify customer + project members
       if (project.customer_id) {
-        const { data: cust } = await admin.from("customers").select("email").eq("id", project.customer_id).single();
+        const { data: cust } = await admin.from("cportal_customers").select("email").eq("id", project.customer_id).single();
         if (cust?.email && cust.email.toLowerCase() !== authorProfile.email.toLowerCase()) {
           const { data: prof } = await admin
-            .from("profiles").select("email, email_notifications")
+            .from("cportal_profiles").select("email, email_notifications")
             .ilike("email", cust.email).maybeSingle();
           if (!prof || prof.email_notifications !== false) recipients.add(cust.email);
         }
       }
-      const { data: members } = await admin.from("project_members").select("user_id").eq("project_id", projectId);
+      const { data: members } = await admin.from("cportal_project_members").select("user_id").eq("project_id", projectId);
       if (members && members.length) {
         const { data: profs } = await admin
-          .from("profiles")
+          .from("cportal_profiles")
           .select("email, email_notifications")
           .in("id", members.map((m) => m.user_id));
         for (const p of profs ?? []) {

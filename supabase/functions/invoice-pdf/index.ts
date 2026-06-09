@@ -50,15 +50,15 @@ Deno.serve(async (req) => {
     if (!invoiceId) return jsonError("invoiceId is required", 400);
 
     const { data: invoice } = await admin
-      .from("invoices").select("zoho_invoice_id, customer_id").eq("id", invoiceId).single();
+      .from("cportal_invoices").select("zoho_invoice_id, customer_id").eq("id", invoiceId).single();
     if (!invoice) return jsonError("Invoice not found", 404);
 
     // Authorize: admins, or the customer this invoice belongs to (matched by email).
-    const { data: profile } = await admin.from("profiles").select("role").eq("id", user.id).single();
+    const { data: profile } = await admin.from("cportal_profiles").select("role").eq("id", user.id).single();
     if (profile?.role !== "admin") {
       let ok = false;
       if (invoice.customer_id) {
-        const { data: cust } = await admin.from("customers").select("email").eq("id", invoice.customer_id).single();
+        const { data: cust } = await admin.from("cportal_customers").select("email").eq("id", invoice.customer_id).single();
         if (cust?.email && user.email && cust.email.toLowerCase() === user.email.toLowerCase()) ok = true;
       }
       if (!ok) return jsonError("Not authorized to view this invoice", 403);

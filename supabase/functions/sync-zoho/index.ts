@@ -58,32 +58,32 @@ async function fetchAll(path: string, key: string, accessToken: string, orgId: s
   return out;
 }
 
-// Fetch a single contact's full detail record. The list endpoint used by
-// fetchAll() omits the shipping_address / billing_address objects — those only
-// come back here, from GET /contacts/{id}. Returns the contact object or null.
-async function fetchContactDetail(contactId: string, accessToken: string, orgId: string): Promise<Record<string, any> | null> {
+// Fetch a single contact's full record from Zoho. The /contacts list
+// endpoint returns only summary data; the detail endpoint includes the
+// shipping/billing address objects we need to populate cportal_customers.
+async function fetchContactDetails(contactId: string, accessToken: string, orgId: string): Promise<Record<string, unknown> | null> {
   const url = `${ZOHO_BOOKS}/contacts/${contactId}?organization_id=${orgId}`;
   const res = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+  if (!res.ok) return null;
   const data = await res.json();
-  if (typeof data.code !== "undefined" && data.code !== 0) {
-    throw new Error(`Zoho contact ${contactId} error: ${JSON.stringify(data)}`);
-  }
-  return data.contact ?? null;
+  if (typeof data.code !== "undefined" && data.code !== 0) return null;
+  return (data.contact ?? null) as Record<string, unknown> | null;
 }
 
-// Run an async mapper over items with bounded concurrency, so enriching every
-// customer with a detail fetch doesn't blow past Zoho's API rate limits.
+// Run an async mapper over `items` with bounded concurrency. Keeps API
+// calls under the per-minute rate limit while still pipelining requests.
 async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length);
+  const out: R[] = new Array(items.length);
   let next = 0;
   async function worker() {
-    while (next < items.length) {
-      const i = next++;
-      results[i] = await fn(items[i]);
+    while (true) {
+      const idx = next++;
+      if (idx >= items.length) return;
+      out[idx] = await fn(items[idx]);
     }
   }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return out;
 }
 
 function mapProjectStatus(zohoStatus: string): string {
@@ -148,7 +148,7 @@ async function sendEmail(
 ) {
   if (!to) return;
   const { data: setting } = await admin
-    .from("app_settings").select("value").eq("key", "emails_paused").maybeSingle();
+    .from("cportal_app_settings").select("value").eq("key", "emails_paused").maybeSingle();
   if (setting?.value !== "false") {
     console.log(`[emails paused] would send "${subject}" to: ${to}`);
     return;
@@ -212,7 +212,7 @@ Deno.serve(async (req) => {
   if (!allowed && token) {
     const { data: { user } } = await admin.auth.getUser(token);
     if (user) {
-      const { data: profile } = await admin.from("profiles").select("role").eq("id", user.id).single();
+      const { data: profile } = await admin.from("cportal_profiles").select("role").eq("id", user.id).single();
       if (profile?.role === "admin") allowed = true;
     }
   }
@@ -230,23 +230,21 @@ Deno.serve(async (req) => {
     //    does have related rows we leave it alone and report the orphan
     //    count so an admin can investigate.
     const allContacts = await fetchAll("contacts", "contacts", accessToken, orgId);
-    const contacts = allContacts.filter((c) => c.contact_type === "customer");
+    const summaryCustomers = allContacts.filter((c) => c.contact_type === "customer");
     const nonCustomers = allContacts.filter((c) => c.contact_type !== "customer");
 
-    // The list endpoint doesn't return address objects, so enrich each customer
-    // with its detail record (which carries shipping_address / billing_address).
-    // A per-contact failure falls back to the summary so one bad record can't
-    // abort the whole sync — that row just keeps whatever address it already had.
-    const detailedContacts = await mapWithConcurrency(contacts, 8, async (c) => {
-      try {
-        return (await fetchContactDetail(String(c.contact_id), accessToken, orgId)) ?? c;
-      } catch (e) {
-        console.error(`Zoho contact detail fetch failed for ${c.contact_id}:`, e);
-        return c;
-      }
+    // The /contacts list endpoint returns only summary data — no addresses,
+    // no phone in the right shape. Fetch each customer's full detail record
+    // so we get billing_address and shipping_address. Run with bounded
+    // concurrency (5 at a time) to stay under Zoho's per-minute rate limit.
+    // For ~500 contacts at concurrency=5 this takes ~1–2 minutes.
+    const contacts = await mapWithConcurrency(summaryCustomers, 5, async (c) => {
+      const details = await fetchContactDetails(String(c.contact_id), accessToken, orgId);
+      // Merge summary + details so we keep all fields. Detail wins on conflict.
+      return { ...c, ...(details ?? {}) };
     });
 
-    const customerRows = detailedContacts.map((c) => {
+    const customerRows = contacts.map((c) => {
       const ship = (c.shipping_address ?? {}) as Record<string, string | undefined>;
       const bill = (c.billing_address ?? {}) as Record<string, string | undefined>;
       return {
@@ -272,7 +270,7 @@ Deno.serve(async (req) => {
       };
     });
     if (customerRows.length) {
-      const { error } = await admin.from("customers").upsert(customerRows, { onConflict: "zoho_contact_id" });
+      const { error } = await admin.from("cportal_customers").upsert(customerRows, { onConflict: "zoho_contact_id" });
       if (error) throw error;
     }
 
@@ -285,16 +283,16 @@ Deno.serve(async (req) => {
     if (nonCustomers.length) {
       const nonCustomerIds = nonCustomers.map((c) => String(c.contact_id));
       const { data: candidates } = await admin
-        .from("customers")
+        .from("cportal_customers")
         .select("id, zoho_contact_id")
         .in("zoho_contact_id", nonCustomerIds);
       for (const cand of candidates ?? []) {
         const [{ count: projCount }, { count: invCount }] = await Promise.all([
-          admin.from("projects").select("id", { count: "exact", head: true }).eq("customer_id", cand.id),
-          admin.from("invoices").select("id", { count: "exact", head: true }).eq("customer_id", cand.id),
+          admin.from("cportal_projects").select("id", { count: "exact", head: true }).eq("customer_id", cand.id),
+          admin.from("cportal_invoices").select("id", { count: "exact", head: true }).eq("customer_id", cand.id),
         ]);
         if ((projCount ?? 0) === 0 && (invCount ?? 0) === 0) {
-          const { error } = await admin.from("customers").delete().eq("id", cand.id);
+          const { error } = await admin.from("cportal_customers").delete().eq("id", cand.id);
           if (!error) customersRemoved++;
         } else {
           customersOrphaned++;
@@ -302,13 +300,13 @@ Deno.serve(async (req) => {
       }
     }
 
-    const { data: custList } = await admin.from("customers").select("id, zoho_contact_id, email");
+    const { data: custList } = await admin.from("cportal_customers").select("id, zoho_contact_id, email");
     const custMap = new Map((custList ?? []).map((c) => [c.zoho_contact_id, c.id]));
     const custEmail = new Map((custList ?? []).map((c) => [c.id, c.email]));
 
     // 2) Projects — capture existing statuses first so we can detect changes
     const { data: existingProjects } = await admin
-      .from("projects").select("zoho_project_id, status").not("zoho_project_id", "is", null);
+      .from("cportal_projects").select("zoho_project_id, status").not("zoho_project_id", "is", null);
     const oldStatus = new Map((existingProjects ?? []).map((p) => [p.zoho_project_id, p.status]));
 
     const projects = await fetchAll("projects", "projects", accessToken, orgId);
@@ -322,7 +320,7 @@ Deno.serve(async (req) => {
       updated_at: new Date().toISOString(),
     }));
     if (projectRows.length) {
-      const { error } = await admin.from("projects").upsert(projectRows, { onConflict: "zoho_project_id" });
+      const { error } = await admin.from("cportal_projects").upsert(projectRows, { onConflict: "zoho_project_id" });
       if (error) throw error;
     }
 
@@ -346,7 +344,7 @@ Deno.serve(async (req) => {
     }
 
     const { data: projList } = await admin
-      .from("projects").select("id, zoho_project_id").not("zoho_project_id", "is", null);
+      .from("cportal_projects").select("id, zoho_project_id").not("zoho_project_id", "is", null);
     const projMap = new Map((projList ?? []).map((p) => [p.zoho_project_id, p.id]));
 
     // Auto-add project members from each project's customer email. For every
@@ -359,7 +357,7 @@ Deno.serve(async (req) => {
     // unique constraint on (project_id, user_id).
     let membersAdded = 0;
     {
-      const { data: allProfiles } = await admin.from("profiles").select("id, email");
+      const { data: allProfiles } = await admin.from("cportal_profiles").select("id, email");
       const profileByEmail = new Map<string, string>();
       for (const p of allProfiles ?? []) {
         if (p.email) profileByEmail.set(p.email.toLowerCase(), p.id);
@@ -373,20 +371,20 @@ Deno.serve(async (req) => {
         const userId = profileByEmail.get(customerEmail.toLowerCase());
         if (!userId) continue;
         const { data: existing } = await admin
-          .from("project_members")
+          .from("cportal_project_members")
           .select("id")
           .eq("project_id", portalProjectId)
           .eq("user_id", userId)
           .maybeSingle();
         if (existing) continue;
         const { error } = await admin
-          .from("project_members").insert({ project_id: portalProjectId, user_id: userId });
+          .from("cportal_project_members").insert({ project_id: portalProjectId, user_id: userId });
         if (!error) membersAdded++;
       }
     }
 
     // 3) Invoices — capture existing ids first so we can detect new ones
-    const { data: existingInvoices } = await admin.from("invoices").select("zoho_invoice_id");
+    const { data: existingInvoices } = await admin.from("cportal_invoices").select("zoho_invoice_id");
     const existingInvIds = new Set((existingInvoices ?? []).map((i) => i.zoho_invoice_id));
 
     const invoices = await fetchAll("invoices", "invoices", accessToken, orgId);
@@ -403,7 +401,7 @@ Deno.serve(async (req) => {
       due_date: inv.due_date || null,
     }));
     if (invoiceRows.length) {
-      const { error } = await admin.from("invoices").upsert(invoiceRows, { onConflict: "zoho_invoice_id" });
+      const { error } = await admin.from("cportal_invoices").upsert(invoiceRows, { onConflict: "zoho_invoice_id" });
       if (error) throw error;
     }
 

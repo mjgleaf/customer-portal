@@ -2,7 +2,7 @@
 // Called by the customer portal when a logged-in user submits the in-portal
 // Request-for-Quote form. We:
 //   1. Authenticate the caller (must be a logged-in user)
-//   2. Insert the row into public.quote_requests
+//   2. Insert the row into public.cportal_quote_requests
 //   3. POST the payload to the existing Power Automate webhook so the
 //      original RFQ automation (SharePoint list entry, Teams notifications,
 //      whatever else) runs unchanged.
@@ -66,7 +66,7 @@ async function sendEmail(
   html: string,
 ) {
   const { data: setting } = await admin
-    .from("app_settings").select("value").eq("key", "emails_paused").maybeSingle();
+    .from("cportal_app_settings").select("value").eq("key", "emails_paused").maybeSingle();
   if (setting?.value !== "false") {
     console.log(`[emails paused] would send "${subject}" to: ${to.join(", ")}`);
     return;
@@ -138,7 +138,7 @@ Deno.serve(async (req) => {
 
     // 1. Insert into quote_requests (service-role bypasses RLS)
     const { data: row, error: insertError } = await admin
-      .from("quote_requests")
+      .from("cportal_quote_requests")
       .insert({
         user_id: user.id,
         name: String(name).trim(),
@@ -197,7 +197,7 @@ Deno.serve(async (req) => {
         console.error("Power Automate webhook error:", e);
       }
       // Record the outcome on the row for the admin queue.
-      await admin.from("quote_requests")
+      await admin.from("cportal_quote_requests")
         .update({ webhook_status: webhookStatus })
         .eq("id", row.id);
     }

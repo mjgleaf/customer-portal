@@ -61,7 +61,7 @@ async function sendEmail(
   // Admin-controlled kill switch via app_settings.emails_paused. Defaults to
   // paused — admin flips it active from the portal's Account page.
   const { data: setting } = await admin
-    .from("app_settings").select("value").eq("key", "emails_paused").maybeSingle();
+    .from("cportal_app_settings").select("value").eq("key", "emails_paused").maybeSingle();
   if (setting?.value !== "false") {
     console.log(`[emails paused] would send "${subject}" to: ${to.join(", ")}`);
     return;
@@ -114,7 +114,7 @@ Deno.serve(async (req) => {
   if (!token) return json({ error: "Not authorized" }, 403);
   const { data: { user } } = await admin.auth.getUser(token);
   if (!user) return json({ error: "Not authorized" }, 403);
-  const { data: caller } = await admin.from("profiles").select("role").eq("id", user.id).single();
+  const { data: caller } = await admin.from("cportal_profiles").select("role").eq("id", user.id).single();
   if (caller?.role !== "admin") return json({ error: "Admin only" }, 403);
 
   try {
@@ -122,7 +122,7 @@ Deno.serve(async (req) => {
     if (!projectId || !documentLabel) return json({ error: "projectId and documentLabel are required" }, 400);
 
     const { data: project } = await admin
-      .from("projects").select("name, customer_id, description, lead_comments").eq("id", projectId).single();
+      .from("cportal_projects").select("name, customer_id, description, lead_comments").eq("id", projectId).single();
     if (!project) return json({ error: "Project not found" }, 404);
 
     // Build the recipient set. If the admin explicitly chose recipients in
@@ -137,16 +137,16 @@ Deno.serve(async (req) => {
       }
     } else {
       if (project.customer_id) {
-        const { data: cust } = await admin.from("customers").select("email").eq("id", project.customer_id).single();
+        const { data: cust } = await admin.from("cportal_customers").select("email").eq("id", project.customer_id).single();
         if (cust?.email) {
-          const { data: prof } = await admin.from("profiles").select("email, email_notifications").ilike("email", cust.email).maybeSingle();
+          const { data: prof } = await admin.from("cportal_profiles").select("email, email_notifications").ilike("email", cust.email).maybeSingle();
           if (!prof || prof.email_notifications !== false) recipients.add(cust.email);
         }
       }
-      const { data: members } = await admin.from("project_members").select("user_id").eq("project_id", projectId);
+      const { data: members } = await admin.from("cportal_project_members").select("user_id").eq("project_id", projectId);
       if (members && members.length) {
         const { data: profs } = await admin
-          .from("profiles")
+          .from("cportal_profiles")
           .select("email, email_notifications")
           .in("id", members.map((m) => m.user_id));
         for (const p of profs ?? []) {
@@ -160,7 +160,7 @@ Deno.serve(async (req) => {
     // to show "Reminded Xd ago" so admins don't double-remind. Delivery is a
     // separate concern — pause switch on, no recipients, Graph failure all
     // still constitute "we tried to remind" for UX purposes.
-    await admin.from("reminders").insert({
+    await admin.from("cportal_reminders").insert({
       project_id: projectId,
       document_key: documentKey || documentLabel,
       document_label: documentLabel,

@@ -6,7 +6,7 @@
 //   4. Pass that URL to the Anthropic Messages API (Claude reads the PDF
 //      natively via vision)
 //   5. Parse Claude's structured JSON response
-//   6. Upsert the result into public.po_reviews
+//   6. Upsert the result into public.cportal_po_reviews
 //   7. Return the review for the UI to show inline
 //
 // Costs ~few cents per analysis. Requires ANTHROPIC_API_KEY secret.
@@ -81,7 +81,7 @@ Deno.serve(async (req) => {
   if (!token) return json({ error: "Not authorized" }, 401);
   const { data: { user } } = await admin.auth.getUser(token);
   if (!user) return json({ error: "Not authorized" }, 401);
-  const { data: caller } = await admin.from("profiles").select("role").eq("id", user.id).single();
+  const { data: caller } = await admin.from("cportal_profiles").select("role").eq("id", user.id).single();
   if (caller?.role !== "admin") return json({ error: "Admin only" }, 403);
 
   try {
@@ -90,7 +90,7 @@ Deno.serve(async (req) => {
 
     // Look up the file
     const { data: file } = await admin
-      .from("files")
+      .from("cportal_files")
       .select("id, project_id, name, kind, storage_path")
       .eq("id", fileId)
       .single();
@@ -110,7 +110,7 @@ Deno.serve(async (req) => {
     // Generate a signed URL Claude can fetch. 5 minutes is well beyond a
     // typical API call duration but expires before any meaningful exposure.
     const { data: urlData, error: urlErr } = await admin.storage
-      .from("project-files")
+      .from("cportal-project-files")
       .createSignedUrl(file.storage_path, 300);
     if (urlErr || !urlData?.signedUrl) {
       return json({ error: `Could not generate signed URL: ${urlErr?.message ?? "unknown"}` }, 500);
@@ -186,7 +186,7 @@ Deno.serve(async (req) => {
 
     // Upsert the review (one row per file_id; re-analyze overwrites).
     const { data: review, error: upsertErr } = await admin
-      .from("po_reviews")
+      .from("cportal_po_reviews")
       .upsert(
         {
           file_id: fileId,

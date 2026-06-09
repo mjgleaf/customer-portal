@@ -31,22 +31,51 @@ Deno.serve(async (req) => {
   if (token && token !== serviceKey) {
     const { data: { user } } = await admin.auth.getUser(token);
     if (user) {
-      const { data: profile } = await admin.from("profiles").select("role").eq("id", user.id).single();
+      const { data: profile } = await admin.from("cportal_profiles").select("role").eq("id", user.id).single();
       if (profile?.role === "admin") allowed = true;
     }
   }
   if (!allowed) return json({ error: "Not authorized" }, 403);
 
   try {
-    const { email, name, redirectTo } = await req.json();
+    const { email, name, redirectTo, role } = await req.json();
     if (!email) return json({ error: "Email is required" }, 400);
+
+    // Role defaults to "customer". Admins can also invite admins or
+    // service techs (the latter sees every Service-type project via RLS).
+    const desiredRole =
+      role === "admin" ? "admin"
+      : role === "service_tech" ? "service_tech"
+      : "customer";
 
     const { data, error } = await admin.auth.admin.inviteUserByEmail(email, {
       data: { full_name: name ?? null },
       redirectTo: redirectTo || undefined,
     });
     if (error) return json({ error: error.message }, 400);
-    return json({ ok: true, user_id: data.user?.id ?? null });
+
+    const newUserId = data.user?.id ?? null;
+
+    // If inviting as anything other than the default 'customer', promote
+    // the profile row that the cportal_handle_new_user trigger just created.
+    // The role-escalation trigger now allows service_role to make the change.
+    if (newUserId && desiredRole !== "customer") {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const { error: updErr } = await admin
+        .from("cportal_profiles")
+        .update({ role: desiredRole, full_name: name ?? null })
+        .eq("id", newUserId);
+      if (updErr) {
+        return json({
+          ok: true,
+          user_id: newUserId,
+          role: "customer",
+          warning: `Invite sent, but couldn't set role to ${desiredRole}: ${updErr.message}`,
+        });
+      }
+    }
+
+    return json({ ok: true, user_id: newUserId, role: desiredRole });
   } catch (e) {
     return json({ error: String((e as Error)?.message ?? e) }, 500);
   }

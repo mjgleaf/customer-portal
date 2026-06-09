@@ -337,8 +337,8 @@ Deno.serve(async (req) => {
 
   // (3) Look up the project by HWI code prefix.
   const { data: projects } = await admin
-    .from("projects")
-    .select("id, name, customer:customers(company, name)")
+    .from("cportal_projects")
+    .select("id, name, customer:cportal_customers(company, name)")
     .ilike("name", `${hwiCode}%`)
     .limit(1);
   const project = projects?.[0];
@@ -373,7 +373,7 @@ Deno.serve(async (req) => {
       const storagePath = `${project.id}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safeName}`;
 
       const { error: upErr } = await admin.storage
-        .from("project-files")
+        .from("cportal-project-files")
         .upload(storagePath, bytes, {
           contentType: c.contentType,
           upsert: false,
@@ -384,7 +384,7 @@ Deno.serve(async (req) => {
       }
 
       const { data: insertedFile, error: insErr } = await admin
-        .from("files")
+        .from("cportal_files")
         .insert({
           project_id: project.id,
           name: c.filename,
@@ -396,7 +396,7 @@ Deno.serve(async (req) => {
         .select("id")
         .single();
       if (insErr || !insertedFile) {
-        await admin.storage.from("project-files").remove([storagePath]);
+        await admin.storage.from("cportal-project-files").remove([storagePath]);
         failures.push({ name: c.filename, error: `files insert failed: ${insErr?.message}` });
         continue;
       }
@@ -427,7 +427,7 @@ Deno.serve(async (req) => {
           // The mirror function updates files.sharepoint_path itself; re-read
           // to find out which path it took (real folder vs emailed-to-sales).
           const { data: refetched } = await admin
-            .from("files")
+            .from("cportal_files")
             .select("sharepoint_path, sharepoint_error")
             .eq("id", insertedFile.id)
             .single();
