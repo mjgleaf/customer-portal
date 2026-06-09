@@ -58,6 +58,34 @@ async function fetchAll(path: string, key: string, accessToken: string, orgId: s
   return out;
 }
 
+// Fetch a single contact's full detail record. The list endpoint used by
+// fetchAll() omits the shipping_address / billing_address objects — those only
+// come back here, from GET /contacts/{id}. Returns the contact object or null.
+async function fetchContactDetail(contactId: string, accessToken: string, orgId: string): Promise<Record<string, any> | null> {
+  const url = `${ZOHO_BOOKS}/contacts/${contactId}?organization_id=${orgId}`;
+  const res = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+  const data = await res.json();
+  if (typeof data.code !== "undefined" && data.code !== 0) {
+    throw new Error(`Zoho contact ${contactId} error: ${JSON.stringify(data)}`);
+  }
+  return data.contact ?? null;
+}
+
+// Run an async mapper over items with bounded concurrency, so enriching every
+// customer with a detail fetch doesn't blow past Zoho's API rate limits.
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 function mapProjectStatus(zohoStatus: string): string {
   return zohoStatus === "active" ? "active" : "completed";
 }
@@ -205,7 +233,20 @@ Deno.serve(async (req) => {
     const contacts = allContacts.filter((c) => c.contact_type === "customer");
     const nonCustomers = allContacts.filter((c) => c.contact_type !== "customer");
 
-    const customerRows = contacts.map((c) => {
+    // The list endpoint doesn't return address objects, so enrich each customer
+    // with its detail record (which carries shipping_address / billing_address).
+    // A per-contact failure falls back to the summary so one bad record can't
+    // abort the whole sync — that row just keeps whatever address it already had.
+    const detailedContacts = await mapWithConcurrency(contacts, 8, async (c) => {
+      try {
+        return (await fetchContactDetail(String(c.contact_id), accessToken, orgId)) ?? c;
+      } catch (e) {
+        console.error(`Zoho contact detail fetch failed for ${c.contact_id}:`, e);
+        return c;
+      }
+    });
+
+    const customerRows = detailedContacts.map((c) => {
       const ship = (c.shipping_address ?? {}) as Record<string, string | undefined>;
       const bill = (c.billing_address ?? {}) as Record<string, string | undefined>;
       return {
