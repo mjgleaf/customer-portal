@@ -1514,10 +1514,13 @@ export default function ProjectPage() {
           )
         }
 
-        // Format the customer's shipping address from the Zoho-synced fields.
-        // Returns null if no usable address is on file (so the card can
-        // collapse to a friendly empty state).
+        // Ship-to address. The SharePoint Lead List ("addressshipto") is the
+        // authoritative source — Zoho Books shipping addresses are unreliable —
+        // so prefer the project's synced ship_to_address and fall back to the
+        // customer's Zoho shipping fields only when the Lead List has none.
         const ship = project?.customer
+        const leadShipTo = (project?.ship_to_address ?? '').trim()
+        const hasLeadShipTo = !!leadShipTo
         const hasShipAddr = !!(ship && (ship.shipping_address || ship.shipping_city || ship.shipping_state || ship.shipping_zip))
         const cityStateZip = ship
           ? [
@@ -1528,16 +1531,27 @@ export default function ProjectPage() {
 
         return (
           <div className="space-y-5">
-            {/* --- Ship-to address (read-only, synced from Zoho) --- */}
+            {/* --- Ship-to address (read-only). Prefers the SharePoint Lead
+                 List ("addressshipto"); falls back to the Zoho customer address. --- */}
             <div className="bg-white border border-gray-200 rounded-xl p-5">
               <div className="flex items-start gap-3">
                 <MapPin size={18} className="text-gray-400 mt-1 flex-shrink-0" />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center justify-between gap-2 mb-1">
                     <h3 className="text-sm font-semibold text-gray-900">Ship to</h3>
-                    <span className="text-[10px] uppercase tracking-wide text-gray-400">From Zoho Books</span>
+                    <span className="text-[10px] uppercase tracking-wide text-gray-400">{hasLeadShipTo ? 'From Lead List' : 'From Zoho Books'}</span>
                   </div>
-                  {hasShipAddr ? (
+                  {hasLeadShipTo ? (
+                    <address className="text-sm text-gray-700 not-italic leading-relaxed">
+                      {ship?.company && (
+                        <div className="font-medium text-gray-900">{ship.company}</div>
+                      )}
+                      {ship?.name && ship.name !== ship.company && (
+                        <div className="text-gray-700">{ship.name}</div>
+                      )}
+                      <div className="whitespace-pre-line">{leadShipTo}</div>
+                    </address>
+                  ) : hasShipAddr ? (
                     <address className="text-sm text-gray-700 not-italic leading-relaxed">
                       {ship?.company && (
                         <div className="font-medium text-gray-900">{ship.company}</div>

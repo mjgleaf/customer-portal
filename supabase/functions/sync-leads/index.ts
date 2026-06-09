@@ -20,6 +20,16 @@ const COMMENTS_FIELD = "LeadComments";  // the description text shown as "Projec
 // SharePoint may expose the column under any of these internal names — we
 // try them in order. If your column is named differently, add it here.
 const EMAIL_FIELDS = ["LeadEmail", "leademail", "Lead_x0020_Email", "Email"];
+// Site contact info (on-site point of contact for the service tech).
+// SharePoint stores these as ContactNameOnSite / ContactPhoneOnSite —
+// confirmed empirically by unioning fields across every lead row.
+const SITE_CONTACT_FIELDS = ["ContactNameOnSite"];
+const SITE_CONTACT_PHONE_FIELDS = ["ContactPhoneOnSite"];
+// Ship-to address for the job site. The SharePoint column is "addressshipto";
+// the internal name is usually the lowercased value, but we try a few common
+// encodings to be safe (same approach as EMAIL_FIELDS). This is the
+// authoritative ship-to — Zoho Books shipping addresses are unreliable.
+const SHIPTO_FIELDS = ["addressshipto", "AddressShipTo", "AddressShipto", "addressShipTo", "Address_x0020_Ship_x0020_To", "ShipToAddress", "ShipTo"];
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -55,14 +65,24 @@ Deno.serve(async (req) => {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const admin = createClient(supabaseUrl, serviceKey);
 
+  // Three-path auth: direct env match, JWT role:service_role claim, or admin user JWT.
   const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "").trim();
   let allowed = false;
-  if (token && token === serviceKey) {
-    allowed = true;
-  } else if (token) {
+  if (token && token === serviceKey) allowed = true;
+  if (!allowed && token) {
+    try {
+      const parts = token.split(".");
+      if (parts.length === 3) {
+        const padded = parts[1] + "=".repeat((4 - parts[1].length % 4) % 4);
+        const payload = JSON.parse(atob(padded.replace(/-/g, "+").replace(/_/g, "/")));
+        if (payload?.role === "service_role") allowed = true;
+      }
+    } catch { /* not a JWT */ }
+  }
+  if (!allowed && token) {
     const { data: { user } } = await admin.auth.getUser(token);
     if (user) {
-      const { data: profile } = await admin.from("profiles").select("role").eq("id", user.id).single();
+      const { data: profile } = await admin.from("cportal_profiles").select("role").eq("id", user.id).single();
       if (profile?.role === "admin") allowed = true;
     }
   }
@@ -84,23 +104,93 @@ Deno.serve(async (req) => {
     }
 
     // Map project name -> id (trimmed, lower-cased)
-    const { data: projects } = await admin.from("projects").select("id, name");
+    const { data: projects } = await admin.from("cportal_projects").select("id, name");
     const byName = new Map<string, string>();
     for (const p of projects ?? []) byName.set(String(p.name).trim().toLowerCase(), p.id);
 
     let matched = 0;
+    let projectTypesSet = 0;
+    let siteContactsSet = 0;
+    let shipToSet = 0;
     let membersAdded = 0;
+    // Diagnostic: union every field key across every lead row. SharePoint
+    // omits null/empty fields from the `?expand=fields` payload, so a
+    // column that exists but is only filled on some rows won't appear if
+    // we sample a single row.
+    const allFieldNames = new Set<string>();
+    for (const l of leads) for (const k of Object.keys(l)) allFieldNames.add(k);
+    const sampleFieldNames = [...allFieldNames].sort();
+
+    // Also fetch the LIST'S column schema for definitive ground truth.
+    // This returns every defined column even if all rows are empty.
+    let listColumns: { name: string; displayName: string }[] = [];
+    try {
+      const colResp = await fetch(
+        `https://graph.microsoft.com/v1.0/sites/${SITE_ID}/lists/${LIST_ID}/columns?$select=name,displayName`,
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+      );
+      const colData = await colResp.json();
+      listColumns = (colData.value ?? []).map((c: { name: string; displayName: string }) => ({
+        name: c.name,
+        displayName: c.displayName,
+      }));
+    } catch { /* best-effort */ }
+
     for (const f of leads) {
       const q = String(f[MATCH_FIELD] ?? "").trim();
       if (!q) continue;
       const projectId = byName.get(q.toLowerCase());
       if (!projectId) continue;
 
+      // Build the update payload incrementally so we only PATCH the columns
+      // this lead actually has values for.
+      const update: Record<string, string> = {};
+
       // 1. LeadComments -> project_scope
       const comments = String(f[COMMENTS_FIELD] ?? "").trim();
-      if (comments) {
-        const { error } = await admin.from("projects").update({ lead_comments: comments }).eq("id", projectId);
-        if (!error) matched++;
+      if (comments) update.lead_comments = comments;
+
+      // 2. ProjType -> project_type ('Service', 'Rental', 'Sales'). Used by
+      //    the service_tech role to filter what they see — only Service jobs.
+      const projType = String(f["ProjType"] ?? "").trim();
+      if (projType) update.project_type = projType;
+
+      // 3. ContactNameOnSite -> site_contact. Shown under the ship-to
+      //    address on the service tech view so they have a name to ask
+      //    for on arrival. Phone goes in site_contact_phone so we can
+      //    render it as a tap-to-call link on mobile.
+      let siteContact = "";
+      for (const key of SITE_CONTACT_FIELDS) {
+        const v = f[key];
+        if (typeof v === "string" && v.trim()) { siteContact = v.trim(); break; }
+      }
+      if (siteContact) update.site_contact = siteContact;
+
+      let siteContactPhone = "";
+      for (const key of SITE_CONTACT_PHONE_FIELDS) {
+        const v = f[key];
+        if (typeof v === "string" && v.trim()) { siteContactPhone = v.trim(); break; }
+      }
+      if (siteContactPhone) update.site_contact_phone = siteContactPhone;
+
+      // 4. addressshipto -> ship_to_address. Authoritative ship-to for the
+      //    job site, shown on the project page (preferred over the Zoho
+      //    customer shipping address, which is unreliable).
+      let shipTo = "";
+      for (const key of SHIPTO_FIELDS) {
+        const v = f[key];
+        if (typeof v === "string" && v.trim()) { shipTo = v.trim(); break; }
+      }
+      if (shipTo) update.ship_to_address = shipTo;
+
+      if (Object.keys(update).length > 0) {
+        const { error } = await admin.from("cportal_projects").update(update).eq("id", projectId);
+        if (!error) {
+          matched++;
+          if (update.project_type) projectTypesSet++;
+          if (update.site_contact) siteContactsSet++;
+          if (update.ship_to_address) shipToSet++;
+        }
       }
 
       // 2. LeadEmail -> auto-add as a project member (only if a portal profile
@@ -113,17 +203,17 @@ Deno.serve(async (req) => {
       }
       if (email) {
         const { data: prof } = await admin
-          .from("profiles").select("id").ilike("email", email).maybeSingle();
+          .from("cportal_profiles").select("id").ilike("email", email).maybeSingle();
         if (prof?.id) {
           const { data: existing } = await admin
-            .from("project_members")
+            .from("cportal_project_members")
             .select("id")
             .eq("project_id", projectId)
             .eq("user_id", prof.id)
             .maybeSingle();
           if (!existing) {
             const { error } = await admin
-              .from("project_members").insert({ project_id: projectId, user_id: prof.id });
+              .from("cportal_project_members").insert({ project_id: projectId, user_id: prof.id });
             if (!error) membersAdded++;
           }
         }
@@ -134,7 +224,12 @@ Deno.serve(async (req) => {
       ok: true,
       leadsScanned: leads.length,
       projectsMatched: matched,
+      projectTypesSet,
+      siteContactsSet,
+      shipToSet,
       membersAdded,
+      sampleFieldNames,
+      listColumns,
       at: new Date().toISOString(),
     });
   } catch (e) {

@@ -36,6 +36,7 @@ export interface Project {
     billing_country?: string | null
   } | null
   lead_comments?: string | null
+  ship_to_address?: string | null
 }
 
 export interface ProjectFile {
@@ -53,6 +54,8 @@ export interface ProjectFile {
   sharepoint_synced_at?: string | null
   sharepoint_path?: string | null
   sharepoint_error?: string | null
+  // SharePoint source item id, used to dedupe files synced from SharePoint.
+  sharepoint_source_id?: string | null
   // For SharePoint-synced files, the createdDateTime from OneDrive — i.e.
   // when the file was first added to SharePoint. Null for files uploaded
   // directly through the portal (use created_at instead).
