@@ -13,7 +13,7 @@
 
 param(
   [string]$SupabaseToken = $env:SUPABASE_ACCESS_TOKEN,
-  [string]$ProjectRef    = "uooklwtysposkuwocbup"
+  [string]$ProjectRef    = "vpdcikiyaifppkkantrb"   # LifeOSBase — the project both the portal and travel app share
 )
 
 if ([string]::IsNullOrWhiteSpace($SupabaseToken)) {
@@ -32,7 +32,7 @@ $mgmtHeaders = @{ Authorization = "Bearer $SupabaseToken" }
 $keys = Invoke-RestMethod -Method Get -Uri "https://api.supabase.com/v1/projects/$ProjectRef/api-keys" -Headers $mgmtHeaders
 $serviceRole = ($keys | Where-Object { $_.name -eq "service_role" }).api_key
 
-$sql = "select id, name from public.projects where name ~* '^HWI-(25|26)-' order by name desc"
+$sql = "select id, name from public.cportal_projects where name ~* '^HWI-(25|26)-' order by name desc"
 $body = @{ query = $sql } | ConvertTo-Json -Compress
 $projects = Invoke-RestMethod -Method Post -Uri "https://api.supabase.com/v1/projects/$ProjectRef/database/query" -Headers $mgmtHeaders -ContentType "application/json" -Body $body
 
