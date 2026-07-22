@@ -56,6 +56,8 @@ export default function DashboardPage() {
     currency: string
   } | null>(null)
   const [actionItems, setActionItems] = useState<Record<string, number>>({})
+  // Projects where the current user has unread @mentions (the red dot).
+  const [mentionProjects, setMentionProjects] = useState<Set<string>>(new Set())
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const didInitCollapse = useRef(false)
 
@@ -94,7 +96,19 @@ export default function DashboardPage() {
     // Skip action-items fetch for techs — they don't care about missing
     // documents (it's a customer/admin paperwork concern, not theirs).
     if (showActionItems) fetchActionItems((data ?? []).map((p) => p.id))
+    fetchMentions()
     setLoading(false)
+  }
+
+  // Projects where I have unread @mentions — drives the dashboard red dot.
+  async function fetchMentions() {
+    if (!profile) { setMentionProjects(new Set()); return }
+    const { data } = await supabase
+      .from('cportal_note_mentions')
+      .select('project_id')
+      .eq('mentioned_user_id', profile.id)
+      .is('read_at', null)
+    setMentionProjects(new Set((data ?? []).map((r) => r.project_id as string)))
   }
 
   // Count outstanding required documents per project (missing PO + unmet checklist items).
@@ -180,14 +194,25 @@ export default function DashboardPage() {
       className="bg-white border border-gray-200 rounded-xl p-5 hover:shadow-md hover:border-blue-200 transition-all group block"
     >
       <div className="flex items-start justify-between mb-3">
-        <div className="w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center group-hover:bg-blue-100 transition-colors">
+        <div className="relative w-10 h-10 bg-blue-50 rounded-lg flex items-center justify-center group-hover:bg-blue-100 transition-colors">
           <FolderOpen size={20} className="text-blue-600" />
+          {mentionProjects.has(project.id) && (
+            <span className="absolute -top-1 -right-1 w-3 h-3 rounded-full bg-red-500 ring-2 ring-white" />
+          )}
         </div>
-        {showActionItems && !isAdmin && (actionItems[project.id] ?? 0) > 0 && (
-          <span className="text-xs font-semibold px-2 py-1 rounded-full text-amber-700 bg-amber-100">
-            {actionItems[project.id]} needed
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {mentionProjects.has(project.id) && (
+            <span className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-full text-red-700 bg-red-100">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
+              Mentioned you
+            </span>
+          )}
+          {showActionItems && !isAdmin && (actionItems[project.id] ?? 0) > 0 && (
+            <span className="text-xs font-semibold px-2 py-1 rounded-full text-amber-700 bg-amber-100">
+              {actionItems[project.id]} needed
+            </span>
+          )}
+        </div>
       </div>
       <h3 className="font-semibold text-gray-900 mb-1">{project.name}</h3>
       {!isAdmin && (project.customer?.company || project.customer?.name) && (
@@ -216,6 +241,12 @@ export default function DashboardPage() {
         <span className="text-sm font-medium text-gray-900 truncate group-hover:text-blue-700 transition-colors">
           {project.name}
         </span>
+        {mentionProjects.has(project.id) && (
+          <span className="inline-flex items-center gap-1 flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded-full text-red-700 bg-red-100">
+            <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
+            Mention
+          </span>
+        )}
         {project.description && (
           <span className="text-xs text-gray-400 truncate hidden md:inline">— {project.description}</span>
         )}

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Award, Download, Eye, Search, FileText, X, MapPin } from 'lucide-react'
 import { supabase } from '../lib/supabase'
+import { latestEquipmentCerts } from '../lib/equipmentCerts'
 import { useAuth } from '../context/AuthContext'
 import type { ProjectFile } from '../types'
 
@@ -84,7 +85,13 @@ export default function CertificatesPage() {
       .order('created_at', { ascending: false })
     // Sort client-side by the displayed date so newest-in-SharePoint comes
     // first (falls back to created_at for portal-uploaded files).
-    const rows = (data ?? []) as CertWithProject[]
+    // Collapse synced equipment certs to the current one per asset —
+    // see latestEquipmentCerts. Proof-load test certs pass through as-is.
+    const fetched = (data ?? []) as CertWithProject[]
+    const rows = [
+      ...fetched.filter(f => f.kind !== 'equipment_certificate'),
+      ...latestEquipmentCerts(fetched.filter(f => f.kind === 'equipment_certificate')),
+    ]
     rows.sort((a, b) => {
       const ad = new Date(a.source_created_at || a.created_at).getTime()
       const bd = new Date(b.source_created_at || b.created_at).getTime()

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Shield, UserPlus, Mail, Check, AlertCircle, X, HardHat, Phone } from 'lucide-react'
+import { Shield, UserPlus, Mail, Check, AlertCircle, X, HardHat, Phone, Send } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 
@@ -22,6 +22,8 @@ interface TeamRow {
   phone: string | null
   role: string
   created_at: string
+  has_signed_in: boolean
+  last_sign_in_at: string | null
 }
 
 function formatDate(d: string) {
@@ -73,12 +75,10 @@ export default function TeamPage() {
 
   async function fetchTeam() {
     setLoading(true)
-    const { data } = await supabase
-      .from('cportal_profiles')
-      .select('id, email, full_name, phone, role, created_at')
-      .in('role', ['admin', 'service_tech'])
-      .order('role', { ascending: true })
-      .order('created_at', { ascending: true })
+    // Call the cportal_get_team RPC instead of the table directly so we
+    // can join in last_sign_in_at from auth.users (which the table doesn't
+    // expose). Function is admin/team-member-gated internally.
+    const { data } = await supabase.rpc('cportal_get_team')
     setTeam((data ?? []) as TeamRow[])
     setLoading(false)
   }
@@ -159,6 +159,38 @@ export default function TeamPage() {
     await fetchTeam()
   }
 
+  // "Re-invite" — for team members who were invited but never accepted.
+  // Hits the existing invite-customer edge function which now also
+  // handles the "user already exists" case by sending a fresh password
+  // setup email and refreshing their role.
+  const [resendingId, setResendingId] = useState<string | null>(null)
+  async function resendInvite(target: TeamRow) {
+    if (!target.email) return
+    setResendingId(target.id)
+    setMsg(null)
+    const { data, error } = await supabase.functions.invoke('invite-customer', {
+      body: {
+        email: target.email,
+        name: target.full_name,
+        role: target.role,
+        redirectTo: `${window.location.origin}/set-password`,
+      },
+    })
+    setResendingId(null)
+    if (error || data?.error) {
+      let detail = error?.message || data?.error || 'Re-invite failed.'
+      try {
+        const ctx = (error as { context?: Response } | null)?.context
+        if (ctx) { const body = await ctx.json(); if (body?.error) detail = body.error }
+      } catch { /* ignore */ }
+      setMsg({ kind: 'error', text: detail })
+      setTimeout(() => setMsg(null), 8000)
+      return
+    }
+    setMsg({ kind: 'success', text: `Fresh setup link sent to ${target.email}.` })
+    setTimeout(() => setMsg(null), 6000)
+  }
+
   if (profile && !isAdmin && !isServiceTech) return null
 
   return (
@@ -236,6 +268,26 @@ export default function TeamPage() {
                         <span className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded font-medium ${memberIsAdmin ? 'bg-blue-50 text-blue-700' : 'bg-amber-50 text-amber-700'}`}>
                           {memberIsAdmin ? 'Admin' : 'Service Tech'}
                         </span>
+                        {/* Sign-in status — quick visual cue for admins to know
+                            who's actually using the portal vs. who's still
+                            sitting on an unaccepted invitation. */}
+                        {m.has_signed_in ? (
+                          <span
+                            className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded font-medium bg-green-50 text-green-700"
+                            title={m.last_sign_in_at ? `Last signed in ${formatDate(m.last_sign_in_at)}` : 'Has signed in'}
+                          >
+                            <Check size={10} />
+                            Active
+                          </span>
+                        ) : (
+                          <span
+                            className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded font-medium bg-gray-100 text-gray-600"
+                            title="Invitation sent — they haven't accepted yet"
+                          >
+                            <Mail size={10} />
+                            Invited
+                          </span>
+                        )}
                         {isMe && <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 font-medium">You</span>}
                       </div>
 
@@ -275,6 +327,17 @@ export default function TeamPage() {
                         next to each row. */}
                     {isAdmin && !isMe && (
                       <div className="hidden sm:flex items-center gap-2 flex-shrink-0">
+                        {!m.has_signed_in && (
+                          <button
+                            onClick={() => resendInvite(m)}
+                            disabled={resendingId === m.id}
+                            className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 px-2 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+                            title="Send a fresh password setup email"
+                          >
+                            <Send size={11} />
+                            {resendingId === m.id ? 'Sending…' : 'Re-invite'}
+                          </button>
+                        )}
                         <select
                           value={m.role}
                           onChange={e => changeRole(m, e.target.value as 'admin' | 'service_tech')}
@@ -298,7 +361,17 @@ export default function TeamPage() {
 
                   {/* Mobile-only admin controls below the card body. */}
                   {isAdmin && !isMe && (
-                    <div className="sm:hidden flex items-center gap-2 mt-3 pl-13">
+                    <div className="sm:hidden flex flex-wrap items-center gap-2 mt-3 pl-13">
+                      {!m.has_signed_in && (
+                        <button
+                          onClick={() => resendInvite(m)}
+                          disabled={resendingId === m.id}
+                          className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 bg-blue-50 px-2 py-2 rounded-lg disabled:opacity-50"
+                        >
+                          <Send size={11} />
+                          {resendingId === m.id ? 'Sending…' : 'Re-invite'}
+                        </button>
+                      )}
                       <select
                         value={m.role}
                         onChange={e => changeRole(m, e.target.value as 'admin' | 'service_tech')}

@@ -52,7 +52,70 @@ Deno.serve(async (req) => {
       data: { full_name: name ?? null },
       redirectTo: redirectTo || undefined,
     });
-    if (error) return json({ error: error.message }, 400);
+
+    // If the user already exists in auth.users, fall through to a
+    // re-invite flow: send a fresh password recovery email and update
+    // their role to the requested one. This handles two situations:
+    //   1. The original invite link expired / they didn't click in time.
+    //   2. They were previously demoted to customer and we want to
+    //      put them back as admin or service tech.
+    // Refuse to re-send to someone who has already signed in — that's
+    // a password reset, not an invite, and the admin should use that
+    // flow instead so we don't silently expire their working password.
+    if (error) {
+      const looksLikeAlreadyExists =
+        (error as { code?: string }).code === "email_exists" ||
+        (error.message ?? "").toLowerCase().includes("already") ||
+        (error.message ?? "").toLowerCase().includes("registered");
+
+      if (!looksLikeAlreadyExists) {
+        return json({ error: error.message }, 400);
+      }
+
+      // Look up the existing user by email.
+      const { data: profileMatch } = await admin
+        .from("cportal_profiles")
+        .select("id")
+        .ilike("email", email)
+        .maybeSingle();
+
+      if (!profileMatch?.id) {
+        return json({ error: "Email is registered but no portal profile was found." }, 500);
+      }
+      const existingUserId = profileMatch.id;
+
+      // Note: we intentionally don't bail out if last_sign_in_at is set.
+      // Supabase marks a user as "signed in" the moment they hit
+      // /auth/v1/verify even if the post-verify redirect 404s (broken
+      // /set-password page, etc.), so a non-null last_sign_in_at doesn't
+      // actually mean they have a working password. The admin clicked
+      // Invite explicitly — send them a fresh setup email no matter what.
+
+      // Update role + name to reflect the current invite request.
+      const { error: updErr } = await admin
+        .from("cportal_profiles")
+        .update({ role: desiredRole, full_name: name ?? null })
+        .eq("id", existingUserId);
+      if (updErr) {
+        return json({ error: `Couldn't update role on re-invite: ${updErr.message}` }, 500);
+      }
+
+      // Send them a fresh password setup email (re-uses our recovery
+      // template via the send-auth-email hook).
+      const { error: resendErr } = await admin.auth.resetPasswordForEmail(email, {
+        redirectTo: redirectTo || undefined,
+      });
+      if (resendErr) {
+        return json({ error: `Re-invite email failed: ${resendErr.message}` }, 500);
+      }
+
+      return json({
+        ok: true,
+        user_id: existingUserId,
+        role: desiredRole,
+        resent: true,
+      });
+    }
 
     const newUserId = data.user?.id ?? null;
 

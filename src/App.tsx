@@ -9,6 +9,7 @@ import CustomerDetailPage from './pages/CustomerDetailPage'
 import SetPasswordPage from './pages/SetPasswordPage'
 import ResetPasswordPage from './pages/ResetPasswordPage'
 import ForgotPasswordPage from './pages/ForgotPasswordPage'
+import AcceptInvitePage from './pages/AcceptInvitePage'
 import AccountPage from './pages/AccountPage'
 import CertificatesPage from './pages/CertificatesPage'
 import InvoicesPage from './pages/InvoicesPage'
@@ -23,6 +24,7 @@ export default function App() {
         <Routes>
           <Route path="/login" element={<LoginPage />} />
           <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+          <Route path="/accept" element={<AcceptInvitePage />} />
           <Route path="/set-password" element={<SetPasswordPage />} />
           <Route path="/reset-password" element={<ResetPasswordPage />} />
           <Route path="/" element={<ProtectedRoute><DashboardPage /></ProtectedRoute>} />

@@ -103,16 +103,23 @@ Deno.serve(async (req) => {
       url = (data["@odata.nextLink"] as string | undefined) ?? null;
     }
 
-    // Map project name -> id (trimmed, lower-cased)
-    const { data: projects } = await admin.from("cportal_projects").select("id, name");
-    const byName = new Map<string, string>();
-    for (const p of projects ?? []) byName.set(String(p.name).trim().toLowerCase(), p.id);
+    // Map project name -> {id, customer_id} (trimmed, lower-cased)
+    const { data: projects } = await admin.from("cportal_projects").select("id, name, customer_id");
+    const byName = new Map<string, { id: string; customer_id: string | null }>();
+    for (const p of projects ?? []) {
+      byName.set(String(p.name).trim().toLowerCase(), { id: p.id, customer_id: p.customer_id });
+    }
 
     let matched = 0;
     let projectTypesSet = 0;
     let siteContactsSet = 0;
     let shipToSet = 0;
     let membersAdded = 0;
+    let contactsSynced = 0;
+
+    // Pull up the existing sharepoint-source contacts so we can later
+    // mirror-delete ones no longer in any lead.
+    const seenContactKeys = new Set<string>(); // `${customer_id}::${email}`
     // Diagnostic: union every field key across every lead row. SharePoint
     // omits null/empty fields from the `?expand=fields` payload, so a
     // column that exists but is only filled on some rows won't appear if
@@ -139,8 +146,10 @@ Deno.serve(async (req) => {
     for (const f of leads) {
       const q = String(f[MATCH_FIELD] ?? "").trim();
       if (!q) continue;
-      const projectId = byName.get(q.toLowerCase());
-      if (!projectId) continue;
+      const project = byName.get(q.toLowerCase());
+      if (!project) continue;
+      const projectId = project.id;
+      const customerId = project.customer_id;
 
       // Build the update payload incrementally so we only PATCH the columns
       // this lead actually has values for.
@@ -193,14 +202,43 @@ Deno.serve(async (req) => {
         }
       }
 
-      // 2. LeadEmail -> auto-add as a project member (only if a portal profile
-      //    already exists for that email). We don't auto-invite people who
-      //    haven't signed up — that's still an admin decision.
+      // 5. LeadEmail -> the person who submitted the lead. We do two
+      //    things with it:
+      //      a) Add as a contact on the project's customer so they (and
+      //         their company peers) automatically get portal access.
+      //      b) If they ALREADY have a portal profile, also link them as
+      //         an explicit project_member (legacy behavior — kept so
+      //         nothing breaks for already-invited users).
       let email = "";
       for (const key of EMAIL_FIELDS) {
         const v = f[key];
         if (typeof v === "string" && v.trim()) { email = v.trim(); break; }
       }
+      if (email && customerId) {
+        const lowerEmail = email.toLowerCase();
+        seenContactKeys.add(`${customerId}::${lowerEmail}`);
+
+        // Lead name + phone (helpful display info on the contact row).
+        const leadName = String(f["LeadName"] ?? "").trim() || null;
+        const leadPhone = String(f["Phone"] ?? "").trim() || null;
+
+        const { error: ccErr } = await admin
+          .from("cportal_customer_contacts")
+          .upsert(
+            {
+              customer_id: customerId,
+              email: lowerEmail,
+              name: leadName,
+              role: "lead",
+              phone: leadPhone,
+              source: "sharepoint",
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "customer_id,email" },
+          );
+        if (!ccErr) contactsSynced++;
+      }
+
       if (email) {
         const { data: prof } = await admin
           .from("cportal_profiles").select("id").ilike("email", email).maybeSingle();
@@ -220,6 +258,26 @@ Deno.serve(async (req) => {
       }
     }
 
+    // Mirror SharePoint: drop sharepoint-source contacts that no longer
+    // appear in any current lead. Leaves zoho and manual entries alone.
+    let contactsRemoved = 0;
+    {
+      const { data: existingSp } = await admin
+        .from("cportal_customer_contacts")
+        .select("id, customer_id, email")
+        .eq("source", "sharepoint");
+      const stale = (existingSp ?? []).filter(
+        (r) => !seenContactKeys.has(`${r.customer_id}::${r.email}`),
+      );
+      if (stale.length) {
+        const { error } = await admin
+          .from("cportal_customer_contacts")
+          .delete()
+          .in("id", stale.map((r) => r.id));
+        if (!error) contactsRemoved = stale.length;
+      }
+    }
+
     return json({
       ok: true,
       leadsScanned: leads.length,
@@ -228,6 +286,8 @@ Deno.serve(async (req) => {
       siteContactsSet,
       shipToSet,
       membersAdded,
+      contactsSynced,
+      contactsRemoved,
       sampleFieldNames,
       listColumns,
       at: new Date().toISOString(),

@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { supabase } from '../lib/supabase'
 
 export default function LoginPage() {
   const { signIn } = useAuth()
@@ -9,6 +10,7 @@ export default function LoginPage() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [msLoading, setMsLoading] = useState(false)
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
@@ -18,6 +20,28 @@ export default function LoginPage() {
     setLoading(false)
     if (error) setError(error)
     else navigate('/')
+  }
+
+  // Microsoft (Azure AD) SSO for Hydro-Wates employees. Supabase Auth
+  // matches the OAuth'd email to an existing user (set up via the
+  // Team page invite flow) and links the Microsoft identity to it —
+  // so the role the admin chose during invite is preserved.
+  async function handleMicrosoftLogin() {
+    setError('')
+    setMsLoading(true)
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'azure',
+      options: {
+        scopes: 'openid profile email',
+        redirectTo: window.location.origin,
+      },
+    })
+    // signInWithOAuth navigates to Microsoft; if we land back here it
+    // means setup is incomplete (e.g. Azure provider not enabled yet).
+    if (error) {
+      setError(error.message)
+      setMsLoading(false)
+    }
   }
 
   return (
@@ -68,6 +92,37 @@ export default function LoginPage() {
             Forgot password?
           </Link>
         </form>
+
+        {/* SSO divider + Microsoft button. Customers use email/password
+            above; Hydro-Wates employees use the Microsoft button below to
+            sign in with their company account. */}
+        <div className="relative my-6">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-gray-200" />
+          </div>
+          <div className="relative flex justify-center text-xs uppercase tracking-wider">
+            <span className="bg-white px-2 text-gray-400">or</span>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleMicrosoftLogin}
+          disabled={msLoading}
+          className="w-full bg-white border border-gray-300 text-gray-800 py-2.5 rounded-lg text-sm font-semibold hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors inline-flex items-center justify-center gap-2.5"
+        >
+          {/* Inline Microsoft 4-square mark; no external dependency. */}
+          <svg width="18" height="18" viewBox="0 0 23 23" aria-hidden="true">
+            <rect width="10" height="10" x="1"  y="1"  fill="#F25022" />
+            <rect width="10" height="10" x="12" y="1"  fill="#7FBA00" />
+            <rect width="10" height="10" x="1"  y="12" fill="#00A4EF" />
+            <rect width="10" height="10" x="12" y="12" fill="#FFB900" />
+          </svg>
+          {msLoading ? 'Redirecting…' : 'Sign in with Microsoft'}
+        </button>
+        <p className="text-[11px] text-gray-400 text-center mt-2">
+          For Hydro-Wates employees — uses your company Microsoft account.
+        </p>
       </div>
     </div>
   )

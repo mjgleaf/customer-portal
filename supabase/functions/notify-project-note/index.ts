@@ -9,8 +9,6 @@
 // email_notifications preference.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { brandedEmail } from "../_shared/email-template.ts";
-import { renderProjectInfoBlock } from "../_shared/project-context.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -31,6 +29,147 @@ function esc(s: unknown): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+// --- Branded email wrapper + project-info block (inlined copies of the
+//     _shared helpers so this function deploys as one self-contained file) --
+interface BrandedEmailOptions {
+  preheader?: string;
+  title: string;
+  bodyHtml: string;
+  ctaLabel?: string;
+  ctaUrl?: string;
+  footnote?: string;
+}
+
+function brandedEmail(opts: BrandedEmailOptions): string {
+  const logoUrl = Deno.env.get("EMAIL_LOGO_URL") || "";
+  const year = new Date().getFullYear();
+
+  const headerVisual = logoUrl
+    ? `<img src="${esc(logoUrl)}" alt="Hydro-Wates" height="44" style="display:block;max-height:44px;width:auto;border:0;outline:none;text-decoration:none;">`
+    : `<div style="font-family:'Helvetica Neue',Arial,sans-serif;color:#ffffff;line-height:1.1;text-align:center;">
+         <div style="font-size:22px;font-weight:700;letter-spacing:0.06em;">HYDRO-WATES</div>
+         <div style="font-size:10px;color:#94a3b8;letter-spacing:0.18em;text-transform:uppercase;margin-top:6px;">Proof-Load Testing Services</div>
+       </div>`;
+
+  const ctaBlock = opts.ctaUrl && opts.ctaLabel
+    ? `<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:28px 0 0 0;">
+         <tr><td style="background:#2563eb;border-radius:6px;">
+           <a href="${esc(opts.ctaUrl)}" style="display:inline-block;padding:12px 28px;color:#ffffff;text-decoration:none;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;font-weight:600;line-height:1;">${esc(opts.ctaLabel)}</a>
+         </td></tr>
+       </table>`
+    : "";
+
+  const footnote = opts.footnote
+    ? `<p style="margin:24px 0 0 0;font-size:13px;color:#6b7280;line-height:1.5;font-style:italic;">${opts.footnote}</p>`
+    : "";
+
+  const preheader = opts.preheader
+    ? `<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;font-size:1px;color:#f3f4f6;line-height:1px;">${esc(opts.preheader)}</div>`
+    : "";
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>${esc(opts.title)}</title>
+<!--[if mso]>
+<style type="text/css">
+table {border-collapse:collapse;}
+</style>
+<![endif]-->
+</head>
+<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;">
+${preheader}
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color:#f3f4f6;">
+  <tr>
+    <td align="center" style="padding:24px 12px;">
+      <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="max-width:560px;background-color:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb;">
+        <tr>
+          <td align="center" style="padding:28px 32px;background-color:#1e293b;">
+            ${headerVisual}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 32px 24px 32px;">
+            <h1 style="margin:0 0 16px 0;font-size:20px;line-height:1.4;color:#111827;font-weight:600;">${esc(opts.title)}</h1>
+            <div style="font-size:15px;line-height:1.6;color:#374151;">${opts.bodyHtml}</div>
+            ${ctaBlock}
+            ${footnote}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 32px;background-color:#f9fafb;border-top:1px solid #e5e7eb;">
+            <p style="margin:0 0 8px 0;font-size:12px;color:#6b7280;line-height:1.5;">
+              This message was sent by Hydro-Wates Proof-Load Testing Services. If you have questions, reply to this email or sign in to the customer portal.
+            </p>
+            <p style="margin:0;font-size:11px;color:#9ca3af;line-height:1.5;">
+              Manage email preferences in the portal under <strong>Account &rarr; Email notifications</strong>.
+            </p>
+          </td>
+        </tr>
+      </table>
+      <p style="margin:16px 0 0 0;font-size:11px;color:#9ca3af;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;">
+        &copy; ${year} Hydro-Wates. All rights reserved.
+      </p>
+    </td>
+  </tr>
+</table>
+</body>
+</html>`;
+}
+
+interface ProjectContext {
+  name: string;
+  description?: string | null;
+  lead_comments?: string | null;
+}
+
+function escMultiline(s: string): string {
+  return esc(s).replace(/\r?\n/g, "<br>");
+}
+
+const SCOPE_LIMIT = 600;
+
+function clamp(s: string, max: number): { text: string; truncated: boolean } {
+  const trimmed = s.trim();
+  if (trimmed.length <= max) return { text: trimmed, truncated: false };
+  const slice = trimmed.slice(0, max);
+  const lastBreak = slice.lastIndexOf(" ");
+  const cut = lastBreak > max * 0.7 ? slice.slice(0, lastBreak) : slice;
+  return { text: cut.trim() + "…", truncated: true };
+}
+
+function renderProjectInfoBlock(p: ProjectContext): string {
+  const description = (p.description ?? "").trim();
+  const scope = (p.lead_comments ?? "").trim();
+  if (!description && !scope) return "";
+
+  const parts: string[] = [];
+  if (description) {
+    parts.push(
+      `<div style="font-size:13px;color:#374151;line-height:1.5;margin-bottom:${scope ? "10px" : "0"};">
+         <span style="display:inline-block;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px;">Description</span><br>
+         ${esc(description)}
+       </div>`,
+    );
+  }
+  if (scope) {
+    const { text, truncated } = clamp(scope, SCOPE_LIMIT);
+    parts.push(
+      `<div style="font-size:13px;color:#374151;line-height:1.5;">
+         <span style="display:inline-block;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px;">Project scope</span><br>
+         ${escMultiline(text)}${truncated ? ` <span style=\"color:#6b7280;font-style:italic;\">(full scope in the portal)</span>` : ""}
+       </div>`,
+    );
+  }
+
+  return `<div style="background:#f9fafb;border:1px solid #e5e7eb;border-left:3px solid #2563eb;border-radius:6px;padding:14px 16px;margin:16px 0;">
+            <div style="font-size:12px;font-weight:600;color:#1e293b;margin-bottom:8px;">${esc(p.name)}</div>
+            ${parts.join("")}
+          </div>`;
 }
 
 // --- Microsoft Graph (app-only) email sender -------------------------------
@@ -116,7 +255,7 @@ Deno.serve(async (req) => {
   if (!user) return json({ error: "Not authorized" }, 401);
 
   try {
-    const { projectId, noteId, isUpdate, portalUrl } = await req.json();
+    const { projectId, noteId, isUpdate, portalUrl, mentionedUserIds, internal } = await req.json();
     if (!projectId) return json({ error: "projectId is required" }, 400);
 
     // Fetch the project (we'll need name + customer linkage for routing).
@@ -128,6 +267,7 @@ Deno.serve(async (req) => {
     const { data: authorProfile } = await admin
       .from("cportal_profiles").select("full_name, email, role").eq("id", user.id).single();
     if (!authorProfile) return json({ error: "Author profile not found" }, 404);
+    const authorName = authorProfile.full_name || authorProfile.email || "Someone";
 
     // Fetch the note content for the email body. If a specific noteId was
     // passed, use it; otherwise fall back to the most recent note on this
@@ -144,6 +284,51 @@ Deno.serve(async (req) => {
         .order("created_at", { ascending: false })
         .limit(1).maybeSingle();
       if (latest) noteContent = latest.content;
+    }
+
+    // --- @mentions: record each mention (drives the in-app red dot) and send
+    //     the mentioned person a targeted email. These addresses are then
+    //     excluded from the general note email below so nobody gets two.
+    const mentionedEmails = new Set<string>();
+    const rawMentionIds: string[] = Array.isArray(mentionedUserIds)
+      ? mentionedUserIds.filter((x: unknown): x is string => typeof x === "string")
+      : [];
+    let mentionCount = 0;
+    if (noteId && rawMentionIds.length) {
+      // Fetch role too so we can ENFORCE that an internal (team-only) note
+      // never tags or emails a customer — that would leak the private note's
+      // content to someone who can't even see it in the portal. This backs up
+      // the same rule in the UI, in case the client is bypassed.
+      const { data: mentionedProfiles } = await admin
+        .from("cportal_profiles").select("id, email, role, email_notifications").in("id", rawMentionIds);
+      const allowed = (mentionedProfiles ?? []).filter((p) =>
+        !internal || p.role === "admin" || p.role === "service_tech"
+      );
+      if (allowed.length) {
+        await admin.from("cportal_note_mentions").upsert(
+          allowed.map((p) => ({ note_id: noteId, project_id: projectId, mentioned_user_id: p.id })),
+          { onConflict: "note_id,mentioned_user_id", ignoreDuplicates: true },
+        );
+      }
+      const mLink = portalUrl ? `${portalUrl}/projects/${projectId}` : "";
+      for (const person of allowed) {
+        if (!person.email) continue;
+        const em = person.email.toLowerCase();
+        mentionedEmails.add(em);
+        if (em === authorProfile.email.toLowerCase()) continue;   // don't notify yourself
+        if (person.email_notifications === false) continue;
+        mentionCount++;
+        const mSubject = `${authorName} mentioned you on ${project.name}`;
+        await sendEmail(admin, [person.email], mSubject, brandedEmail({
+          preheader: `${authorName} mentioned you in a note on ${project.name}.`,
+          title: mSubject,
+          bodyHtml: `<p><strong>${esc(authorName)}</strong> mentioned you in a note on project <strong>${esc(project.name)}</strong>:</p>
+                     <blockquote style="border-left:3px solid #d1d5db;padding-left:12px;margin:12px 0;color:#4b5563;white-space:pre-wrap;background:#f9fafb;padding:12px 16px;border-radius:0 6px 6px 0;">${esc(noteContent)}</blockquote>
+                     ${renderProjectInfoBlock(project)}`,
+          ctaLabel: mLink ? "Open project" : undefined,
+          ctaUrl: mLink || undefined,
+        }));
+      }
     }
 
     // Build the recipient set. The author themselves is always excluded.
@@ -183,9 +368,6 @@ Deno.serve(async (req) => {
       recipients.add(teamEmail);
     }
 
-    if (recipients.size === 0) return json({ ok: true, sent: 0, note: "No recipients (or all opted out)." });
-
-    const authorName = authorProfile.full_name || authorProfile.email || "Someone";
     const action = isUpdate ? "updated a note" : "added a note";
     const projectLink = portalUrl ? `${portalUrl}/projects/${projectId}` : "";
     const subject = `${authorName} ${action} on ${project.name}`;
@@ -199,8 +381,15 @@ Deno.serve(async (req) => {
       ctaUrl: projectLink || undefined,
     });
 
-    await sendEmail(admin, [...recipients], subject, html);
-    return json({ ok: true, sent: recipients.size });
+    // General note email goes to the other side — but never for an internal
+    // (team-only) note, and never to anyone who already got a mention email.
+    const generalRecipients = internal
+      ? []
+      : [...recipients].filter((r) => !mentionedEmails.has(r.toLowerCase()));
+    if (generalRecipients.length) {
+      await sendEmail(admin, generalRecipients, subject, html);
+    }
+    return json({ ok: true, sent: generalRecipients.length, mentioned: mentionCount });
   } catch (e) {
     return json({ error: String((e as Error)?.message ?? e) }, 500);
   }

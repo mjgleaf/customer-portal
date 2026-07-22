@@ -1,7 +1,8 @@
-import { useEffect, useState, useRef, type ChangeEvent } from 'react'
+import { useEffect, useState, useRef, type ChangeEvent, type ReactNode } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award, Eye, Send, MessageSquare, Sparkles, MapPin, Lock, User, Phone } from 'lucide-react'
+import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award, Eye, Send, MessageSquare, Sparkles, MapPin, Lock, User, Phone, Navigation, Clock, Wrench } from 'lucide-react'
 import { supabase } from '../lib/supabase'
+import { latestEquipmentCerts } from '../lib/equipmentCerts'
 import { useAuth } from '../context/AuthContext'
 import type { Project, ProjectFile, ProjectMember, Profile, Invoice, DocumentRequest } from '../types'
 
@@ -149,6 +150,9 @@ export default function ProjectPage() {
   const [openingInvoice, setOpeningInvoice] = useState<string | null>(null)
   const [invoiceError, setInvoiceError] = useState('')
   const [members, setMembers] = useState<ProjectMember[]>([])
+  // Sign-in status by user id (from cportal_account_status). null = unknown
+  // (the function isn't deployed yet) → fall back to the old "Member" label.
+  const [signedInById, setSignedInById] = useState<Map<string, boolean> | null>(null)
   const [availableProfiles, setAvailableProfiles] = useState<Profile[]>([])
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
@@ -239,6 +243,18 @@ export default function ProjectPage() {
   const [noteError, setNoteError] = useState('')
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null)
   const [editingNoteContent, setEditingNoteContent] = useState('')
+
+  // @mentions. mentionPeople = everyone taggable on this project (from the
+  // cportal_mentionable_for_project RPC). mentionQuery = the text typed after
+  // an "@" right now (null when not mentioning). pickedMentions = people the
+  // author has selected. unreadMentionCount = this project's unread mentions
+  // for the current user (drives the Notes-tab red dot).
+  const [mentionPeople, setMentionPeople] = useState<{ user_id: string; display_name: string; role: string }[]>([])
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null)
+  const [pickedMentions, setPickedMentions] = useState<{ user_id: string; display_name: string }[]>([])
+  const [unreadMentionCount, setUnreadMentionCount] = useState(0)
+  const noteRef = useRef<HTMLTextAreaElement | null>(null)
+  const mentionAnchorRef = useRef<number>(0)
   const [activeTab, setActiveTab] = useState<TabKey>('documents')
 
   const [editing, setEditing] = useState(false)
@@ -254,8 +270,11 @@ export default function ProjectPage() {
     fetchFiles()
     fetchDocumentRequests()
     fetchNotes()
+    fetchMentionPeople()
+    fetchUnreadMentions()
     if (isAdmin) {
       fetchMembers()
+      fetchSignInStatus()
       fetchAvailableProfiles()
       fetchLastReminders()
     }
@@ -374,6 +393,37 @@ export default function ProjectPage() {
     setNotes(list.map(n => ({ ...n, author: byId.get(n.author_id) ?? null })))
   }
 
+  // People taggable on this project (staff + everyone with access). Fetched
+  // via a SECURITY DEFINER RPC so customers can load it too (their profile
+  // RLS would otherwise hide everyone else).
+  async function fetchMentionPeople() {
+    if (!id) return
+    const { data } = await supabase.rpc('cportal_mentionable_for_project', { p_project: id })
+    setMentionPeople((data ?? []) as { user_id: string; display_name: string; role: string }[])
+  }
+
+  // How many unread @mentions the current user has on THIS project (the
+  // Notes-tab red dot). Cleared when they open the Notes tab.
+  async function fetchUnreadMentions() {
+    if (!id || !user) return
+    const { count } = await supabase
+      .from('cportal_note_mentions')
+      .select('id', { count: 'exact', head: true })
+      .eq('project_id', id)
+      .eq('mentioned_user_id', user.id)
+      .is('read_at', null)
+    setUnreadMentionCount(count ?? 0)
+  }
+
+  // Resolve which picked mentions are actually still present in the text
+  // (the author may have deleted the "@Name" after picking it).
+  function resolveMentionedIds(content: string): string[] {
+    const ids = pickedMentions
+      .filter(m => content.includes(`@${m.display_name}`))
+      .map(m => m.user_id)
+    return Array.from(new Set(ids))
+  }
+
   async function addNote() {
     if (!user || !id || !newNoteContent.trim()) return
     setAddingNote(true)
@@ -382,20 +432,41 @@ export default function ProjectPage() {
     // Customers can never insert an internal note (RLS blocks it anyway,
     // but the checkbox isn't even rendered for them).
     const internalFlag = newNoteInternal && (isAdmin || isServiceTech)
-    const { error } = await supabase
+    const { data: inserted, error } = await supabase
       .from('cportal_project_notes')
       .insert({ project_id: id, author_id: user.id, content: trimmed, internal: internalFlag })
+      .select('id')
+      .single()
     setAddingNote(false)
     if (error) { setNoteError(error.message); return }
+    let mentionedUserIds = resolveMentionedIds(trimmed)
+    // Private notes can only tag staff — strip any customer-side mentions so
+    // we never email a private note's content to someone who can't see it.
+    if (internalFlag) {
+      const staffIds = new Set(
+        mentionPeople.filter(p => p.role === 'admin' || p.role === 'service_tech').map(p => p.user_id),
+      )
+      mentionedUserIds = mentionedUserIds.filter(uid => staffIds.has(uid))
+    }
     setNewNoteContent('')
     setNewNoteInternal(false)
+    setPickedMentions([])
+    setMentionQuery(null)
     fetchNotes()
-    // Best-effort: notify the other side via Microsoft Graph. Skip on
-    // internal notes — customers shouldn't be pinged about a note they
-    // can't see, and team-to-team notifications aren't wired up.
-    if (!internalFlag) {
+    // Best-effort: notify via Microsoft Graph. Mentioned people get a
+    // targeted "you were mentioned" email + an in-app record; the general
+    // note notification still goes to the other side. Skip the general email
+    // on internal notes (customers can't see them), but DO still record
+    // mentions — a mentioned teammate should be pinged either way.
+    if (!internalFlag || mentionedUserIds.length) {
       void supabase.functions.invoke('notify-project-note', {
-        body: { projectId: id, portalUrl: window.location.origin },
+        body: {
+          projectId: id,
+          noteId: inserted?.id,
+          mentionedUserIds,
+          internal: internalFlag,
+          portalUrl: window.location.origin,
+        },
       }).catch(() => { /* notification is best-effort */ })
     }
   }
@@ -423,6 +494,83 @@ export default function ProjectPage() {
     fetchNotes()
   }
 
+  // ---- @mention input handling --------------------------------------------
+  function escapeRegExp(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
+
+  // On each keystroke, detect an in-progress "@mention" right before the
+  // caret and open the picker (or close it when the user moves on).
+  function handleNoteChange(e: ChangeEvent<HTMLTextAreaElement>) {
+    const value = e.target.value
+    setNewNoteContent(value)
+    const caret = e.target.selectionStart ?? value.length
+    const before = value.slice(0, caret)
+    const m = before.match(/(?:^|\s)@([\w.\-]*)$/)
+    if (m) {
+      mentionAnchorRef.current = caret - m[1].length - 1
+      setMentionQuery(m[1].toLowerCase())
+    } else {
+      setMentionQuery(null)
+    }
+  }
+
+  // Insert the chosen person as "@Display Name " and remember them so the
+  // mention gets recorded on submit.
+  function pickMention(person: { user_id: string; display_name: string }) {
+    const text = newNoteContent
+    const caret = noteRef.current?.selectionStart ?? text.length
+    const anchor = mentionAnchorRef.current
+    const next = `${text.slice(0, anchor)}@${person.display_name} ${text.slice(caret)}`
+    setNewNoteContent(next)
+    setPickedMentions(prev => prev.some(p => p.user_id === person.user_id) ? prev : [...prev, person])
+    setMentionQuery(null)
+    requestAnimationFrame(() => {
+      const pos = anchor + person.display_name.length + 2
+      noteRef.current?.focus()
+      noteRef.current?.setSelectionRange(pos, pos)
+    })
+  }
+
+  // Candidate list shown while typing "@…" (excludes yourself). On a PRIVATE
+  // (team-only) note, only staff are taggable — never a customer, since they
+  // can't see the note and we must not leak its content to them.
+  const mentionMatches = mentionQuery === null ? [] : mentionPeople
+    .filter(p => p.user_id !== user?.id)
+    .filter(p => !newNoteInternal || p.role === 'admin' || p.role === 'service_tech')
+    .filter(p => p.display_name.toLowerCase().includes(mentionQuery))
+    .slice(0, 6)
+
+  // Render note text with any "@Known Name" highlighted.
+  function renderNoteContent(content: string): ReactNode {
+    const names = mentionPeople.map(p => p.display_name).filter(Boolean).sort((a, b) => b.length - a.length)
+    if (names.length === 0) return content
+    const re = new RegExp(`@(${names.map(escapeRegExp).join('|')})`, 'g')
+    const out: ReactNode[] = []
+    let last = 0
+    let key = 0
+    let m: RegExpExecArray | null
+    while ((m = re.exec(content)) !== null) {
+      if (m.index > last) out.push(content.slice(last, m.index))
+      out.push(<span key={key++} className="text-blue-700 font-medium bg-blue-50 rounded px-1">@{m[1]}</span>)
+      last = m.index + m[0].length
+    }
+    if (last < content.length) out.push(content.slice(last))
+    return out
+  }
+
+  // Opening the Notes tab clears this project's unread @mentions for me.
+  useEffect(() => {
+    if (activeTab === 'notes' && unreadMentionCount > 0 && id && user) {
+      void supabase
+        .from('cportal_note_mentions')
+        .update({ read_at: new Date().toISOString() })
+        .eq('project_id', id)
+        .eq('mentioned_user_id', user.id)
+        .is('read_at', null)
+        .then(() => setUnreadMentionCount(0))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, unreadMentionCount, id])
+
   // Pull the latest reminder per document_key for this project so we can
   // show "Reminded Xd ago" next to each missing-document row.
   async function fetchLastReminders() {
@@ -449,7 +597,7 @@ export default function ProjectPage() {
     setProject(data)
     setEditName(data.name)
     setEditDesc(data.description ?? '')
-    fetchInvoices(data.customer_id ?? null)
+    fetchInvoices()
     setLoading(false)
   }
 
@@ -480,12 +628,16 @@ export default function ProjectPage() {
     setDocumentRequests((data ?? []) as DocumentRequest[])
   }
 
-  async function fetchInvoices(customerId: string | null) {
-    if (!customerId) { setInvoices([]); return }
+  // Invoices for THIS specific project only — matched on the project link
+  // Zoho stores per invoice (cportal_invoices.project_id), not on the whole
+  // company. An invoice with no project link in Zoho won't appear here; it
+  // still shows on the company-wide Invoices page and the customer record.
+  async function fetchInvoices() {
+    if (!id) { setInvoices([]); return }
     const { data } = await supabase
       .from('cportal_invoices')
       .select('*')
-      .eq('customer_id', customerId)
+      .eq('project_id', id)
       .order('invoice_date', { ascending: false })
     setInvoices((data ?? []) as Invoice[])
   }
@@ -534,6 +686,17 @@ export default function ProjectPage() {
       .in('id', list.map(r => r.user_id))
     const byId = new Map((profs ?? []).map(p => [p.id, p]))
     setMembers(list.map(r => ({ ...r, profile: byId.get(r.user_id) })) as ProjectMember[])
+  }
+
+  // Which accounts have actually signed in, so the Members tab can show
+  // "Member" only for people who've logged in (vs "Invited" for pending).
+  // If the function isn't deployed yet, leave it null → old behavior.
+  async function fetchSignInStatus() {
+    const { data, error } = await supabase.rpc('cportal_account_status')
+    if (error || !data) { setSignedInById(null); return }
+    setSignedInById(new Map(
+      (data as { id: string; has_signed_in: boolean }[]).map(s => [s.id, !!s.has_signed_in]),
+    ))
   }
 
   async function fetchAvailableProfiles() {
@@ -910,7 +1073,8 @@ export default function ProjectPage() {
       : ['documents', 'drawings', 'certificates', 'invoices', 'notes']
 
   const certificates = files.filter(f => f.kind === 'certificate')
-  const equipmentCertificates = files.filter(f => f.kind === 'equipment_certificate')
+  // Only the current cert per asset — see latestEquipmentCerts.
+  const equipmentCertificates = latestEquipmentCerts(files.filter(f => f.kind === 'equipment_certificate'))
   const drawings = files.filter(f => f.kind === 'drawing')
   const poFile = files.find(f => f.kind === 'purchase_order')
   const quotes = files.filter(f => f.kind === 'quote')
@@ -1009,6 +1173,118 @@ export default function ProjectPage() {
         </div>
       )}
 
+      {/* --- Service tech Site Info card -------------------------------
+          Pinned at the top of the project page for service techs only.
+          Everything they need to roll up to the site: who to ask for,
+          where to go (one-tap Open in Maps for ETA), and a reminder of
+          when the job is on the books. Admins and customers don't see
+          this — they get the regular ship-to card further down. */}
+      {isServiceTech && (() => {
+        const c = project.customer
+        // Prefer the SharePoint ship-to override (free-form, set per
+        // project), then fall back to the Zoho structured address.
+        const addrLine = project.ship_to_address?.trim() || c?.shipping_address || null
+        const cityStateZip = c
+          ? [
+              [c.shipping_city, c.shipping_state].filter(Boolean).join(', '),
+              c.shipping_zip,
+            ].filter(Boolean).join(' ').trim()
+          : ''
+        const fullAddress = [addrLine, cityStateZip, c?.shipping_country]
+          .filter(Boolean).join(', ').trim()
+        const mapsUrl = fullAddress
+          ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(fullAddress)}`
+          : null
+
+        // Pretty US phone formatting for the tap-to-call link.
+        const phoneRaw = project.site_contact_phone || null
+        const formattedPhone = (() => {
+          if (!phoneRaw) return null
+          const digits = phoneRaw.replace(/\D/g, '')
+          if (digits.length === 10) return `(${digits.slice(0,3)}) ${digits.slice(3,6)}-${digits.slice(6)}`
+          if (digits.length === 11 && digits.startsWith('1')) return `(${digits.slice(1,4)}) ${digits.slice(4,7)}-${digits.slice(7)}`
+          return phoneRaw
+        })()
+
+        return (
+          <div className="bg-blue-50 border border-blue-200 rounded-xl p-5 mb-6">
+            <div className="flex items-center gap-2 mb-4">
+              <Wrench size={16} className="text-blue-700" />
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-blue-900">Site Info</h2>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              {/* Contact */}
+              <div className="bg-white rounded-lg p-4 border border-blue-100">
+                <div className="flex items-center gap-1.5 mb-2">
+                  <User size={12} className="text-gray-400" />
+                  <span className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold">Site Contact</span>
+                </div>
+                {project.site_contact ? (
+                  <>
+                    <p className="text-base font-semibold text-gray-900 leading-tight">{project.site_contact}</p>
+                    {formattedPhone ? (
+                      <a
+                        href={`tel:${phoneRaw?.replace(/[^+\d]/g, '')}`}
+                        className="inline-flex items-center gap-2 mt-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 active:bg-blue-800 rounded-lg px-4 py-2.5 transition-colors w-full sm:w-auto justify-center"
+                      >
+                        <Phone size={14} />
+                        {formattedPhone}
+                      </a>
+                    ) : (
+                      <p className="text-xs text-gray-400 italic mt-2">No phone on file</p>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-sm text-gray-500 italic">No contact on file. Ask the office before you head out.</p>
+                )}
+              </div>
+
+              {/* Location + ETA via Maps */}
+              <div className="bg-white rounded-lg p-4 border border-blue-100">
+                <div className="flex items-center gap-1.5 mb-2">
+                  <MapPin size={12} className="text-gray-400" />
+                  <span className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold">Site Address</span>
+                </div>
+                {fullAddress ? (
+                  <>
+                    {addrLine && <p className="text-sm font-medium text-gray-900 leading-tight">{addrLine}</p>}
+                    {cityStateZip && <p className="text-sm text-gray-700 leading-tight">{cityStateZip}</p>}
+                    {c?.shipping_country && (
+                      <p className="text-xs text-gray-500 leading-tight mt-0.5">{c.shipping_country}</p>
+                    )}
+                    {mapsUrl && (
+                      <a
+                        href={mapsUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-2 mt-2.5 text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 rounded-lg px-4 py-2.5 transition-colors w-full sm:w-auto justify-center"
+                      >
+                        <Navigation size={14} />
+                        Get Directions
+                      </a>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-sm text-gray-500 italic">No address on file yet.</p>
+                )}
+              </div>
+            </div>
+
+            {/* Timing footnote */}
+            <div className="mt-4 flex items-center gap-1.5 text-xs text-blue-900/80">
+              <Clock size={12} className="text-blue-700/70" />
+              <span>
+                {project.started_on
+                  ? <>Job opened {new Date(project.started_on).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}.</>
+                  : 'No job start date logged yet.'}
+                {' '}Tap <span className="font-medium">Get Directions</span> for live ETA from your maps app.
+              </span>
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Tabs */}
       <div className="flex gap-1 mb-6 bg-gray-100 p-1 rounded-lg w-fit">
         {tabList.map(tab => (
@@ -1019,7 +1295,15 @@ export default function ProjectPage() {
               activeTab === tab ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
             }`}
           >
-            {tab}
+            <span className="relative inline-block">
+              {tab}
+              {tab === 'notes' && unreadMentionCount > 0 && (
+                <span
+                  className="absolute -top-1 -right-2.5 w-2 h-2 rounded-full bg-red-500 ring-2 ring-gray-100"
+                  title={`${unreadMentionCount} new mention${unreadMentionCount === 1 ? '' : 's'}`}
+                />
+              )}
+            </span>
           </button>
         ))}
       </div>
@@ -1748,21 +2032,45 @@ export default function ProjectPage() {
 
           {/* Compose */}
           <div className="p-5 border-b border-gray-100">
-            <textarea
-              value={newNoteContent}
-              onChange={e => setNewNoteContent(e.target.value)}
-              placeholder={
-                newNoteInternal
-                  ? 'Private note — visible to admins and service techs only…'
-                  : 'Add a note (everyone on this project sees it)…'
-              }
-              rows={3}
-              className={`w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 ${
-                newNoteInternal
-                  ? 'border-amber-300 bg-amber-50/40 focus:ring-amber-500'
-                  : 'border-gray-300 focus:ring-blue-500'
-              }`}
-            />
+            <div className="relative">
+              <textarea
+                ref={noteRef}
+                value={newNoteContent}
+                onChange={handleNoteChange}
+                placeholder={
+                  newNoteInternal
+                    ? 'Private note — visible to admins and service techs only…'
+                    : 'Add a note (everyone on this project sees it). Type @ to mention someone…'
+                }
+                rows={3}
+                className={`w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 ${
+                  newNoteInternal
+                    ? 'border-amber-300 bg-amber-50/40 focus:ring-amber-500'
+                    : 'border-gray-300 focus:ring-blue-500'
+                }`}
+              />
+              {mentionMatches.length > 0 && (
+                <div className="absolute z-20 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-56 overflow-auto">
+                  <p className="px-3 py-1.5 text-[11px] uppercase tracking-wide text-gray-400 border-b border-gray-100">Mention someone</p>
+                  {mentionMatches.map(p => (
+                    <button
+                      key={p.user_id}
+                      type="button"
+                      onMouseDown={e => { e.preventDefault(); pickMention(p) }}
+                      className="w-full text-left px-3 py-2 hover:bg-blue-50 flex items-center gap-2"
+                    >
+                      <span className="w-6 h-6 rounded-full bg-gray-100 text-gray-600 flex items-center justify-center text-[11px] font-semibold flex-shrink-0">
+                        {(p.display_name[0] ?? '?').toUpperCase()}
+                      </span>
+                      <span className="text-sm text-gray-800 truncate">{p.display_name}</span>
+                      <span className="ml-auto text-[10px] uppercase tracking-wide text-gray-400 flex-shrink-0">
+                        {p.role === 'admin' ? 'Hydro-Wates' : p.role === 'service_tech' ? 'Service Tech' : 'Customer'}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             {noteError && <p className="text-red-600 text-xs mt-1">{noteError}</p>}
             <div className="flex items-center justify-between gap-3 mt-2 flex-wrap">
               {(isAdmin || isServiceTech) ? (
@@ -1854,7 +2162,7 @@ export default function ProjectPage() {
                             </div>
                           </div>
                         ) : (
-                          <p className="text-sm text-gray-700 whitespace-pre-wrap">{n.content}</p>
+                          <p className="text-sm text-gray-700 whitespace-pre-wrap">{renderNoteContent(n.content)}</p>
                         )}
                       </div>
                       {!isEditing && (isOwn || isAdmin) && (
@@ -1960,12 +2268,17 @@ export default function ProjectPage() {
           {(() => {
             const memberRows = members.map(m => {
               const p = m.profile as Profile | undefined
+              // Unknown sign-in data (function not deployed yet) → treat as
+              // signed in, keeping the old "Member" label rather than
+              // mislabeling everyone as "Invited".
+              const signedIn = signedInById ? (signedInById.get(m.user_id) ?? false) : true
               return {
                 key: `m:${m.id}`,
                 name: p?.full_name ?? null,
                 email: p?.email ?? null,
                 status: 'member' as const,
                 memberId: m.id,
+                signedIn,
               }
             })
             const memberUserIds = new Set(members.map(m => m.user_id))
@@ -1987,6 +2300,7 @@ export default function ProjectPage() {
               memberId?: string
               userId?: string
               customerId?: string
+              signedIn?: boolean
             }> = [...memberRows, ...extraRows]
 
             if (rows.length === 0) {
@@ -2016,7 +2330,11 @@ export default function ProjectPage() {
                     <div className="flex items-center gap-3 flex-shrink-0">
                       {row.status === 'member' && (
                         <>
-                          <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-green-50 text-green-700 font-medium">Member</span>
+                          {row.signedIn ? (
+                            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-green-50 text-green-700 font-medium" title="Signed in — has access">Member</span>
+                          ) : (
+                            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 font-medium" title="Invited — hasn't signed in yet">Invited</span>
+                          )}
                           {row.memberId && (
                             <button
                               onClick={() => setPendingRemoveMember({

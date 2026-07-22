@@ -1,15 +1,25 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
-import { Users, Search, Mail, Check } from 'lucide-react'
+import { Users, Search, Mail, Check, Clock } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
 import type { Customer } from '../types'
+
+// Normalized company key — same basis the detail page uses to group peers.
+const companyKey = (s?: string | null) => (s ?? '').trim().toLowerCase()
 
 export default function CustomersPage() {
   const { profile } = useAuth()
   const navigate = useNavigate()
   const [customers, setCustomers] = useState<Customer[]>([])
-  const [invitedEmails, setInvitedEmails] = useState<Set<string>>(new Set())
+  // Account status by lowercased email. Not present = no account (never
+  // invited). false = invited but hasn't signed in yet. true = signed in /
+  // has access.
+  const [accountStatus, setAccountStatus] = useState<Map<string, boolean>>(new Map())
+  // Distinct emails on file per company (own row emails + contact emails),
+  // keyed by normalized company name. Used so a customer row with no email
+  // of its own still reflects the contacts associated with its company.
+  const [emailCounts, setEmailCounts] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [invitingId, setInvitingId] = useState<string | null>(null)
@@ -27,9 +37,41 @@ export default function CustomersPage() {
   async function fetchData() {
     setLoading(true)
     const { data: custs } = await supabase.from('cportal_customers').select('*').order('company', { ascending: true })
-    const { data: profs } = await supabase.from('cportal_profiles').select('email')
-    setInvitedEmails(new Set((profs ?? []).map(p => (p.email ?? '').toLowerCase()).filter(Boolean)))
-    setCustomers((custs ?? []) as Customer[])
+    const { data: contactRows } = await supabase.from('cportal_customer_contacts').select('customer_id, email')
+
+    // Account status by email. Prefer cportal_account_status (knows sign-in
+    // state → Invited vs Active). If that function isn't deployed yet, fall
+    // back to profiles so we still show who has an account as "Invited"
+    // rather than wrongly showing "Invite" for someone who's already a member.
+    const { data: statuses, error: statusErr } = await supabase.rpc('cportal_account_status')
+    if (!statusErr && statuses) {
+      setAccountStatus(new Map(
+        (statuses as { email: string; has_signed_in: boolean }[]).map(s => [String(s.email ?? '').toLowerCase(), !!s.has_signed_in]),
+      ))
+    } else {
+      const { data: profs } = await supabase.from('cportal_profiles').select('email')
+      setAccountStatus(new Map((profs ?? []).map(p => [String(p.email ?? '').toLowerCase(), false])))
+    }
+
+    const list = (custs ?? []) as Customer[]
+
+    // Tally distinct emails per company: each customer row's own email plus
+    // every contact email on any row sharing that company name.
+    const keyByCustomerId = new Map(list.map(c => [c.id, companyKey(c.company)]))
+    const emailsByCompany = new Map<string, Set<string>>()
+    const add = (key: string, email?: string | null) => {
+      const e = (email ?? '').trim().toLowerCase()
+      if (!key || !e) return
+      if (!emailsByCompany.has(key)) emailsByCompany.set(key, new Set())
+      emailsByCompany.get(key)!.add(e)
+    }
+    for (const c of list) add(companyKey(c.company), c.email)
+    for (const ct of contactRows ?? []) add(keyByCustomerId.get(ct.customer_id) ?? '', ct.email)
+    const counts: Record<string, number> = {}
+    for (const [k, set] of emailsByCompany) counts[k] = set.size
+    setEmailCounts(counts)
+
+    setCustomers(list)
     setLoading(false)
   }
 
@@ -52,7 +94,8 @@ export default function CustomersPage() {
     }
     if (data?.ok) {
       setMsg(`Invitation sent to ${customer.email}.`)
-      setInvitedEmails(prev => new Set(prev).add(customer.email!.toLowerCase()))
+      // Now they have an account but haven't signed in yet → "Invited".
+      setAccountStatus(prev => new Map(prev).set(customer.email!.toLowerCase(), false))
     } else if (data?.error) {
       setMsg(`Invite failed: ${data.error}`)
     }
@@ -96,19 +139,41 @@ export default function CustomersPage() {
               <p className="text-gray-400 text-xs mt-1">Customers sync automatically from Zoho each time the dashboard loads.</p>
             </div>
           ) : filtered.map(c => {
-            const invited = c.email ? invitedEmails.has(c.email.toLowerCase()) : false
+            // undefined = no account, false = invited (not signed in), true = active
+            const acct = c.email ? accountStatus.get(c.email.toLowerCase()) : undefined
+            const onFile = emailCounts[companyKey(c.company)] ?? 0
             return (
               <div key={c.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
                 <Link to={`/customers/${c.id}`} className="min-w-0 flex-1 group">
                   <p className="text-sm font-medium text-gray-900 truncate group-hover:text-blue-600 transition-colors">{c.company || c.name || 'Unnamed customer'}</p>
-                  <p className="text-xs text-gray-400 truncate">{c.email || 'No email on file'}</p>
+                  <p className="text-xs text-gray-400 truncate">
+                    {c.email
+                      ? c.email
+                      : onFile > 0
+                        ? `${onFile} email${onFile === 1 ? '' : 's'} on file`
+                        : 'No email on file'}
+                  </p>
                 </Link>
                 <div className="ml-4 flex-shrink-0">
                   {!c.email ? (
-                    <span className="text-xs text-gray-400">No email</span>
-                  ) : invited ? (
-                    <span className="inline-flex items-center gap-1 text-xs font-medium text-green-700 bg-green-100 px-2.5 py-1 rounded-full">
-                      <Check size={12} /> Invited
+                    onFile > 0 ? (
+                      <span className="text-xs text-gray-400">View contacts</span>
+                    ) : (
+                      <span className="text-xs text-gray-400">No email</span>
+                    )
+                  ) : acct === true ? (
+                    <span
+                      className="inline-flex items-center gap-1 text-xs font-medium text-green-700 bg-green-100 px-2.5 py-1 rounded-full"
+                      title="Signed in — has portal access"
+                    >
+                      <Check size={12} /> Active
+                    </span>
+                  ) : acct === false ? (
+                    <span
+                      className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-100 px-2.5 py-1 rounded-full"
+                      title="Invited — hasn't signed in yet"
+                    >
+                      <Clock size={12} /> Invited
                     </span>
                   ) : (
                     <button

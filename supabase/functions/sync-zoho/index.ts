@@ -9,7 +9,104 @@
 // app_settings.emails_paused kill switch; best-effort if creds are unset.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { brandedEmail } from "../_shared/email-template.ts";
+
+// --- Branded email wrapper (inlined copy of _shared/email-template.ts so
+//     this function deploys as a single self-contained file) ---------------
+function esc(s: unknown): string {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+interface BrandedEmailOptions {
+  preheader?: string;
+  title: string;
+  bodyHtml: string;
+  ctaLabel?: string;
+  ctaUrl?: string;
+  footnote?: string;
+}
+
+function brandedEmail(opts: BrandedEmailOptions): string {
+  const logoUrl = Deno.env.get("EMAIL_LOGO_URL") || "";
+  const year = new Date().getFullYear();
+
+  const headerVisual = logoUrl
+    ? `<img src="${esc(logoUrl)}" alt="Hydro-Wates" height="44" style="display:block;max-height:44px;width:auto;border:0;outline:none;text-decoration:none;">`
+    : `<div style="font-family:'Helvetica Neue',Arial,sans-serif;color:#ffffff;line-height:1.1;text-align:center;">
+         <div style="font-size:22px;font-weight:700;letter-spacing:0.06em;">HYDRO-WATES</div>
+         <div style="font-size:10px;color:#94a3b8;letter-spacing:0.18em;text-transform:uppercase;margin-top:6px;">Proof-Load Testing Services</div>
+       </div>`;
+
+  const ctaBlock = opts.ctaUrl && opts.ctaLabel
+    ? `<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:28px 0 0 0;">
+         <tr><td style="background:#2563eb;border-radius:6px;">
+           <a href="${esc(opts.ctaUrl)}" style="display:inline-block;padding:12px 28px;color:#ffffff;text-decoration:none;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;font-weight:600;line-height:1;">${esc(opts.ctaLabel)}</a>
+         </td></tr>
+       </table>`
+    : "";
+
+  const footnote = opts.footnote
+    ? `<p style="margin:24px 0 0 0;font-size:13px;color:#6b7280;line-height:1.5;font-style:italic;">${opts.footnote}</p>`
+    : "";
+
+  const preheader = opts.preheader
+    ? `<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;font-size:1px;color:#f3f4f6;line-height:1px;">${esc(opts.preheader)}</div>`
+    : "";
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>${esc(opts.title)}</title>
+<!--[if mso]>
+<style type="text/css">
+table {border-collapse:collapse;}
+</style>
+<![endif]-->
+</head>
+<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;">
+${preheader}
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color:#f3f4f6;">
+  <tr>
+    <td align="center" style="padding:24px 12px;">
+      <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="max-width:560px;background-color:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb;">
+        <tr>
+          <td align="center" style="padding:28px 32px;background-color:#1e293b;">
+            ${headerVisual}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 32px 24px 32px;">
+            <h1 style="margin:0 0 16px 0;font-size:20px;line-height:1.4;color:#111827;font-weight:600;">${esc(opts.title)}</h1>
+            <div style="font-size:15px;line-height:1.6;color:#374151;">${opts.bodyHtml}</div>
+            ${ctaBlock}
+            ${footnote}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 32px;background-color:#f9fafb;border-top:1px solid #e5e7eb;">
+            <p style="margin:0 0 8px 0;font-size:12px;color:#6b7280;line-height:1.5;">
+              This message was sent by Hydro-Wates Proof-Load Testing Services. If you have questions, reply to this email or sign in to the customer portal.
+            </p>
+            <p style="margin:0;font-size:11px;color:#9ca3af;line-height:1.5;">
+              Manage email preferences in the portal under <strong>Account &rarr; Email notifications</strong>.
+            </p>
+          </td>
+        </tr>
+      </table>
+      <p style="margin:16px 0 0 0;font-size:11px;color:#9ca3af;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;">
+        &copy; ${year} Hydro-Wates. All rights reserved.
+      </p>
+    </td>
+  </tr>
+</table>
+</body>
+</html>`;
+}
 
 const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_BOOKS = "https://www.zohoapis.com/books/v3";
@@ -68,6 +165,30 @@ async function fetchContactDetails(contactId: string, accessToken: string, orgId
   const data = await res.json();
   if (typeof data.code !== "undefined" && data.code !== 0) return null;
   return (data.contact ?? null) as Record<string, unknown> | null;
+}
+
+// Recover an invoice's project link. The /invoices LIST endpoint omits the
+// project association entirely, so an invoice billed under a project still
+// comes back with no project_id. The detail endpoint includes it — either at
+// the top level (`project_id`) or on the first line item that carries one.
+// Returns the Zoho project_id string, or null when the invoice genuinely has
+// no project. THROWS on a transport/API error so the caller can leave the
+// invoice unchecked and retry it on the next sync (rather than wrongly marking
+// it as having no project).
+async function fetchInvoiceProjectId(invoiceId: string, accessToken: string, orgId: string): Promise<string | null> {
+  const url = `${ZOHO_BOOKS}/invoices/${invoiceId}?organization_id=${orgId}`;
+  const res = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+  if (!res.ok) throw new Error(`Zoho invoice ${invoiceId} HTTP ${res.status}`);
+  const data = await res.json();
+  if (typeof data.code !== "undefined" && data.code !== 0) {
+    throw new Error(`Zoho invoice ${invoiceId} error: ${JSON.stringify(data)}`);
+  }
+  const inv = (data.invoice ?? {}) as { project_id?: string; line_items?: Array<{ project_id?: string }> };
+  if (inv.project_id) return String(inv.project_id);
+  for (const li of inv.line_items ?? []) {
+    if (li.project_id) return String(li.project_id);
+  }
+  return null;
 }
 
 // Run an async mapper over `items` with bounded concurrency. Keeps API
@@ -244,31 +365,44 @@ Deno.serve(async (req) => {
       return { ...c, ...(details ?? {}) };
     });
 
-    const customerRows = contacts.map((c) => {
-      const ship = (c.shipping_address ?? {}) as Record<string, string | undefined>;
-      const bill = (c.billing_address ?? {}) as Record<string, string | undefined>;
-      return {
-        zoho_contact_id: String(c.contact_id),
-        name: c.contact_name ?? null,
-        email: c.email || null,
-        company: c.company_name || null,
-        // Phone — Zoho contacts can have several phone fields; prefer the
-        // main `phone` then fall back to `mobile`. Used by the Request
-        // Quote form to autofill the customer's contact details.
-        phone: (c as { phone?: string; mobile?: string }).phone || (c as { mobile?: string }).mobile || null,
-        shipping_address: ship.address || ship.street || null,
-        shipping_city: ship.city || null,
-        shipping_state: ship.state || null,
-        shipping_zip: ship.zip || null,
-        shipping_country: ship.country || null,
-        billing_address: bill.address || bill.street || null,
-        billing_city: bill.city || null,
-        billing_state: bill.state || null,
-        billing_zip: bill.zip || null,
-        billing_country: bill.country || null,
-        updated_at: new Date().toISOString(),
-      };
-    });
+    // Pull the merged-contacts table so we know which Zoho contacts we
+    // should NOT recreate (they were merged into a surviving customer
+    // record by an admin) and where to re-point any project/invoice
+    // references to them.
+    const { data: mergedRows } = await admin
+      .from("cportal_merged_zoho_contacts")
+      .select("zoho_contact_id, merged_into_customer_id");
+    const mergedMap = new Map<string, string>(
+      (mergedRows ?? []).map((m) => [String(m.zoho_contact_id), String(m.merged_into_customer_id)]),
+    );
+
+    const customerRows = contacts
+      .filter((c) => !mergedMap.has(String(c.contact_id)))
+      .map((c) => {
+        const ship = (c.shipping_address ?? {}) as Record<string, string | undefined>;
+        const bill = (c.billing_address ?? {}) as Record<string, string | undefined>;
+        return {
+          zoho_contact_id: String(c.contact_id),
+          name: c.contact_name ?? null,
+          email: c.email || null,
+          company: c.company_name || null,
+          // Phone — Zoho contacts can have several phone fields; prefer the
+          // main `phone` then fall back to `mobile`. Used by the Request
+          // Quote form to autofill the customer's contact details.
+          phone: (c as { phone?: string; mobile?: string }).phone || (c as { mobile?: string }).mobile || null,
+          shipping_address: ship.address || ship.street || null,
+          shipping_city: ship.city || null,
+          shipping_state: ship.state || null,
+          shipping_zip: ship.zip || null,
+          shipping_country: ship.country || null,
+          billing_address: bill.address || bill.street || null,
+          billing_city: bill.city || null,
+          billing_state: bill.state || null,
+          billing_zip: bill.zip || null,
+          billing_country: bill.country || null,
+          updated_at: new Date().toISOString(),
+        };
+      });
     if (customerRows.length) {
       const { error } = await admin.from("cportal_customers").upsert(customerRows, { onConflict: "zoho_contact_id" });
       if (error) throw error;
@@ -301,8 +435,126 @@ Deno.serve(async (req) => {
     }
 
     const { data: custList } = await admin.from("cportal_customers").select("id, zoho_contact_id, email");
-    const custMap = new Map((custList ?? []).map((c) => [c.zoho_contact_id, c.id]));
+    const custMap = new Map<string, string>((custList ?? []).map((c) => [String(c.zoho_contact_id), String(c.id)]));
     const custEmail = new Map((custList ?? []).map((c) => [c.id, c.email]));
+
+    // Route merged Zoho contact ids to their surviving customer so any
+    // projects/invoices that reference the merged contact_id end up on
+    // the right record.
+    for (const [zohoId, survivorId] of mergedMap) {
+      custMap.set(zohoId, survivorId);
+    }
+
+    // 1b) Customer contacts — multiple people per company (admin, PM,
+    //     billing, site) pulled from Zoho. Zoho's /contactpersons
+    //     endpoint requires a per-contact filter (there's no org-wide
+    //     list), so we fetch per customer using the same bounded
+    //     concurrency we already apply for the addresses.
+    type ContactPerson = {
+      contact_id?: string;
+      contact_person_id?: string;
+      first_name?: string;
+      last_name?: string;
+      email?: string;
+      phone?: string;
+      mobile?: string;
+      designation?: string;
+      is_primary_contact?: boolean;
+    };
+
+    async function fetchContactPersons(contactId: string): Promise<ContactPerson[]> {
+      const url = `${ZOHO_BOOKS}/contacts/${contactId}/contactpersons?organization_id=${orgId}`;
+      // Up to 3 tries — Zoho's edge sometimes returns a transient HTTP/2
+      // connection error under concurrency; one or two retries clear it.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const res = await fetch(url, {
+            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+          });
+          if (!res.ok) return [];
+          const data = await res.json();
+          if (typeof data.code !== "undefined" && data.code !== 0) return [];
+          return (data.contact_persons ?? []) as ContactPerson[];
+        } catch (e) {
+          if (attempt === 3) {
+            console.warn(`contactpersons fetch failed after 3 tries for ${contactId}:`, (e as Error).message);
+            return [];
+          }
+          // Brief exponential backoff: 250ms, 750ms
+          await new Promise((r) => setTimeout(r, 250 * attempt));
+        }
+      }
+      return [];
+    }
+
+    const personsByContactId = new Map<string, ContactPerson[]>();
+    // Lower concurrency than the 5 we use for fetchContactDetails — Zoho's
+    // /contactpersons endpoint is flakier under parallel load.
+    await mapWithConcurrency(summaryCustomers, 3, async (c) => {
+      const id = String(c.contact_id);
+      const persons = await fetchContactPersons(id);
+      if (persons.length) personsByContactId.set(id, persons);
+    });
+
+    const contactRows: Array<Record<string, unknown>> = [];
+    const seenZohoCpids = new Set<string>();
+
+    for (const [zohoContactId, persons] of personsByContactId) {
+      const localCustomerId = custMap.get(zohoContactId);
+      if (!localCustomerId) continue;
+      for (const p of persons) {
+        const email = (p.email || "").trim().toLowerCase();
+        if (!email) continue;
+        const cpid = p.contact_person_id ? String(p.contact_person_id) : null;
+        if (cpid) seenZohoCpids.add(cpid);
+        const fullName = [p.first_name, p.last_name].filter(Boolean).join(" ").trim();
+        contactRows.push({
+          customer_id: localCustomerId,
+          name: fullName || null,
+          email,
+          role: p.designation || (p.is_primary_contact ? "primary" : null),
+          phone: p.phone || p.mobile || null,
+          source: "zoho",
+          zoho_contact_person_id: cpid,
+          updated_at: new Date().toISOString(),
+        });
+      }
+    }
+
+    let contactsSynced = 0;
+    let contactsRemoved = 0;
+    if (contactRows.length) {
+      // Upsert keyed on the Zoho contact_person_id so re-running just
+      // updates existing rows instead of creating duplicates.
+      const { error: ccErr } = await admin
+        .from("cportal_customer_contacts")
+        .upsert(contactRows, { onConflict: "zoho_contact_person_id" });
+      if (ccErr) {
+        console.error("contact upsert failed:", ccErr);
+      } else {
+        contactsSynced = contactRows.length;
+      }
+    }
+
+    // Mirror Zoho: delete any source='zoho' contacts that no longer exist in
+    // Zoho's contact_persons response. Leaves manual/sharepoint entries alone.
+    {
+      const { data: existingZoho } = await admin
+        .from("cportal_customer_contacts")
+        .select("id, zoho_contact_person_id")
+        .eq("source", "zoho")
+        .not("zoho_contact_person_id", "is", null);
+      const stale = (existingZoho ?? []).filter(
+        (r) => r.zoho_contact_person_id && !seenZohoCpids.has(r.zoho_contact_person_id),
+      );
+      if (stale.length) {
+        const { error } = await admin
+          .from("cportal_customer_contacts")
+          .delete()
+          .in("id", stale.map((r) => r.id));
+        if (!error) contactsRemoved = stale.length;
+      }
+    }
 
     // 2) Projects — capture existing statuses first so we can detect changes
     const { data: existingProjects } = await admin
@@ -383,15 +635,61 @@ Deno.serve(async (req) => {
       }
     }
 
-    // 3) Invoices — capture existing ids first so we can detect new ones
-    const { data: existingInvoices } = await admin.from("cportal_invoices").select("zoho_invoice_id");
-    const existingInvIds = new Set((existingInvoices ?? []).map((i) => i.zoho_invoice_id));
+    // 3) Invoices — only invoices the PM has FINALIZED AND SENT in Zoho flow
+    //    into the portal. Zoho marks a not-yet-sent invoice as "draft"; we keep
+    //    those out entirely so a customer never sees — or gets emailed about —
+    //    an invoice that's still being prepared. The moment the PM sends it, its
+    //    status flips off "draft" and the next sync brings it in (which is when
+    //    the portal "receives" the invoice and the new-invoice email fires).
 
-    const invoices = await fetchAll("invoices", "invoices", accessToken, orgId);
-    const invoiceRows = invoices.map((inv) => ({
+    // Clean up any draft rows a prior sync may have stored before this rule
+    // existed. This also ensures that when such an invoice is later sent, it
+    // counts as genuinely new and triggers the notification.
+    await admin.from("cportal_invoices").delete().eq("status", "draft");
+
+    // Capture existing rows first so we can (a) detect genuinely new invoices
+    // for the notification email and (b) skip re-resolving the project link for
+    // invoices we've already checked in a prior sync.
+    const { data: existingInvoices } = await admin
+      .from("cportal_invoices").select("zoho_invoice_id, project_id, project_synced_at");
+    const existingInvIds = new Set((existingInvoices ?? []).map((i) => i.zoho_invoice_id));
+    const priorLink = new Map(
+      (existingInvoices ?? []).map((i) => [
+        i.zoho_invoice_id,
+        { projectId: i.project_id as string | null, checked: !!i.project_synced_at },
+      ]),
+    );
+
+    // Exclude drafts: a customer "receives" an invoice only once it's issued.
+    const invoices = (await fetchAll("invoices", "invoices", accessToken, orgId))
+      .filter((inv) => String(inv.status ?? "").toLowerCase() !== "draft");
+
+    // Resolve each invoice's project. Zoho's invoice LIST omits the project
+    // link, so for any invoice we haven't resolved before we read it from the
+    // DETAIL endpoint (same list-is-summary / detail-has-the-field pattern as
+    // contacts above). We pay that detail call only ONCE per invoice: once an
+    // invoice has project_synced_at set, later syncs reuse the stored link, so
+    // the recurring cron never re-walks the whole invoice history. Bounded
+    // concurrency (5) keeps us under Zoho's per-minute rate limit. A transient
+    // failure leaves the invoice unchecked so the next sync retries it.
+    const resolved = await mapWithConcurrency(invoices, 5, async (inv) => {
+      const zInvId = String(inv.invoice_id);
+      const prior = priorLink.get(zInvId);
+      if (prior?.checked) return { projectId: prior.projectId, checked: true };       // resolved before
+      if (inv.project_id) return { projectId: projMap.get(String(inv.project_id)) ?? null, checked: true };
+      try {
+        const zProjId = await fetchInvoiceProjectId(zInvId, accessToken, orgId);
+        return { projectId: zProjId ? (projMap.get(zProjId) ?? null) : null, checked: true };
+      } catch (_e) {
+        return { projectId: null, checked: false };                                   // retry next sync
+      }
+    });
+
+    const nowIso = new Date().toISOString();
+    const invoiceRows = invoices.map((inv, i) => ({
       zoho_invoice_id: String(inv.invoice_id),
       customer_id: custMap.get(String(inv.customer_id)) ?? null,
-      project_id: inv.project_id ? (projMap.get(String(inv.project_id)) ?? null) : null,
+      project_id: resolved[i].projectId,
       invoice_number: inv.invoice_number ?? null,
       status: inv.status ?? null,
       total: inv.total ?? null,
@@ -399,27 +697,42 @@ Deno.serve(async (req) => {
       currency_code: inv.currency_code ?? null,
       invoice_date: inv.date || null,
       due_date: inv.due_date || null,
+      // Stamp once the project link is settled so future syncs skip the detail
+      // call. Left null on a transient failure so the next run retries it.
+      project_synced_at: resolved[i].checked ? nowIso : null,
     }));
     if (invoiceRows.length) {
       const { error } = await admin.from("cportal_invoices").upsert(invoiceRows, { onConflict: "zoho_invoice_id" });
       if (error) throw error;
     }
 
-    // Email customers about genuinely-new invoices
+    // Only notify customers who actually have a portal account. A customer gets
+    // a cportal_profiles row when they're invited, so the presence of a matching
+    // profile means they've been invited/registered. Cold customers who were
+    // never invited should not receive "view it in your portal" emails.
+    const { data: portalProfiles } = await admin.from("cportal_profiles").select("email");
+    const portalEmails = new Set(
+      (portalProfiles ?? []).map((pf) => String(pf.email ?? "").trim().toLowerCase()).filter(Boolean),
+    );
+
+    // Email customers about genuinely-new invoices. Drafts are already filtered
+    // out above, so this only fires for invoices the PM has finalized and sent.
+    // Skip voided invoices, and skip customers who aren't on the portal yet.
     for (const inv of invoices) {
-      if (!existingInvIds.has(String(inv.invoice_id))) {
-        const email = custEmail.get(custMap.get(String(inv.customer_id)) ?? "");
-        await sendEmail(
-          admin,
-          email,
-          `New invoice ${inv.invoice_number ?? ""}`.trim(),
-          brandedEmail({
-            preheader: `Invoice ${inv.invoice_number ?? ""} for ${money(inv.total, inv.currency_code)} is ready.`,
-            title: `New invoice ${inv.invoice_number ?? ""}`.trim(),
-            bodyHtml: `<p>A new invoice <strong>${inv.invoice_number ?? ""}</strong> for <strong>${money(inv.total, inv.currency_code)}</strong> is now available in your portal.</p>`,
-          }),
-        );
-      }
+      if (existingInvIds.has(String(inv.invoice_id))) continue;
+      if (String(inv.status ?? "").toLowerCase() === "void") continue;
+      const email = custEmail.get(custMap.get(String(inv.customer_id)) ?? "");
+      if (!email || !portalEmails.has(email.trim().toLowerCase())) continue;
+      await sendEmail(
+        admin,
+        email,
+        `New invoice ${inv.invoice_number ?? ""}`.trim(),
+        brandedEmail({
+          preheader: `Invoice ${inv.invoice_number ?? ""} for ${money(inv.total, inv.currency_code)} is ready.`,
+          title: `New invoice ${inv.invoice_number ?? ""}`.trim(),
+          bodyHtml: `<p>A new invoice <strong>${inv.invoice_number ?? ""}</strong> for <strong>${money(inv.total, inv.currency_code)}</strong> is now available in your portal.</p>`,
+        }),
+      );
     }
 
     return json({
@@ -428,9 +741,13 @@ Deno.serve(async (req) => {
         customers: customerRows.length,
         projects: projectRows.length,
         invoices: invoiceRows.length,
+        invoicesLinkedToProject: resolved.filter((r) => r.projectId).length,
         membersAdded,
         customersRemoved,
         customersOrphaned,
+        contactsSynced,
+        contactsRemoved,
+        contactPersonsFetched: contactRows.length,
       },
       at: new Date().toISOString(),
     });
