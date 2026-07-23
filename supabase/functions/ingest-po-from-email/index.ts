@@ -1,20 +1,24 @@
 // Supabase Edge Function: ingest-po-from-email
 //
-// Receives forwarded PO emails via Microsoft Power Automate. The intended
-// flow:
+// Receives forwarded PO / drawing emails via Microsoft Power Automate. The
+// intended flow:
 //
-//   1. Customer emails a PO to a Hydro-Wates project manager.
+//   1. Customer emails a PO and/or engineering drawings to a Hydro-Wates
+//      project manager.
 //   2. PM forwards the email (and its attachments) to automation@hydrowates.com.
-//      No trigger word required — the AI classifier figures it out.
 //   3. Power Automate watches that inbox. For every new message with
 //      attachments it POSTs here with subject, body, sender, and attachments.
-//   4. For each attachment we ask Claude Haiku 4.5 vision: "is this a PO?".
-//      Only attachments classified as POs get stored.
-//   5. The HWI project code is taken (in this order): from the document
+//   4. Each attachment is classified by Claude vision as a PO, a drawing, or
+//      something else. POs and drawings get stored; the rest are skipped.
+//      Native CAD files (.dwg/.dxf/.step/...) are treated as drawings without
+//      a classifier call — the extension is unambiguous.
+//   5. The HWI project code is taken (in this order): from a document
 //      itself (Claude extracts it), or the email subject, or the email body.
 //      If none is found anywhere, we bounce back to the PM asking for it.
-//   6. Each PO file is stored as kind='purchase_order' and the existing
-//      upload-po-to-sharepoint mirror is triggered in the background.
+//   6. Each PO file is stored as kind='purchase_order' and mirrored to
+//      SharePoint via upload-po-to-sharepoint. Drawings are stored as
+//      kind='drawing' (they show on the portal's Drawings tab — no
+//      SharePoint mirror, which is PO-specific).
 //   7. We return a structured result so Power Automate can email the PM
 //      back with either a success confirmation or a clear failure reason.
 //
@@ -64,6 +68,12 @@ function isClassifiable(filename: string, contentType?: string): boolean {
   return false;
 }
 
+// Native CAD formats the vision classifier can't read, but whose extension
+// alone tells us the file is a drawing.
+function isCadFile(filename: string): boolean {
+  return /\.(dwg|dxf|step|stp|iges|igs)$/i.test(filename || "");
+}
+
 // Strip path components from a filename and replace anything not safe for
 // Supabase Storage keys.
 function safeFilename(name: string): string {
@@ -75,7 +85,7 @@ function safeFilename(name: string): string {
 // classifier doesn't waste tokens guessing fields we don't need.
 interface ClassifierVerdict {
   is_po: boolean;
-  document_type: string; // "purchase_order" | "invoice" | "quote" | "certificate" | "other"
+  document_type: string; // "purchase_order" | "invoice" | "quote" | "certificate" | "drawing" | "other"
   po_number: string | null;
   customer_name: string | null;
   total_amount: string | null;
@@ -136,6 +146,10 @@ WHAT IS NOT A PURCHASE ORDER (is_po = false):
 - A Certificate of testing/calibration issued BY Hydro-Wates
 - An engineering Drawing
 - Email body text with no formal PO document attached
+
+DRAWINGS (is_po = false, document_type = "drawing"):
+- An engineering or technical drawing: general arrangement, rigging/test setup, structural detail, or any CAD-produced sheet with a title block
+- Drawings often show the HWI code or a project name in the title block — extract the HWI code if clearly readable
 
 The key test: who is the BUYER on this document?
 - If the buyer is Hydro-Wates' customer (and Hydro-Wates is the vendor receiving the order) → is_po = true
@@ -269,12 +283,34 @@ Deno.serve(async (req) => {
     contentType: string;
     verdict: ClassifierVerdict;
   };
-  const classified: Classified[] = [];
+  const poFiles: Classified[] = [];
+  const drawingFiles: Classified[] = [];
   const skippedNonPo: Array<{ filename: string; document_type: string; reasoning: string }> = [];
 
   for (const att of attachments) {
     const filename = att.filename || "attachment";
     if (!att.contentBase64) continue;
+
+    // Native CAD files skip the vision classifier — the extension is proof
+    // enough that it's a drawing (and Claude can't read the format anyway).
+    if (isCadFile(filename)) {
+      drawingFiles.push({
+        filename,
+        contentBase64: att.contentBase64,
+        contentType: att.contentType ?? "application/octet-stream",
+        verdict: {
+          is_po: false,
+          document_type: "drawing",
+          po_number: null,
+          customer_name: null,
+          total_amount: null,
+          hwi_code: null,
+          reasoning: "Native CAD file extension",
+        },
+      });
+      continue;
+    }
+
     if (!isClassifiable(filename, att.contentType)) continue;
 
     const verdict = await classifyAttachment(
@@ -286,7 +322,14 @@ Deno.serve(async (req) => {
     if (!verdict) continue;
 
     if (verdict.is_po) {
-      classified.push({
+      poFiles.push({
+        filename,
+        contentBase64: att.contentBase64,
+        contentType: att.contentType ?? "application/pdf",
+        verdict,
+      });
+    } else if (verdict.document_type === "drawing") {
+      drawingFiles.push({
         filename,
         contentBase64: att.contentBase64,
         contentType: att.contentType ?? "application/pdf",
@@ -301,24 +344,24 @@ Deno.serve(async (req) => {
     }
   }
 
-  if (classified.length === 0) {
-    // Nothing in the email looked like a PO. Tell the PM what we DID see so
-    // they can decide whether to re-forward with a different attachment.
+  if (poFiles.length === 0 && drawingFiles.length === 0) {
+    // Nothing in the email looked like a PO or a drawing. Tell the PM what we
+    // DID see so they can decide whether to re-forward with a different attachment.
     const seenSummary = skippedNonPo.length === 0
-      ? "I couldn't identify any of the attachments as Purchase Orders."
-      : "I reviewed the attachments but none looked like a Purchase Order. Here's what I saw: " +
+      ? "I couldn't identify any of the attachments as Purchase Orders or drawings."
+      : "I reviewed the attachments but none looked like a Purchase Order or drawing. Here's what I saw: " +
         skippedNonPo.map((s) => `${s.filename} (${s.document_type})`).join("; ");
     return json({
       ok: false,
       reason: "no-po-found",
       classified: skippedNonPo,
-      message: `${seenSummary} If a PO was attached, please re-forward and the system will try again.`,
+      message: `${seenSummary} If a PO or drawing was attached, please re-forward and the system will try again.`,
     }, 200);
   }
 
-  // (2) Decide which HWI code to use. Prefer the code printed on the
-  // document itself; fall back to subject; fall back to body.
-  const codeFromDoc = classified.map((c) => c.verdict.hwi_code).find((c) => c) ?? null;
+  // (2) Decide which HWI code to use. Prefer the code printed on a
+  // document itself (POs first); fall back to subject; fall back to body.
+  const codeFromDoc = [...poFiles, ...drawingFiles].map((c) => c.verdict.hwi_code).find((c) => c) ?? null;
   const codeFromSubject = extractHwiCode(subject);
   const codeFromBody = extractHwiCode(body);
   const hwiCode = (extractHwiCode(codeFromDoc ?? "")) // normalize doc code through the same regex (handles odd formats)
@@ -326,12 +369,20 @@ Deno.serve(async (req) => {
     ?? codeFromBody;
 
   if (!hwiCode) {
-    const poNumbers = classified.map((c) => c.verdict.po_number).filter(Boolean).join(", ");
+    const poNumbers = poFiles.map((c) => c.verdict.po_number).filter(Boolean).join(", ");
+    const recognized = [
+      poFiles.length > 0
+        ? `${poFiles.length} Purchase Order file${poFiles.length === 1 ? "" : "s"}${poNumbers ? ` (PO ${poNumbers})` : ""}`
+        : null,
+      drawingFiles.length > 0
+        ? `${drawingFiles.length} drawing${drawingFiles.length === 1 ? "" : "s"}`
+        : null,
+    ].filter(Boolean).join(" and ");
     return json({
       ok: false,
       reason: "no-hwi-code",
-      classified: classified.map((c) => ({ filename: c.filename, verdict: c.verdict })),
-      message: `I recognized ${classified.length} Purchase Order file${classified.length === 1 ? "" : "s"}${poNumbers ? ` (PO ${poNumbers})` : ""} but couldn't find the HWI project code anywhere — not on the PO, not in the subject, not in the body. Please reply with the HWI code (e.g. HWI-26-254) or re-forward with it added.`,
+      classified: [...poFiles, ...drawingFiles].map((c) => ({ filename: c.filename, verdict: c.verdict })),
+      message: `I recognized ${recognized} but couldn't find the HWI project code anywhere — not on the documents, not in the subject, not in the body. Please reply with the HWI code (e.g. HWI-26-254) or re-forward with it added.`,
     }, 200);
   }
 
@@ -347,26 +398,34 @@ Deno.serve(async (req) => {
       ok: false,
       reason: "project-not-found",
       hwiCode,
-      classified: classified.map((c) => ({ filename: c.filename, verdict: c.verdict })),
+      classified: [...poFiles, ...drawingFiles].map((c) => ({ filename: c.filename, verdict: c.verdict })),
       message: `No project starting with "${hwiCode}" found in the portal. Create the project first, then re-forward this email.`,
     }, 200);
   }
 
-  // (4) Upload each PO attachment. Mark with kind='purchase_order' and
-  // synchronously mirror to SharePoint so the confirmation email accurately
-  // reflects what happened.
+  // (4) Upload each recognized attachment. POs get kind='purchase_order' and
+  // a synchronous SharePoint mirror (so the confirmation email accurately
+  // reflects what happened). Drawings get kind='drawing' — they show on the
+  // project's Drawings tab; the SharePoint mirror is PO-specific so it's
+  // skipped for them.
   type UploadOutcome = {
     name: string;
     fileId: string;
+    kind: "purchase_order" | "drawing";
     po_number: string | null;
-    sharepoint: "mirrored" | "emailed-to-sales" | "failed";
+    sharepoint: "mirrored" | "emailed-to-sales" | "failed" | "n/a";
     sharepoint_path: string | null;
     sharepoint_note: string | null;
   };
   const uploaded: UploadOutcome[] = [];
   const failures: Array<{ name: string; error: string }> = [];
 
-  for (const c of classified) {
+  const toIngest = [
+    ...poFiles.map((c) => ({ ...c, kind: "purchase_order" as const })),
+    ...drawingFiles.map((c) => ({ ...c, kind: "drawing" as const })),
+  ];
+
+  for (const c of toIngest) {
     try {
       const bytes = decodeBase64(c.contentBase64);
       const safeName = safeFilename(c.filename);
@@ -391,7 +450,7 @@ Deno.serve(async (req) => {
           storage_path: storagePath,
           size: bytes.length,
           mime_type: c.contentType,
-          kind: "purchase_order",
+          kind: c.kind,
         })
         .select("id")
         .single();
@@ -401,61 +460,64 @@ Deno.serve(async (req) => {
         continue;
       }
 
-      // Synchronously call the SharePoint mirror. We use direct fetch (not
-      // admin.functions.invoke) because invoke() doesn't reliably pass the
-      // service-role token in the Authorization header that the mirror
-      // function checks. Edge functions also kill detached promises on
+      // Synchronously call the SharePoint mirror (POs only). We use direct
+      // fetch (not admin.functions.invoke) because invoke() doesn't reliably
+      // pass the service-role token in the Authorization header that the
+      // mirror function checks. Edge functions also kill detached promises on
       // return, so this has to await. Stays well under Power Automate's
       // 120-sec HTTP timeout.
-      let spOutcome: UploadOutcome["sharepoint"] = "failed";
+      let spOutcome: UploadOutcome["sharepoint"] = c.kind === "purchase_order" ? "failed" : "n/a";
       let spPath: string | null = null;
       let spNote: string | null = null;
-      try {
-        const mirrorResp = await fetch(`${supabaseUrl}/functions/v1/upload-po-to-sharepoint`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${serviceKey}`,
-            "apikey": serviceKey,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ fileId: insertedFile.id }),
-        });
-        if (!mirrorResp.ok) {
-          const errText = await mirrorResp.text();
-          spNote = `mirror returned ${mirrorResp.status}: ${errText.slice(0, 200)}`;
-        } else {
-          // The mirror function updates files.sharepoint_path itself; re-read
-          // to find out which path it took (real folder vs emailed-to-sales).
-          const { data: refetched } = await admin
-            .from("cportal_files")
-            .select("sharepoint_path, sharepoint_error")
-            .eq("id", insertedFile.id)
-            .single();
-          if (refetched?.sharepoint_path === "emailed-to-sales") {
-            spOutcome = "emailed-to-sales";
-            spPath = null;
-            spNote = "No SharePoint folder yet for this project — PO was emailed to sales@hydrowates.com for manual filing.";
-          } else if (refetched?.sharepoint_path) {
-            spOutcome = "mirrored";
-            spPath = refetched.sharepoint_path;
-          } else if (refetched?.sharepoint_error) {
-            spNote = refetched.sharepoint_error;
+      if (c.kind === "purchase_order") {
+        try {
+          const mirrorResp = await fetch(`${supabaseUrl}/functions/v1/upload-po-to-sharepoint`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${serviceKey}`,
+              "apikey": serviceKey,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ fileId: insertedFile.id }),
+          });
+          if (!mirrorResp.ok) {
+            const errText = await mirrorResp.text();
+            spNote = `mirror returned ${mirrorResp.status}: ${errText.slice(0, 200)}`;
           } else {
-            // Mirror returned 2xx but didn't update the row — treat as success
-            // since the function's own JSON said ok.
-            spOutcome = "mirrored";
-            const mirrorJson = await mirrorResp.clone().json().catch(() => null);
-            if (mirrorJson?.path) spPath = mirrorJson.path;
+            // The mirror function updates files.sharepoint_path itself; re-read
+            // to find out which path it took (real folder vs emailed-to-sales).
+            const { data: refetched } = await admin
+              .from("cportal_files")
+              .select("sharepoint_path, sharepoint_error")
+              .eq("id", insertedFile.id)
+              .single();
+            if (refetched?.sharepoint_path === "emailed-to-sales") {
+              spOutcome = "emailed-to-sales";
+              spPath = null;
+              spNote = "No SharePoint folder yet for this project — PO was emailed to sales@hydrowates.com for manual filing.";
+            } else if (refetched?.sharepoint_path) {
+              spOutcome = "mirrored";
+              spPath = refetched.sharepoint_path;
+            } else if (refetched?.sharepoint_error) {
+              spNote = refetched.sharepoint_error;
+            } else {
+              // Mirror returned 2xx but didn't update the row — treat as success
+              // since the function's own JSON said ok.
+              spOutcome = "mirrored";
+              const mirrorJson = await mirrorResp.clone().json().catch(() => null);
+              if (mirrorJson?.path) spPath = mirrorJson.path;
+            }
           }
+        } catch (e) {
+          spNote = `mirror call threw: ${String((e as Error)?.message ?? e)}`;
         }
-      } catch (e) {
-        spNote = `mirror call threw: ${String((e as Error)?.message ?? e)}`;
       }
 
       uploaded.push({
         name: c.filename,
         fileId: insertedFile.id,
-        po_number: c.verdict.po_number,
+        kind: c.kind,
+        po_number: c.kind === "purchase_order" ? c.verdict.po_number : null,
         sharepoint: spOutcome,
         sharepoint_path: spPath,
         sharepoint_note: spNote,
@@ -472,7 +534,7 @@ Deno.serve(async (req) => {
       hwiCode,
       projectName: project.name,
       failures,
-      message: `Found project ${hwiCode} and identified ${classified.length} PO file${classified.length === 1 ? "" : "s"}, but couldn't store any of them. See failures.`,
+      message: `Found project ${hwiCode} and identified ${toIngest.length} file${toIngest.length === 1 ? "" : "s"}, but couldn't store any of them. See failures.`,
     }, 200);
   }
 
@@ -481,18 +543,23 @@ Deno.serve(async (req) => {
   const customerCompany = (project.customer as { company?: string; name?: string } | null)?.company
     || (project.customer as { company?: string; name?: string } | null)?.name
     || null;
-  const poNumberList = uploaded.map((u) => u.po_number).filter(Boolean).join(", ");
+  const uploadedPos = uploaded.filter((u) => u.kind === "purchase_order");
+  const uploadedDrawings = uploaded.filter((u) => u.kind === "drawing");
+  const poNumberList = uploadedPos.map((u) => u.po_number).filter(Boolean).join(", ");
   const skippedNote = skippedNonPo.length > 0
-    ? ` I also saw ${skippedNonPo.length} non-PO attachment${skippedNonPo.length === 1 ? "" : "s"} (${skippedNonPo.map((s) => s.document_type).join(", ")}) which I didn't file.`
+    ? ` I also saw ${skippedNonPo.length} other attachment${skippedNonPo.length === 1 ? "" : "s"} (${skippedNonPo.map((s) => s.document_type).join(", ")}) which I didn't file.`
     : "";
 
-  // Compose an accurate SharePoint status sentence from the per-file outcomes.
-  const mirrored = uploaded.filter((u) => u.sharepoint === "mirrored").length;
-  const emailedToSales = uploaded.filter((u) => u.sharepoint === "emailed-to-sales").length;
-  const spFailed = uploaded.filter((u) => u.sharepoint === "failed").length;
+  // Compose an accurate SharePoint status sentence from the per-file PO
+  // outcomes (drawings don't mirror to SharePoint).
+  const mirrored = uploadedPos.filter((u) => u.sharepoint === "mirrored").length;
+  const emailedToSales = uploadedPos.filter((u) => u.sharepoint === "emailed-to-sales").length;
+  const spFailed = uploadedPos.filter((u) => u.sharepoint === "failed").length;
   let sharepointSentence = "";
-  if (mirrored === uploaded.length) {
-    sharepointSentence = " Also copied to SharePoint.";
+  if (uploadedPos.length === 0) {
+    sharepointSentence = "";
+  } else if (mirrored === uploadedPos.length) {
+    sharepointSentence = " The PO was also copied to SharePoint.";
   } else if (emailedToSales > 0 && mirrored + spFailed === 0) {
     sharepointSentence = " No SharePoint folder yet for this project — the PO was emailed to sales@hydrowates.com for manual filing.";
   } else {
@@ -500,8 +567,17 @@ Deno.serve(async (req) => {
     if (mirrored > 0) parts.push(`${mirrored} copied to SharePoint`);
     if (emailedToSales > 0) parts.push(`${emailedToSales} emailed to sales@ for manual filing`);
     if (spFailed > 0) parts.push(`${spFailed} couldn't be mirrored (the file is still in the portal — please drop it into the SharePoint folder manually)`);
-    sharepointSentence = " SharePoint status: " + parts.join("; ") + ".";
+    sharepointSentence = " SharePoint status (POs): " + parts.join("; ") + ".";
   }
+
+  const uploadedSummary = [
+    uploadedPos.length > 0
+      ? `${uploadedPos.length} PO file${uploadedPos.length === 1 ? "" : "s"}${poNumberList ? ` (PO ${poNumberList})` : ""}`
+      : null,
+    uploadedDrawings.length > 0
+      ? `${uploadedDrawings.length} drawing${uploadedDrawings.length === 1 ? "" : "s"}`
+      : null,
+  ].filter(Boolean).join(" and ");
 
   return json({
     ok: true,
@@ -512,6 +588,6 @@ Deno.serve(async (req) => {
     skippedNonPo,
     failures: failures.length ? failures : undefined,
     fromEmail,
-    message: `Uploaded ${uploaded.length} PO file${uploaded.length === 1 ? "" : "s"}${poNumberList ? ` (PO ${poNumberList})` : ""} to project ${hwiCode}${customerCompany ? ` (${customerCompany})` : ""}.${sharepointSentence}${skippedNote}`,
+    message: `Uploaded ${uploadedSummary} to project ${hwiCode}${customerCompany ? ` (${customerCompany})` : ""}.${sharepointSentence}${skippedNote}`,
   }, 200);
 });

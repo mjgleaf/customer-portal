@@ -23,7 +23,7 @@ param(
   [string]$IngestToken = $env:PO_INGEST_TOKEN,
   [string]$FromEmail = "kkim@hydrowates.com",
   [string]$Subject = "Fwd: PO from customer",
-  [string]$ProjectRef = "uooklwtysposkuwocbup"
+  [string]$ProjectRef = "vpdcikiyaifppkkantrb"
 )
 
 if ([string]::IsNullOrWhiteSpace($IngestToken)) {

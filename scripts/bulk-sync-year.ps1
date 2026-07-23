@@ -9,7 +9,7 @@
 
 param(
   [string]$SupabaseToken = $env:SUPABASE_ACCESS_TOKEN,
-  [string]$ProjectRef    = "uooklwtysposkuwocbup",
+  [string]$ProjectRef    = "vpdcikiyaifppkkantrb",
   [string]$YearPrefix    = "HWI-26"
 )
 

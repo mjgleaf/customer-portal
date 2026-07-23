@@ -108,10 +108,10 @@ All functions live under `supabase/functions/<name>/index.ts`. Deploy any one wi
 ```powershell
 cd C:\path\to\customer-portal
 $env:SUPABASE_ACCESS_TOKEN = "sbp_..."  # from https://supabase.com/dashboard/account/tokens
-supabase functions deploy <name> --project-ref uooklwtysposkuwocbup --use-api --no-verify-jwt
+supabase functions deploy <name> --project-ref vpdcikiyaifppkkantrb --use-api --no-verify-jwt
 ```
 
-**Project ref**: `uooklwtysposkuwocbup`
+**Project ref**: `vpdcikiyaifppkkantrb`
 
 ### Function inventory
 
@@ -122,7 +122,7 @@ supabase functions deploy <name> --project-ref uooklwtysposkuwocbup --use-api --
 | `sync-leads` | Manual / scheduled | Pulls project descriptions from the SharePoint Lead List into `projects.lead_comments`. |
 | `sharepoint-list` | Debug helper, gated by `INSPECT_KEY` header | Read-only Graph folder listing. Used during development to inspect SharePoint structure. |
 | `upload-po-to-sharepoint` | Admin/customer PO upload via portal + `ingest-po-from-email` | Mirrors a portal-uploaded PO into SharePoint's `Purchase Order/` subfolder. If no matching project folder exists, emails sales@ with the PO attached. Records the SharePoint item ID for dedup with future syncs. |
-| `ingest-po-from-email` | Power Automate (`PO Email Ingest` flow) | Receives forwarded PO emails. Claude Opus vision classifies each attachment as PO or not. Uploads PO files into the portal AND fires the SharePoint mirror. Bounces with a friendly explanation if no PO recognized or HWI code not found. |
+| `ingest-po-from-email` | Power Automate (`PO Email Ingest` flow) | Receives forwarded PO / drawing emails. Claude Opus vision classifies each attachment as PO, drawing, or other. POs upload into the portal AND fire the SharePoint mirror; drawings upload with `kind='drawing'` (project Drawings tab, no SharePoint mirror). Native CAD files (.dwg/.dxf/.step) are filed as drawings by extension. Bounces with a friendly explanation if nothing recognized or HWI code not found. |
 | `analyze-po` | Admin "Review with AI" button on a PO file | Claude Opus reads the PO PDF and returns summary + concerns + extracted fields. Result is cached in `po_reviews` table. |
 | `notify-upload` | Frontend after every file upload | Emails the other party (customer if admin uploaded, sales@ if customer uploaded). Honors `app_settings.emails_paused` kill switch. |
 | `send-reminder` | Admin "Remind" button on missing documents | Emails the customer (and any selected project members) a branded reminder. Records `reminders` row for the "last reminded" indicator. |
@@ -230,12 +230,12 @@ Storage buckets:
 - **Mailbox**: `automation@hydrowates.com` (shared mailbox; the flow runs under whichever user owns it).
 - **Flow name**: `PO Email Ingest`.
 - **Trigger**: New email arrives → subject contains `#PO` → has attachments.
-- **Endpoint**: `https://uooklwtysposkuwocbup.supabase.co/functions/v1/ingest-po-from-email`.
+- **Endpoint**: `https://vpdcikiyaifppkkantrb.supabase.co/functions/v1/ingest-po-from-email`.
 - **Auth**: `X-Ingest-Token` header. Value must match the `PO_INGEST_TOKEN` Supabase secret.
 
 **PM-facing instructions:**
 
-> When a customer emails you a PO, forward it to `automation@hydrowates.com` with `#PO` and the HWI code (e.g. `HWI-26-254`) anywhere in the subject. Within ~60 seconds you'll get a reply confirming the PO is in the portal + SharePoint. If the system can't recognize the PO or find the project, the reply tells you what to fix.
+> When a customer emails you a PO or project drawings, forward it to `automation@hydrowates.com` with `#PO` and the HWI code (e.g. `HWI-26-254`) anywhere in the subject. Within ~60 seconds you'll get a reply confirming what was filed — POs go to the project's documents + SharePoint, drawings go to the project's Drawings tab. If the system can't recognize the attachments or find the project, the reply tells you what to fix.
 
 **To rotate the ingest token:**
 1. Generate a new random string (any URL-safe base64-encoded 32 bytes).
@@ -256,7 +256,7 @@ In Power Automate logged in as the mailbox owner, create an Automated Cloud Flow
      "contentType": @{item()?['ContentType']}
    }
    ```
-3. **HTTP** POST to `https://uooklwtysposkuwocbup.supabase.co/functions/v1/ingest-po-from-email`. Headers: `Content-Type: application/json`, `X-Ingest-Token: <PO_INGEST_TOKEN value>`. Body:
+3. **HTTP** POST to `https://vpdcikiyaifppkkantrb.supabase.co/functions/v1/ingest-po-from-email`. Headers: `Content-Type: application/json`, `X-Ingest-Token: <PO_INGEST_TOKEN value>`. Body:
    ```json
    {
      "subject": @{triggerOutputs()?['body/subject']},
@@ -288,7 +288,7 @@ as soon as possible.
 2. Import project → Add New → Project → Import the customer-portal Git repo.
 3. Framework preset: Vite. Build command: npm run build. Output: dist.
 4. Environment variables (Production):
-     VITE_SUPABASE_URL=https://uooklwtysposkuwocbup.supabase.co
+     VITE_SUPABASE_URL=https://vpdcikiyaifppkkantrb.supabase.co
      VITE_SUPABASE_ANON_KEY=<anon key from Supabase dashboard>
 5. Deploy.
 6. Add custom domain (portal.hydrowates.com) and SSL via Vercel UI.
@@ -310,7 +310,7 @@ Deployed manually using the Supabase CLI. There is no CI/CD pipeline.
 ```powershell
 cd C:\path\to\customer-portal
 $env:SUPABASE_ACCESS_TOKEN = "sbp_..."  # your personal token
-supabase functions deploy <function-name> --project-ref uooklwtysposkuwocbup --use-api --no-verify-jwt
+supabase functions deploy <function-name> --project-ref vpdcikiyaifppkkantrb --use-api --no-verify-jwt
 ```
 
 Most functions need `--no-verify-jwt` because of how they're called. Specifically required for:

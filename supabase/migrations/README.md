@@ -20,7 +20,7 @@ You have two options:
 - This is fine for one-off changes; just remember the file in this folder is what should "win" if production and the file disagree.
 
 **2. Via the Supabase CLI** (recommended for new changes once set up)
-- `supabase link --project-ref uooklwtysposkuwocbup` (one-time setup, needs the database password — different from your CLI access token; available in Supabase Dashboard → Project Settings → Database).
+- `supabase link --project-ref vpdcikiyaifppkkantrb` (one-time setup, needs the database password — different from your CLI access token; available in Supabase Dashboard → Project Settings → Database).
 - `supabase db push` applies any new migration files that haven't been applied yet.
 
 ### Adding a new migration
