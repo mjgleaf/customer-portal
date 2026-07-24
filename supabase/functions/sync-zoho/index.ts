@@ -5,8 +5,8 @@
 // scheduled cron (which authenticates with the service-role key).
 //
 // Also sends notification emails via Microsoft Graph (as the shared sales@
-// mailbox) on genuinely-new invoices (only once they've cleared Zoho Books'
-// approval workflow) and on project status changes. Emails are
+// mailbox) on genuinely-new invoices (only once they're marked sent in Zoho
+// Books, past any approval workflow) and on project status changes. Emails are
 // routed to the linked project's members (job-scoped) rather than the customer
 // record's primary-contact email (company-scoped), falling back to the customer
 // email only when there's no project link or the project has no members — a
@@ -219,30 +219,16 @@ function mapProjectStatus(zohoStatus: string): string {
 
 // Zoho Books approval workflow: an invoice moves draft → pending approval →
 // approved (or rejected) → sent. The customer must not see — or be emailed
-// about — an invoice that hasn't cleared approval. Depending on API version
-// and org settings Zoho reports the approval state either as the top-level
-// `status` or in `current_sub_status`, so check both. "approved" itself IS
-// released: the portal is the delivery channel, so approval is the moment
-// the customer may receive the invoice (no need to also mark it sent in Zoho).
-const UNRELEASED_INVOICE_STATES = new Set(["draft", "pending_approval", "rejected"]);
+// about — an invoice until the PM marks it SENT in Zoho; approval alone
+// still keeps it internal. Depending on API version and org settings Zoho
+// reports the pre-sent state either as the top-level `status` or in
+// `current_sub_status`, so check both.
+const UNRELEASED_INVOICE_STATES = new Set(["draft", "pending_approval", "approved", "rejected"]);
 
 function invoiceReleased(inv: { status?: string; current_sub_status?: string }): boolean {
   const status = String(inv.status ?? "").toLowerCase();
   const sub = String(inv.current_sub_status ?? "").toLowerCase();
-  if (sub === "approved") return true;
   return !UNRELEASED_INVOICE_STATES.has(status) && !UNRELEASED_INVOICE_STATES.has(sub);
-}
-
-// Status to store in the portal. An approved-but-unsent invoice can carry a
-// top-level status of "draft" (approval state lives in current_sub_status);
-// storing that raw would get the row deleted by the draft cleanup on the next
-// sync and re-created — and re-emailed — on the one after, forever. Store
-// "approved" instead so the row survives.
-function effectiveInvoiceStatus(inv: { status?: string; current_sub_status?: string }): string | null {
-  const status = String(inv.status ?? "").toLowerCase();
-  const sub = String(inv.current_sub_status ?? "").toLowerCase();
-  if (sub === "approved" && UNRELEASED_INVOICE_STATES.has(status)) return "approved";
-  return inv.status ?? null;
 }
 
 // Parse a Zoho date/timestamp into an ISO string, or null if absent/invalid.
@@ -737,19 +723,19 @@ Deno.serve(async (req) => {
       }
     }
 
-    // 3) Invoices — only invoices that have cleared Zoho's approval workflow
-    //    (or were never subject to one) flow into the portal. Drafts, invoices
-    //    pending approval, and rejected invoices stay out entirely so a
-    //    customer never sees — or gets emailed about — an invoice that's still
-    //    being prepared. The moment the PM approves (or, without an approval
-    //    workflow, sends) it, the next sync brings it in — which is when the
-    //    portal "receives" the invoice and the new-invoice email fires.
+    // 3) Invoices — only invoices the PM has MARKED SENT in Zoho flow into
+    //    the portal. Drafts, invoices pending approval, approved-but-unsent
+    //    invoices, and rejected invoices stay out entirely so a customer
+    //    never sees — or gets emailed about — an invoice that's still being
+    //    prepared. The moment the PM sends it, the next sync brings it in —
+    //    which is when the portal "receives" the invoice and the new-invoice
+    //    email fires.
 
     // Clean up any unreleased rows a prior sync may have stored before this
     // rule existed. This also ensures that when such an invoice is later
-    // released, it counts as genuinely new and triggers the notification.
+    // sent, it counts as genuinely new and triggers the notification.
     await admin.from("cportal_invoices").delete()
-      .in("status", ["draft", "pending_approval", "rejected"]);
+      .in("status", ["draft", "pending_approval", "approved", "rejected"]);
 
     // Capture existing rows first so we can (a) detect genuinely new invoices
     // for the notification email and (b) skip re-resolving the project link for
@@ -764,8 +750,8 @@ Deno.serve(async (req) => {
       ]),
     );
 
-    // Exclude anything not yet approved: a customer "receives" an invoice only
-    // once it has cleared approval (or been sent, absent an approval workflow).
+    // Exclude anything not yet sent: a customer "receives" an invoice only
+    // once the PM has marked it sent in Zoho.
     const invoices = (await fetchAll("invoices", "invoices", accessToken, orgId))
       .filter((inv) => invoiceReleased(inv));
 
@@ -796,7 +782,7 @@ Deno.serve(async (req) => {
       customer_id: custMap.get(String(inv.customer_id)) ?? null,
       project_id: resolved[i].projectId,
       invoice_number: inv.invoice_number ?? null,
-      status: effectiveInvoiceStatus(inv),
+      status: inv.status ?? null,
       total: inv.total ?? null,
       balance: inv.balance ?? null,
       currency_code: inv.currency_code ?? null,
@@ -812,9 +798,9 @@ Deno.serve(async (req) => {
     }
 
     // Email the job's people about genuinely-new invoices. Unreleased invoices
-    // (draft / pending approval / rejected) are already filtered out above, so
-    // this only fires for invoices that have cleared Zoho's approval workflow.
-    // Skip voided invoices. Recipients come from the linked project's
+    // (draft / pending approval / approved-but-unsent / rejected) are already
+    // filtered out above, so this only fires for invoices the PM has marked
+    // sent in Zoho. Skip voided invoices. Recipients come from the linked project's
     // members; the customer-record email is only a fallback, and only when that
     // customer already has a portal account (a cportal_profiles row is created
     // at invite time, so its presence means they've been invited/registered —
