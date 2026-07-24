@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, type ChangeEvent, type ReactNode } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award, Eye, Send, MessageSquare, Sparkles, MapPin, Lock, User, Phone, Navigation, Clock, Wrench } from 'lucide-react'
+import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award, Eye, Send, MessageSquare, Sparkles, MapPin, Lock, User, Phone, Navigation, Clock, Wrench, Camera, Image as ImageIcon } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { latestEquipmentCerts } from '../lib/equipmentCerts'
 import { useAuth } from '../context/AuthContext'
@@ -113,7 +113,7 @@ function FilePreviewModal({ file, url, onClose, onDownload }: {
 }
 
 
-type TabKey ='documents' | 'drawings' | 'certificates' | 'invoices' | 'notes' | 'members'
+type TabKey ='documents' | 'drawings' | 'photos' | 'certificates' | 'invoices' | 'notes' | 'members'
 
 type ProjectNote = {
   id: string
@@ -1067,19 +1067,20 @@ export default function ProjectPage() {
   //   service_tech → logistics view: documents, drawings, certs, notes.
   //                  No invoices (billing isn't their concern), no members tab.
   const tabList: TabKey[] = isAdmin
-    ? ['documents', 'drawings', 'certificates', 'invoices', 'notes', 'members']
+    ? ['documents', 'drawings', 'photos', 'certificates', 'invoices', 'notes', 'members']
     : isServiceTech
-      ? ['documents', 'drawings', 'certificates', 'notes']
-      : ['documents', 'drawings', 'certificates', 'invoices', 'notes']
+      ? ['documents', 'drawings', 'photos', 'certificates', 'notes']
+      : ['documents', 'drawings', 'photos', 'certificates', 'invoices', 'notes']
 
   const certificates = files.filter(f => f.kind === 'certificate')
   // Only the current cert per asset — see latestEquipmentCerts.
   const equipmentCertificates = latestEquipmentCerts(files.filter(f => f.kind === 'equipment_certificate'))
   const drawings = files.filter(f => f.kind === 'drawing')
+  const photos = files.filter(f => f.kind === 'photo')
   const poFile = files.find(f => f.kind === 'purchase_order')
   const quotes = files.filter(f => f.kind === 'quote')
   const generalDocs = files.filter(f =>
-    f.kind !== 'certificate' && f.kind !== 'equipment_certificate' && f.kind !== 'drawing' && f.kind !== 'purchase_order' && f.kind !== 'quote' && !f.document_request_id
+    f.kind !== 'certificate' && f.kind !== 'equipment_certificate' && f.kind !== 'drawing' && f.kind !== 'photo' && f.kind !== 'purchase_order' && f.kind !== 'quote' && !f.document_request_id
   )
   const fileByRequirement = new Map<string, ProjectFile>()
   for (const f of files) {
@@ -1715,6 +1716,72 @@ export default function ProjectPage() {
                   <button onClick={() => previewFile(file)} className="flex items-center gap-3 min-w-0 text-left flex-1">
                     <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
                       <FileText size={16} className="text-blue-500" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-gray-900 truncate hover:text-blue-600 transition-colors">{file.name}</p>
+                      <p className="text-xs text-gray-400">
+                        {formatBytes(file.size)} · {formatDate(file.source_created_at || file.created_at)}
+                        {uploaderLabel(file) && ` · by ${uploaderLabel(file)}`}
+                      </p>
+                    </div>
+                  </button>
+                  <div className="flex items-center gap-1 ml-4 flex-shrink-0">
+                    <button onClick={() => previewFile(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Preview">
+                      <Eye size={16} />
+                    </button>
+                    <button onClick={() => handleDownload(file)} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Download">
+                      <Download size={16} />
+                    </button>
+                    {(isAdmin || file.uploaded_by === user?.id) && (
+                      <button onClick={() => handleDeleteFile(file)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title="Delete">
+                        <Trash2 size={16} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Photos tab */}
+      {activeTab === 'photos' && (
+        <div
+          onDragOver={e => { e.preventDefault(); setDragZone('photo') }}
+          onDragLeave={() => setDragZone(null)}
+          onDrop={e => { e.preventDefault(); setDragZone(null); const fs = Array.from(e.dataTransfer.files); if (fs.length) startUpload(fs, { kind: 'photo', requirementId: null }) }}
+          className={`bg-white border rounded-xl transition-colors ${dragZone === 'photo' ? 'border-blue-400 ring-2 ring-blue-200' : 'border-gray-200'}`}
+        >
+          <div className="flex items-center justify-between p-5 border-b border-gray-100">
+            <h2 className="font-semibold text-gray-900">Photos</h2>
+            <button
+              onClick={() => triggerUpload({ kind: 'photo', requirementId: null })}
+              disabled={uploading}
+              className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+            >
+              <Upload size={15} />
+              {uploading ? 'Uploading...' : 'Upload photos'}
+            </button>
+          </div>
+
+          {uploadError && (
+            <div className="mx-5 mt-4 bg-red-50 text-red-600 text-sm px-3 py-2 rounded-lg">{uploadError}</div>
+          )}
+
+          {photos.length === 0 ? (
+            <div className="text-center py-14">
+              <Camera className="mx-auto text-gray-300 mb-3" size={40} />
+              <p className="text-gray-500 text-sm font-medium">No photos yet</p>
+              <p className="text-gray-400 text-xs mt-1">Click "Upload photos" or drag files here</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-gray-50">
+              {photos.map(file => (
+                <div key={file.id} className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50 transition-colors">
+                  <button onClick={() => previewFile(file)} className="flex items-center gap-3 min-w-0 text-left flex-1">
+                    <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
+                      <ImageIcon size={16} className="text-blue-500" />
                     </div>
                     <div className="min-w-0">
                       <p className="text-sm font-medium text-gray-900 truncate hover:text-blue-600 transition-colors">{file.name}</p>
@@ -2647,6 +2714,7 @@ export default function ProjectPage() {
           certificate: 'Certificate',
           equipment_certificate: 'Equipment certificate',
           drawing: 'Drawing',
+          photo: 'Photo',
           general: 'Document',
         } as Record<string, string>)[f.kind ?? 'general'] ?? 'Document'
         return (

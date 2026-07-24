@@ -8,17 +8,19 @@
 //   2. PM forwards the email (and its attachments) to automation@hydrowates.com.
 //   3. Power Automate watches that inbox. For every new message with
 //      attachments it POSTs here with subject, body, sender, and attachments.
-//   4. Each attachment is classified by Claude vision as a PO, a drawing, or
-//      something else. POs and drawings get stored; the rest are skipped.
-//      Native CAD files (.dwg/.dxf/.step/...) are treated as drawings without
-//      a classifier call — the extension is unambiguous.
+//   4. Each attachment is classified by Claude vision as a PO, a drawing, a
+//      photo, or something else. POs, drawings, and photos get stored; the
+//      rest are skipped. Native CAD files (.dwg/.dxf/.step/...) are treated
+//      as drawings without a classifier call — the extension is unambiguous.
+//      Likewise camera formats the vision API can't read (.heic/.tiff/...)
+//      are filed as photos by extension.
 //   5. The HWI project code is taken (in this order): from a document
 //      itself (Claude extracts it), or the email subject, or the email body.
 //      If none is found anywhere, we bounce back to the PM asking for it.
 //   6. Each PO file is stored as kind='purchase_order' and mirrored to
 //      SharePoint via upload-po-to-sharepoint. Drawings are stored as
-//      kind='drawing' (they show on the portal's Drawings tab — no
-//      SharePoint mirror, which is PO-specific).
+//      kind='drawing' (portal Drawings tab) and photos as kind='photo'
+//      (portal Photos tab) — no SharePoint mirror, which is PO-specific.
 //   7. We return a structured result so Power Automate can email the PM
 //      back with either a success confirmation or a clear failure reason.
 //
@@ -74,6 +76,14 @@ function isCadFile(filename: string): boolean {
   return /\.(dwg|dxf|step|stp|iges|igs)$/i.test(filename || "");
 }
 
+// Camera/image formats the vision API can't ingest (it accepts JPEG, PNG,
+// GIF, and WebP only). On a project email these are near-certainly job-site
+// photos — iPhones attach .heic by default — so file them as photos by
+// extension, same pattern as CAD files above.
+function isPhotoOnlyFormat(filename: string): boolean {
+  return /\.(heic|heif|tif|tiff|bmp)$/i.test(filename || "");
+}
+
 // Strip path components from a filename and replace anything not safe for
 // Supabase Storage keys.
 function safeFilename(name: string): string {
@@ -85,7 +95,7 @@ function safeFilename(name: string): string {
 // classifier doesn't waste tokens guessing fields we don't need.
 interface ClassifierVerdict {
   is_po: boolean;
-  document_type: string; // "purchase_order" | "invoice" | "quote" | "certificate" | "drawing" | "other"
+  document_type: string; // "purchase_order" | "invoice" | "quote" | "certificate" | "drawing" | "photo" | "other"
   po_number: string | null;
   customer_name: string | null;
   total_amount: string | null;
@@ -151,6 +161,11 @@ DRAWINGS (is_po = false, document_type = "drawing"):
 - An engineering or technical drawing: general arrangement, rigging/test setup, structural detail, or any CAD-produced sheet with a title block
 - Drawings often show the HWI code or a project name in the title block — extract the HWI code if clearly readable
 
+PHOTOS (is_po = false, document_type = "photo"):
+- A photograph (camera image) of equipment, rigging, a job site, a test setup, damaged or worn parts, nameplates/data plates, or anything else physical
+- The test vs drawings: a photo is captured by a camera; a drawing is a produced technical sheet. A photo OF a drawing (e.g. a snapshot of a printed sheet) counts as a drawing if the sheet fills the frame and is legible, otherwise a photo
+- Company logos, email-signature graphics, and marketing banners are NOT photos — classify those as "other"
+
 The key test: who is the BUYER on this document?
 - If the buyer is Hydro-Wates' customer (and Hydro-Wates is the vendor receiving the order) → is_po = true
 - If the buyer is one of Hydro-Wates' suppliers, or the document doesn't have a buyer-seller structure → is_po = false
@@ -159,7 +174,7 @@ Reply with ONLY a JSON object in this exact shape (no markdown, no commentary):
 
 {
   "is_po": true | false,
-  "document_type": "purchase_order" | "invoice" | "quote" | "certificate" | "drawing" | "other",
+  "document_type": "purchase_order" | "invoice" | "quote" | "certificate" | "drawing" | "photo" | "other",
   "po_number": "string or null",
   "customer_name": "the customer (buyer) name, or null",
   "total_amount": "string or null",
@@ -285,6 +300,7 @@ Deno.serve(async (req) => {
   };
   const poFiles: Classified[] = [];
   const drawingFiles: Classified[] = [];
+  const photoFiles: Classified[] = [];
   const skippedNonPo: Array<{ filename: string; document_type: string; reasoning: string }> = [];
 
   for (const att of attachments) {
@@ -306,6 +322,27 @@ Deno.serve(async (req) => {
           total_amount: null,
           hwi_code: null,
           reasoning: "Native CAD file extension",
+        },
+      });
+      continue;
+    }
+
+    // Camera formats the vision API can't read (.heic etc.) are filed as
+    // photos by extension — must run BEFORE the classifier, whose API call
+    // would just fail on these media types.
+    if (isPhotoOnlyFormat(filename)) {
+      photoFiles.push({
+        filename,
+        contentBase64: att.contentBase64,
+        contentType: att.contentType ?? "application/octet-stream",
+        verdict: {
+          is_po: false,
+          document_type: "photo",
+          po_number: null,
+          customer_name: null,
+          total_amount: null,
+          hwi_code: null,
+          reasoning: "Camera image format the classifier can't read",
         },
       });
       continue;
@@ -335,6 +372,13 @@ Deno.serve(async (req) => {
         contentType: att.contentType ?? "application/pdf",
         verdict,
       });
+    } else if (verdict.document_type === "photo") {
+      photoFiles.push({
+        filename,
+        contentBase64: att.contentBase64,
+        contentType: att.contentType ?? "image/jpeg",
+        verdict,
+      });
     } else {
       skippedNonPo.push({
         filename,
@@ -344,24 +388,24 @@ Deno.serve(async (req) => {
     }
   }
 
-  if (poFiles.length === 0 && drawingFiles.length === 0) {
-    // Nothing in the email looked like a PO or a drawing. Tell the PM what we
-    // DID see so they can decide whether to re-forward with a different attachment.
+  if (poFiles.length === 0 && drawingFiles.length === 0 && photoFiles.length === 0) {
+    // Nothing in the email looked like a PO, drawing, or photo. Tell the PM what
+    // we DID see so they can decide whether to re-forward with a different attachment.
     const seenSummary = skippedNonPo.length === 0
-      ? "I couldn't identify any of the attachments as Purchase Orders or drawings."
-      : "I reviewed the attachments but none looked like a Purchase Order or drawing. Here's what I saw: " +
+      ? "I couldn't identify any of the attachments as Purchase Orders, drawings, or photos."
+      : "I reviewed the attachments but none looked like a Purchase Order, drawing, or photo. Here's what I saw: " +
         skippedNonPo.map((s) => `${s.filename} (${s.document_type})`).join("; ");
     return json({
       ok: false,
       reason: "no-po-found",
       classified: skippedNonPo,
-      message: `${seenSummary} If a PO or drawing was attached, please re-forward and the system will try again.`,
+      message: `${seenSummary} If a PO, drawing, or photo was attached, please re-forward and the system will try again.`,
     }, 200);
   }
 
   // (2) Decide which HWI code to use. Prefer the code printed on a
   // document itself (POs first); fall back to subject; fall back to body.
-  const codeFromDoc = [...poFiles, ...drawingFiles].map((c) => c.verdict.hwi_code).find((c) => c) ?? null;
+  const codeFromDoc = [...poFiles, ...drawingFiles, ...photoFiles].map((c) => c.verdict.hwi_code).find((c) => c) ?? null;
   const codeFromSubject = extractHwiCode(subject);
   const codeFromBody = extractHwiCode(body);
   const hwiCode = (extractHwiCode(codeFromDoc ?? "")) // normalize doc code through the same regex (handles odd formats)
@@ -377,11 +421,14 @@ Deno.serve(async (req) => {
       drawingFiles.length > 0
         ? `${drawingFiles.length} drawing${drawingFiles.length === 1 ? "" : "s"}`
         : null,
+      photoFiles.length > 0
+        ? `${photoFiles.length} photo${photoFiles.length === 1 ? "" : "s"}`
+        : null,
     ].filter(Boolean).join(" and ");
     return json({
       ok: false,
       reason: "no-hwi-code",
-      classified: [...poFiles, ...drawingFiles].map((c) => ({ filename: c.filename, verdict: c.verdict })),
+      classified: [...poFiles, ...drawingFiles, ...photoFiles].map((c) => ({ filename: c.filename, verdict: c.verdict })),
       message: `I recognized ${recognized} but couldn't find the HWI project code anywhere — not on the documents, not in the subject, not in the body. Please reply with the HWI code (e.g. HWI-26-254) or re-forward with it added.`,
     }, 200);
   }
@@ -398,20 +445,20 @@ Deno.serve(async (req) => {
       ok: false,
       reason: "project-not-found",
       hwiCode,
-      classified: [...poFiles, ...drawingFiles].map((c) => ({ filename: c.filename, verdict: c.verdict })),
+      classified: [...poFiles, ...drawingFiles, ...photoFiles].map((c) => ({ filename: c.filename, verdict: c.verdict })),
       message: `No project starting with "${hwiCode}" found in the portal. Create the project first, then re-forward this email.`,
     }, 200);
   }
 
   // (4) Upload each recognized attachment. POs get kind='purchase_order' and
   // a synchronous SharePoint mirror (so the confirmation email accurately
-  // reflects what happened). Drawings get kind='drawing' — they show on the
-  // project's Drawings tab; the SharePoint mirror is PO-specific so it's
-  // skipped for them.
+  // reflects what happened). Drawings get kind='drawing' (project Drawings
+  // tab) and photos kind='photo' (project Photos tab); the SharePoint mirror
+  // is PO-specific so it's skipped for both.
   type UploadOutcome = {
     name: string;
     fileId: string;
-    kind: "purchase_order" | "drawing";
+    kind: "purchase_order" | "drawing" | "photo";
     po_number: string | null;
     sharepoint: "mirrored" | "emailed-to-sales" | "failed" | "n/a";
     sharepoint_path: string | null;
@@ -423,6 +470,7 @@ Deno.serve(async (req) => {
   const toIngest = [
     ...poFiles.map((c) => ({ ...c, kind: "purchase_order" as const })),
     ...drawingFiles.map((c) => ({ ...c, kind: "drawing" as const })),
+    ...photoFiles.map((c) => ({ ...c, kind: "photo" as const })),
   ];
 
   for (const c of toIngest) {
@@ -545,6 +593,7 @@ Deno.serve(async (req) => {
     || null;
   const uploadedPos = uploaded.filter((u) => u.kind === "purchase_order");
   const uploadedDrawings = uploaded.filter((u) => u.kind === "drawing");
+  const uploadedPhotos = uploaded.filter((u) => u.kind === "photo");
   const poNumberList = uploadedPos.map((u) => u.po_number).filter(Boolean).join(", ");
   const skippedNote = skippedNonPo.length > 0
     ? ` I also saw ${skippedNonPo.length} other attachment${skippedNonPo.length === 1 ? "" : "s"} (${skippedNonPo.map((s) => s.document_type).join(", ")}) which I didn't file.`
@@ -576,6 +625,9 @@ Deno.serve(async (req) => {
       : null,
     uploadedDrawings.length > 0
       ? `${uploadedDrawings.length} drawing${uploadedDrawings.length === 1 ? "" : "s"}`
+      : null,
+    uploadedPhotos.length > 0
+      ? `${uploadedPhotos.length} photo${uploadedPhotos.length === 1 ? "" : "s"}`
       : null,
   ].filter(Boolean).join(" and ");
 

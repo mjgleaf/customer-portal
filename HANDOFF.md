@@ -122,7 +122,7 @@ supabase functions deploy <name> --project-ref vpdcikiyaifppkkantrb --use-api --
 | `sync-leads` | Manual / scheduled | Pulls project descriptions from the SharePoint Lead List into `projects.lead_comments`. |
 | `sharepoint-list` | Debug helper, gated by `INSPECT_KEY` header | Read-only Graph folder listing. Used during development to inspect SharePoint structure. |
 | `upload-po-to-sharepoint` | Admin/customer PO upload via portal + `ingest-po-from-email` | Mirrors a portal-uploaded PO into SharePoint's `Purchase Order/` subfolder. If no matching project folder exists, emails sales@ with the PO attached. Records the SharePoint item ID for dedup with future syncs. |
-| `ingest-po-from-email` | Power Automate (`PO Email Ingest` flow) | Receives forwarded PO / drawing emails. Claude Opus vision classifies each attachment as PO, drawing, or other. POs upload into the portal AND fire the SharePoint mirror; drawings upload with `kind='drawing'` (project Drawings tab, no SharePoint mirror). Native CAD files (.dwg/.dxf/.step) are filed as drawings by extension. Bounces with a friendly explanation if nothing recognized or HWI code not found. |
+| `ingest-po-from-email` | Power Automate (`PO Email Ingest` flow) | Receives forwarded PO / drawing / photo emails. Claude Opus vision classifies each attachment as PO, drawing, photo, or other. POs upload into the portal AND fire the SharePoint mirror; drawings upload with `kind='drawing'` (project Drawings tab) and photos with `kind='photo'` (project Photos tab) — no SharePoint mirror for either. Native CAD files (.dwg/.dxf/.step) are filed as drawings by extension; camera formats Claude can't read (.heic/.tiff/.bmp) as photos by extension. Bounces with a friendly explanation if nothing recognized or HWI code not found. |
 | `analyze-po` | Admin "Review with AI" button on a PO file | Claude Opus reads the PO PDF and returns summary + concerns + extracted fields. Result is cached in `po_reviews` table. |
 | `notify-upload` | Frontend after every file upload | Emails the other party (customer if admin uploaded, sales@ if customer uploaded). Honors `app_settings.emails_paused` kill switch. |
 | `send-reminder` | Admin "Remind" button on missing documents | Emails the customer (and any selected project members) a branded reminder. Records `reminders` row for the "last reminded" indicator. |
@@ -229,13 +229,13 @@ Storage buckets:
 
 - **Mailbox**: `automation@hydrowates.com` (shared mailbox; the flow runs under whichever user owns it).
 - **Flow name**: `PO Email Ingest`.
-- **Trigger**: New email arrives → subject contains `#PO` or the word `drawing` (case-insensitive, via a trigger condition — the Subject Filter field is intentionally empty) → has attachments.
+- **Trigger**: New email arrives → subject contains `#PO`, the word `drawing`, or the word `photo` (case-insensitive, via a trigger condition — the Subject Filter field is intentionally empty) → has attachments.
 - **Endpoint**: `https://vpdcikiyaifppkkantrb.supabase.co/functions/v1/ingest-po-from-email`.
 - **Auth**: `X-Ingest-Token` header. Value must match the `PO_INGEST_TOKEN` Supabase secret.
 
 **PM-facing instructions:**
 
-> When a customer emails you a PO or project drawings, forward it to `automation@hydrowates.com` with the HWI code (e.g. `HWI-26-254`) anywhere in the subject, plus either `#PO` or the word "drawing" (any casing — "Fwd: Drawings for HWI-26-254" works as-is). Within ~60 seconds you'll get a reply confirming what was filed — POs go to the project's documents + SharePoint, drawings go to the project's Drawings tab. If the system can't recognize the attachments or find the project, the reply tells you what to fix.
+> When a customer emails you a PO, project drawings, or job-site photos, forward it to `automation@hydrowates.com` with the HWI code (e.g. `HWI-26-254`) anywhere in the subject, plus `#PO`, the word "drawing", or the word "photo" (any casing — "Fwd: Drawings for HWI-26-254" or "Site photos HWI-26-254" work as-is). Within ~60 seconds you'll get a reply confirming what was filed — POs go to the project's documents + SharePoint, drawings go to the project's Drawings tab, photos go to the project's Photos tab. If the system can't recognize the attachments or find the project, the reply tells you what to fix.
 
 **To rotate the ingest token:**
 1. Generate a new random string (any URL-safe base64-encoded 32 bytes).
@@ -249,7 +249,7 @@ In Power Automate logged in as the mailbox owner, create an Automated Cloud Flow
 
 1. **Trigger**: *When a new email arrives (V3)*. Mailbox: `automation@hydrowates.com`. Include Attachments: Yes. Only with Attachments: Yes. Leave Subject Filter empty; instead add this under Settings → Trigger conditions:
    ```
-   @or(contains(toLower(coalesce(triggerBody()?['subject'], '')), '#po'), contains(toLower(coalesce(triggerBody()?['subject'], '')), 'drawing'))
+   @or(contains(toLower(coalesce(triggerBody()?['subject'], '')), '#po'), contains(toLower(coalesce(triggerBody()?['subject'], '')), 'drawing'), contains(toLower(coalesce(triggerBody()?['subject'], '')), 'photo'))
    ```
 2. **Select** (Data Operation). From: `triggerOutputs()?['body/attachments']`. Map to:
    ```json
