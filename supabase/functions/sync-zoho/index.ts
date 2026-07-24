@@ -5,7 +5,12 @@
 // scheduled cron (which authenticates with the service-role key).
 //
 // Also sends notification emails via Microsoft Graph (as the shared sales@
-// mailbox) on genuinely-new invoices and on project status changes. Honors the
+// mailbox) on genuinely-new invoices and on project status changes. Emails are
+// routed to the linked project's members (job-scoped) rather than the customer
+// record's primary-contact email (company-scoped), falling back to the customer
+// email only when there's no project link or the project has no members — a
+// multi-office company must not have every office's invoices land with one
+// person. Honors each user's email_notifications preference and the
 // app_settings.emails_paused kill switch; best-effort if creds are unset.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -576,24 +581,8 @@ Deno.serve(async (req) => {
       if (error) throw error;
     }
 
-    // Email customers whose project status changed
-    for (const p of projects) {
-      const newStatus = mapProjectStatus(p.status);
-      const prev = oldStatus.get(String(p.project_id));
-      if (prev !== undefined && prev !== newStatus) {
-        const email = custEmail.get(custMap.get(String(p.customer_id)) ?? "");
-        await sendEmail(
-          admin,
-          email,
-          `Project status updated: ${p.project_name}`,
-          brandedEmail({
-            preheader: `Your project ${p.project_name} is now ${newStatus}.`,
-            title: `Project status updated`,
-            bodyHtml: `<p>The status of your project <strong>${p.project_name}</strong> is now <strong>${newStatus}</strong>.</p>`,
-          }),
-        );
-      }
-    }
+    // (Status-change emails are sent further down, once project membership has
+    // been refreshed, so they can be routed to the members on the job.)
 
     const { data: projList } = await admin
       .from("cportal_projects").select("id, zoho_project_id").not("zoho_project_id", "is", null);
@@ -632,6 +621,90 @@ Deno.serve(async (req) => {
         const { error } = await admin
           .from("cportal_project_members").insert({ project_id: portalProjectId, user_id: userId });
         if (!error) membersAdded++;
+      }
+    }
+
+    // --- Notification recipient routing --------------------------------------
+    // A company can have many offices behind one customer record (e.g. Hoist &
+    // Crane), so the record's primary-contact email is the wrong target for
+    // job-specific news. Route each email to the linked project's members (the
+    // people actually on the job) and use the customer-record email only as a
+    // fallback when there's no project link or the project has no members.
+    // Membership is read AFTER the auto-add pass above so members attached this
+    // run are included. Internal roles (admin, service_tech) are never emailed,
+    // and each user's email_notifications preference (portal Account page) is
+    // honored — the email footer has always promised that control.
+    const { data: mailProfiles } = await admin
+      .from("cportal_profiles").select("id, email, role, email_notifications");
+    const optedOut = new Set<string>();
+    const portalEmails = new Set<string>();
+    const internalEmails = new Set<string>();
+    const profileEmailById = new Map<string, string>();
+    for (const pf of mailProfiles ?? []) {
+      const email = String(pf.email ?? "").trim().toLowerCase();
+      if (!email) continue;
+      portalEmails.add(email);
+      profileEmailById.set(pf.id, email);
+      if (pf.email_notifications === false) optedOut.add(email);
+      if (pf.role === "admin" || pf.role === "service_tech") internalEmails.add(email);
+    }
+
+    const { data: memberRows } = await admin
+      .from("cportal_project_members").select("project_id, user_id");
+    const membersByProject = new Map<string, string[]>();
+    for (const m of memberRows ?? []) {
+      const email = profileEmailById.get(m.user_id);
+      if (!email || internalEmails.has(email)) continue;
+      const list = membersByProject.get(m.project_id) ?? [];
+      if (!list.includes(email)) list.push(email);
+      membersByProject.set(m.project_id, list);
+    }
+
+    // Resolve who should hear about news on a project. The customer-record
+    // email is auto-added as a member of EVERY one of that record's projects
+    // (see the auto-add pass above, which also re-adds it hourly), so its
+    // presence in the member list doesn't mean that person is on THIS job.
+    // When the job has any other members, those are the audience and the
+    // company-wide contact is dropped; it stays the recipient only when it's
+    // all the project has. When the audience exists but everyone in it opted
+    // out, we send nothing rather than fall back — falling back would re-route
+    // job news to the company-wide contact (the exact bug this prevents).
+    // requirePortal: new-invoice emails only go to customers who already have
+    // a portal account (never-invited customers shouldn't get "view it in
+    // your portal" emails); status emails keep their historical behavior of
+    // reaching the customer email regardless.
+    function recipientsFor(
+      portalProjectId: string | null | undefined,
+      fallbackEmail: string | null | undefined,
+      requirePortal: boolean,
+    ): string[] {
+      const fb = String(fallbackEmail ?? "").trim().toLowerCase();
+      const members = (portalProjectId ? membersByProject.get(portalProjectId) : undefined) ?? [];
+      const jobPeople = members.filter((e) => e !== fb);
+      const audience = jobPeople.length ? jobPeople : members;
+      if (audience.length) return audience.filter((e) => !optedOut.has(e));
+      if (!fb || optedOut.has(fb)) return [];
+      if (requirePortal && !portalEmails.has(fb)) return [];
+      return [fb];
+    }
+
+    // Email the job's people when a project's status changed
+    for (const p of projects) {
+      const newStatus = mapProjectStatus(p.status);
+      const prev = oldStatus.get(String(p.project_id));
+      if (prev === undefined || prev === newStatus) continue;
+      const fallback = custEmail.get(custMap.get(String(p.customer_id)) ?? "");
+      for (const to of recipientsFor(projMap.get(String(p.project_id)), fallback, false)) {
+        await sendEmail(
+          admin,
+          to,
+          `Project status updated: ${p.project_name}`,
+          brandedEmail({
+            preheader: `Your project ${p.project_name} is now ${newStatus}.`,
+            title: `Project status updated`,
+            bodyHtml: `<p>The status of your project <strong>${p.project_name}</strong> is now <strong>${newStatus}</strong>.</p>`,
+          }),
+        );
       }
     }
 
@@ -706,33 +779,30 @@ Deno.serve(async (req) => {
       if (error) throw error;
     }
 
-    // Only notify customers who actually have a portal account. A customer gets
-    // a cportal_profiles row when they're invited, so the presence of a matching
-    // profile means they've been invited/registered. Cold customers who were
-    // never invited should not receive "view it in your portal" emails.
-    const { data: portalProfiles } = await admin.from("cportal_profiles").select("email");
-    const portalEmails = new Set(
-      (portalProfiles ?? []).map((pf) => String(pf.email ?? "").trim().toLowerCase()).filter(Boolean),
-    );
-
-    // Email customers about genuinely-new invoices. Drafts are already filtered
-    // out above, so this only fires for invoices the PM has finalized and sent.
-    // Skip voided invoices, and skip customers who aren't on the portal yet.
-    for (const inv of invoices) {
+    // Email the job's people about genuinely-new invoices. Drafts are already
+    // filtered out above, so this only fires for invoices the PM has finalized
+    // and sent. Skip voided invoices. Recipients come from the linked project's
+    // members; the customer-record email is only a fallback, and only when that
+    // customer already has a portal account (a cportal_profiles row is created
+    // at invite time, so its presence means they've been invited/registered —
+    // cold customers should not receive "view it in your portal" emails).
+    for (let i = 0; i < invoices.length; i++) {
+      const inv = invoices[i];
       if (existingInvIds.has(String(inv.invoice_id))) continue;
       if (String(inv.status ?? "").toLowerCase() === "void") continue;
-      const email = custEmail.get(custMap.get(String(inv.customer_id)) ?? "");
-      if (!email || !portalEmails.has(email.trim().toLowerCase())) continue;
-      await sendEmail(
-        admin,
-        email,
-        `New invoice ${inv.invoice_number ?? ""}`.trim(),
-        brandedEmail({
-          preheader: `Invoice ${inv.invoice_number ?? ""} for ${money(inv.total, inv.currency_code)} is ready.`,
-          title: `New invoice ${inv.invoice_number ?? ""}`.trim(),
-          bodyHtml: `<p>A new invoice <strong>${inv.invoice_number ?? ""}</strong> for <strong>${money(inv.total, inv.currency_code)}</strong> is now available in your portal.</p>`,
-        }),
-      );
+      const fallback = custEmail.get(custMap.get(String(inv.customer_id)) ?? "");
+      for (const to of recipientsFor(resolved[i].projectId, fallback, true)) {
+        await sendEmail(
+          admin,
+          to,
+          `New invoice ${inv.invoice_number ?? ""}`.trim(),
+          brandedEmail({
+            preheader: `Invoice ${inv.invoice_number ?? ""} for ${money(inv.total, inv.currency_code)} is ready.`,
+            title: `New invoice ${inv.invoice_number ?? ""}`.trim(),
+            bodyHtml: `<p>A new invoice <strong>${inv.invoice_number ?? ""}</strong> for <strong>${money(inv.total, inv.currency_code)}</strong> is now available in your portal.</p>`,
+          }),
+        );
+      }
     }
 
     return json({
