@@ -229,13 +229,13 @@ Storage buckets:
 
 - **Mailbox**: `automation@hydrowates.com` (shared mailbox; the flow runs under whichever user owns it).
 - **Flow name**: `PO Email Ingest`.
-- **Trigger**: New email arrives → subject contains `#PO` → has attachments.
+- **Trigger**: New email arrives → subject contains `#PO` or the word `drawing` (case-insensitive, via a trigger condition — the Subject Filter field is intentionally empty) → has attachments.
 - **Endpoint**: `https://vpdcikiyaifppkkantrb.supabase.co/functions/v1/ingest-po-from-email`.
 - **Auth**: `X-Ingest-Token` header. Value must match the `PO_INGEST_TOKEN` Supabase secret.
 
 **PM-facing instructions:**
 
-> When a customer emails you a PO or project drawings, forward it to `automation@hydrowates.com` with `#PO` and the HWI code (e.g. `HWI-26-254`) anywhere in the subject. Within ~60 seconds you'll get a reply confirming what was filed — POs go to the project's documents + SharePoint, drawings go to the project's Drawings tab. If the system can't recognize the attachments or find the project, the reply tells you what to fix.
+> When a customer emails you a PO or project drawings, forward it to `automation@hydrowates.com` with the HWI code (e.g. `HWI-26-254`) anywhere in the subject, plus either `#PO` or the word "drawing" (any casing — "Fwd: Drawings for HWI-26-254" works as-is). Within ~60 seconds you'll get a reply confirming what was filed — POs go to the project's documents + SharePoint, drawings go to the project's Drawings tab. If the system can't recognize the attachments or find the project, the reply tells you what to fix.
 
 **To rotate the ingest token:**
 1. Generate a new random string (any URL-safe base64-encoded 32 bytes).
@@ -247,7 +247,10 @@ Storage buckets:
 
 In Power Automate logged in as the mailbox owner, create an Automated Cloud Flow with these 6 actions:
 
-1. **Trigger**: *When a new email arrives (V3)*. Mailbox: `automation@hydrowates.com`. Include Attachments: Yes. Only with Attachments: Yes. Subject Filter: `#PO`.
+1. **Trigger**: *When a new email arrives (V3)*. Mailbox: `automation@hydrowates.com`. Include Attachments: Yes. Only with Attachments: Yes. Leave Subject Filter empty; instead add this under Settings → Trigger conditions:
+   ```
+   @or(contains(toLower(coalesce(triggerBody()?['subject'], '')), '#po'), contains(toLower(coalesce(triggerBody()?['subject'], '')), 'drawing'))
+   ```
 2. **Select** (Data Operation). From: `triggerOutputs()?['body/attachments']`. Map to:
    ```json
    {
