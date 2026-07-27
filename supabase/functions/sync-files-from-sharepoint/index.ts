@@ -568,6 +568,18 @@ Deno.serve(async (req) => {
             continue;
           }
 
+          // Newer certs increasingly live in a "Calibration Certificates"
+          // subfolder instead of the asset folder root — walk one level of
+          // cert-named subfolders too, so the current cert isn't missed.
+          for (const subf of assetItems.filter((it) => it.folder && it.name && /cert/i.test(it.name))) {
+            try {
+              const subItems = await listChildren(driveId, `${drivePath}/${subf.name}`, token);
+              assetItems = assetItems.concat(subItems);
+            } catch (e) {
+              console.warn(`Cert subfolder walk failed for ${sn} at "${drivePath}/${subf.name}": ${(e as Error).message}`);
+            }
+          }
+
           // The equipment folder holds the unit's FULL recalibration history
           // (a decade of "Calibration Certificate ..., MM-DD-YY.pdf" files).
           // The right one for THIS job is the certificate in force when the
@@ -585,7 +597,14 @@ Deno.serve(async (req) => {
               ?? (it.createdDateTime ? Date.parse(it.createdDateTime) : 0);
           const GRACE_MS = 3 * 24 * 60 * 60 * 1000;
           const loadoutAt = snLoadoutDate.get(sn) ?? null;
-          const cutoff = loadoutAt === null ? Number.POSITIVE_INFINITY : loadoutAt + GRACE_MS;
+          // No known load-out date caps the cutoff at "now" rather than
+          // infinity: some cert files are named with their calibration DUE
+          // date (a year in the future), and a future-dated file must never
+          // beat the certificate actually in force.
+          const cutoff = Math.min(
+            loadoutAt === null ? Number.POSITIVE_INFINITY : loadoutAt + GRACE_MS,
+            Date.now() + GRACE_MS,
+          );
           let keeper: (typeof pdfs)[number] | null = null;
           let keeperTime = -1;
           for (const it of pdfs) {
