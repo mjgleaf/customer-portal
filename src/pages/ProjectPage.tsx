@@ -325,14 +325,16 @@ export default function ProjectPage() {
         setLastSyncFailed(true)
         return
       }
-      // Tally new files; if any landed, refresh the file list.
-      let addedAny = false
+      // Tally changes; if any files were added OR removed (the equipment
+      // cert sync deletes stale historical certs), refresh the file list —
+      // otherwise the page keeps showing the pre-sync state.
+      let changedAny = false
       if (data?.summary) {
-        for (const stats of Object.values(data.summary as Record<string, { added: number }>)) {
-          if (stats.added > 0) { addedAny = true; break }
+        for (const stats of Object.values(data.summary as Record<string, { added: number; removed?: number }>)) {
+          if (stats.added > 0 || (stats.removed ?? 0) > 0) { changedAny = true; break }
         }
       }
-      if (addedAny) await fetchFiles()
+      if (changedAny) await fetchFiles()
       setLastSyncedAt(new Date())
     } catch (e) {
       console.warn('Auto-sync error:', e)
