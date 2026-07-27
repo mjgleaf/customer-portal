@@ -212,6 +212,29 @@ function isPdf(file: { name?: string; file?: { mimeType?: string } }): boolean {
   return name.endsWith(".pdf");
 }
 
+// Parse the newest MM-DD-YY or MM-DD-YYYY date embedded in a cert filename,
+// e.g. "Calibration Certificate (250 Te Load Link, SN 16831), 10-25-24.pdf".
+// Returns epoch millis, or null when no plausible date is present. Used to
+// rank a unit's recalibration history — filename dates are the calibration
+// dates, which are more trustworthy than SharePoint timestamps (files get
+// re-uploaded and moved, refreshing created/modified dates).
+function dateFromFilename(name: string): number | null {
+  const re = /(?<!\d)(\d{1,2})-(\d{1,2})-(\d{2,4})(?!\d)/g;
+  let best: number | null = null;
+  for (const m of name.matchAll(re)) {
+    if (m[3].length === 3) continue; // three digits is an HWI sequence, not a year
+    const mm = parseInt(m[1], 10);
+    const dd = parseInt(m[2], 10);
+    let yy = parseInt(m[3], 10);
+    if (mm < 1 || mm > 12 || dd < 1 || dd > 31) continue;
+    if (m[3].length <= 2) yy = yy < 51 ? 2000 + yy : 1900 + yy;
+    if (yy < 1990 || yy > 2100) continue;
+    const t = Date.UTC(yy, mm - 1, dd);
+    if (best === null || t > best) best = t;
+  }
+  return best;
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
@@ -354,15 +377,15 @@ Deno.serve(async (req) => {
       });
     }
 
-    const summary: Record<string, { added: number; skipped: number; backfilled: number; pdfFiltered: number; errors: number }> = {};
+    const summary: Record<string, { added: number; skipped: number; backfilled: number; pdfFiltered: number; removed: number; errors: number }> = {};
     for (const sub of SUBFOLDER_MAP) {
-      summary[sub.spName] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, errors: 0 };
+      summary[sub.spName] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, removed: 0, errors: 0 };
     }
     // Customer-facing test certificates live at the *root* of each project
     // folder (e.g. "Certificate_1.pdf"), not in any subfolder. Track them
     // under their own summary bucket.
     const ROOT_CERT_KEY = "Project root (Certificates)";
-    summary[ROOT_CERT_KEY] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, errors: 0 };
+    summary[ROOT_CERT_KEY] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, removed: 0, errors: 0 };
 
     // 3. Iterate each subfolder, sync new files. Skipped when certsOnly is
     // set — useful for targeted bulk runs that only want root-level
@@ -449,7 +472,7 @@ Deno.serve(async (req) => {
     //
     // Skipped when certsOnly is set (the cert-only bulk run is specifically
     // for project-root test reports, not equipment).
-    summary["Equipment certificates (loadout)"] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, errors: 0 };
+    summary["Equipment certificates (loadout)"] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, removed: 0, errors: 0 };
     if (!certsOnly) {
       try {
         const loadoutListId = await getListId(siteId, LOADOUT_LIST_NAME, token);
@@ -505,11 +528,51 @@ Deno.serve(async (req) => {
             continue;
           }
 
-          for (const item of assetItems) {
-            if (item.folder || !item.id || !item.name) continue;
-            if (!isPdf(item)) continue; // PDFs only
+          // The equipment folder holds the unit's FULL recalibration history
+          // (a decade of "Calibration Certificate ..., MM-DD-YY.pdf" files).
+          // Only the newest certificate is in force, so rank by the date in
+          // the filename (fallback: SharePoint created date) and sync just
+          // that one. Everything else in the folder is an old cert.
+          const pdfs = assetItems.filter((it) => !it.folder && it.id && it.name && isPdf(it));
+          let keeper: (typeof pdfs)[number] | null = null;
+          let keeperTime = -1;
+          for (const it of pdfs) {
+            const t = dateFromFilename(it.name!)
+              ?? (it.createdDateTime ? Date.parse(it.createdDateTime) : 0);
+            if (t > keeperTime) {
+              keeperTime = t;
+              keeper = it;
+            }
+          }
 
-            const prior = existing.get(item.id);
+          // Cleanup: earlier versions of this sync pulled the whole folder,
+          // so drop any previously-synced rows for this project that point
+          // at the older certs. Reference-only rows (no storage bytes), so
+          // a plain delete is safe — and scoped to this project, so other
+          // jobs that used the same equipment are untouched.
+          for (const it of pdfs) {
+            if (!it.id || (keeper && it.id === keeper.id)) continue;
+            const prior = existing.get(it.id);
+            if (!prior) continue;
+            const { error: delErr } = await admin
+              .from("cportal_files")
+              .delete()
+              .eq("id", prior.id)
+              .eq("project_id", projectId)
+              .eq("kind", "equipment_certificate");
+            if (delErr) {
+              console.error(`Stale equipment cert delete failed for ${it.name}: ${delErr.message}`);
+              summary["Equipment certificates (loadout)"].errors++;
+            } else {
+              existing.delete(it.id);
+              summary["Equipment certificates (loadout)"].removed++;
+            }
+          }
+
+          if (!keeper?.id || !keeper.name) continue;
+          const item = keeper;
+          {
+            const prior = existing.get(item.id!);
             if (prior) {
               if (prior.needsSourceDate && item.createdDateTime) {
                 const { error: updErr } = await admin
@@ -546,7 +609,7 @@ Deno.serve(async (req) => {
                 summary["Equipment certificates (loadout)"].errors++;
                 continue;
               }
-              existing.set(item.id, { id: insertedRow.id, needsSourceDate: false });
+              existing.set(item.id!, { id: insertedRow.id, needsSourceDate: false });
               summary["Equipment certificates (loadout)"].added++;
             } catch (e) {
               console.error(`Equipment cert sync failed for ${item.name}:`, e);
