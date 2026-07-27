@@ -134,7 +134,11 @@ async function fetchListItems(
   selectFields: string[],
   token: string,
 ): Promise<Array<Record<string, unknown>>> {
-  const expand = `fields(select=${selectFields.join(",")})`;
+  // Empty selectFields = expand every column (used to self-discover the
+  // Load Out List's date column, whose internal name we don't control).
+  const expand = selectFields.length
+    ? `fields(select=${selectFields.join(",")})`
+    : "fields";
   let url = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items?expand=${expand}&$filter=${encodeURIComponent(filterClause)}&$top=500`;
   const out: Array<Record<string, unknown>> = [];
   for (let page = 0; page < 20 && url; page++) {
@@ -148,10 +152,37 @@ async function fetchListItems(
       throw new Error(`List items fetch failed (${r.status}): ${(await r.text()).slice(0, 200)}`);
     }
     const j = await r.json();
-    for (const it of (j.value ?? [])) out.push(it.fields ?? {});
+    for (const it of (j.value ?? [])) {
+      out.push({ ...(it.fields ?? {}), __itemCreatedDateTime: it.createdDateTime });
+    }
     url = (j["@odata.nextLink"] as string) || "";
   }
   return out;
+}
+
+// Best-guess load-out date for one Load Out List row. Prefer an explicit
+// date column whose (internal) name ties it to shipping out — SharePoint
+// internal names vary and encode spaces as _x0020_, so match loosely on
+// load/ship/out/job + date. Deliberately NOT any date column (CalDueDate,
+// ReturnDate etc. would overshoot). Falls back to the row's Created time:
+// loadout rows are entered when equipment ships, so it's a decent proxy.
+function loadoutDateFromRow(row: Record<string, unknown>): number | null {
+  let best: number | null = null;
+  for (const [key, val] of Object.entries(row)) {
+    if (typeof val !== "string") continue;
+    if (!/((load|ship|out|job).*date|date.*(load|ship|out|job))/i.test(key)) continue;
+    if (/modified|created|due|return/i.test(key)) continue;
+    const t = Date.parse(val);
+    if (!Number.isFinite(t)) continue;
+    if (best === null || t > best) best = t;
+  }
+  if (best !== null) return best;
+  const created = row.Created ?? row.__itemCreatedDateTime;
+  if (typeof created === "string") {
+    const t = Date.parse(created);
+    if (Number.isFinite(t)) return t;
+  }
+  return null;
 }
 
 async function listChildren(driveId: string, path: string, token: string) {
@@ -482,19 +513,28 @@ Deno.serve(async (req) => {
         }
 
         // (a) Find the equipment shipped on this job. JobNumber is text on
-        // the Load Out List, so we filter on it directly.
+        // the Load Out List, so we filter on it directly. All columns are
+        // expanded (empty select) so loadoutDateFromRow can find whatever
+        // the list's load-out date column is called; per SN we keep the
+        // latest date, since a unit can ship out in more than one wave.
         const loadoutRows = await fetchListItems(
           siteId,
           loadoutListId,
           `fields/JobNumber eq '${hwiCode}'`,
-          ["JobNumber", "AssemblySN", "Description", "CartEqCateg"],
+          [],
           token,
         );
-        const assemblySNs = new Set<string>();
+        const snLoadoutDate = new Map<string, number | null>();
         for (const row of loadoutRows) {
           const sn = (row.AssemblySN as string | undefined)?.trim();
-          if (sn) assemblySNs.add(sn);
+          if (!sn) continue;
+          const d = loadoutDateFromRow(row);
+          const prev = snLoadoutDate.get(sn);
+          if (prev === undefined || (d !== null && (prev === null || d > prev))) {
+            snLoadoutDate.set(sn, d);
+          }
         }
+        const assemblySNs = new Set<string>(snLoadoutDate.keys());
 
         // (b) For each unique equipment assembly SN, look up its FolderPath
         // in the Inventory list and walk that folder for cert PDFs.
@@ -530,20 +570,40 @@ Deno.serve(async (req) => {
 
           // The equipment folder holds the unit's FULL recalibration history
           // (a decade of "Calibration Certificate ..., MM-DD-YY.pdf" files).
-          // Only the newest certificate is in force, so rank by the date in
-          // the filename (fallback: SharePoint created date) and sync just
-          // that one. Everything else in the folder is an old cert.
+          // The right one for THIS job is the certificate in force when the
+          // unit shipped: the newest cert dated on/before the unit's
+          // load-out date (3-day grace for clerical skew between the cert's
+          // date and the loadout entry). Old jobs therefore keep the cert
+          // that was active at execution instead of picking up later
+          // recalibrations. Cert dates come from the filename (fallback:
+          // SharePoint created date). If every cert post-dates the load-out
+          // (or no load-out date is known), take the earliest available —
+          // the closest to the job — or the newest overall respectively.
           const pdfs = assetItems.filter((it) => !it.folder && it.id && it.name && isPdf(it));
+          const certTime = (it: (typeof pdfs)[number]): number =>
+            dateFromFilename(it.name!)
+              ?? (it.createdDateTime ? Date.parse(it.createdDateTime) : 0);
+          const GRACE_MS = 3 * 24 * 60 * 60 * 1000;
+          const loadoutAt = snLoadoutDate.get(sn) ?? null;
+          const cutoff = loadoutAt === null ? Number.POSITIVE_INFINITY : loadoutAt + GRACE_MS;
           let keeper: (typeof pdfs)[number] | null = null;
           let keeperTime = -1;
           for (const it of pdfs) {
-            const t = dateFromFilename(it.name!)
-              ?? (it.createdDateTime ? Date.parse(it.createdDateTime) : 0);
-            if (t > keeperTime) {
+            const t = certTime(it);
+            if (t <= cutoff && t > keeperTime) {
               keeperTime = t;
               keeper = it;
             }
           }
+          if (!keeper && pdfs.length > 0) {
+            // Everything post-dates the load-out — take the earliest cert,
+            // the nearest one to the job.
+            keeper = pdfs.reduce((a, b) => (certTime(a) <= certTime(b) ? a : b));
+          }
+          console.log(
+            `[equip-cert] ${sn}: loadout=${loadoutAt === null ? "unknown" : new Date(loadoutAt).toISOString().slice(0, 10)}` +
+            ` certs=${pdfs.length} keeper=${keeper?.name ?? "none"}`,
+          );
 
           // Cleanup: earlier versions of this sync pulled the whole folder,
           // so drop any previously-synced rows for this project that point
