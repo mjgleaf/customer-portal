@@ -4,30 +4,37 @@
 // intended flow:
 //
 //   1. Customer emails a PO and/or engineering drawings to a Hydro-Wates
-//      project manager.
+//      (or Sentinel Instruments) project manager.
 //   2. PM forwards the email (and its attachments) to automation@hydrowates.com.
 //   3. Power Automate watches that inbox. For every new message with
 //      attachments it POSTs here with subject, body, sender, and attachments.
-//   4. Each attachment is classified by Claude vision as a PO, a drawing, a
+//   4. Zip attachments are extracted in-function — some customers send POs
+//      zipped — and each entry joins the attachment list like it had been
+//      attached directly. (One level deep; a zip inside a zip is skipped.)
+//   5. Each attachment is classified by Claude vision as a PO, a drawing, a
 //      photo, or something else. POs, drawings, and photos get stored; the
 //      rest are skipped. Native CAD files (.dwg/.dxf/.step/...) are treated
 //      as drawings without a classifier call — the extension is unambiguous.
 //      Likewise camera formats the vision API can't read (.heic/.tiff/...)
 //      are filed as photos by extension.
-//   5. The HWI project code is taken (in this order): from a document
-//      itself (Claude extracts it), or the email subject, or the email body.
-//      If none is found anywhere, we bounce back to the PM asking for it.
-//   6. Each PO file is stored as kind='purchase_order' and mirrored to
-//      SharePoint via upload-po-to-sharepoint. Drawings are stored as
-//      kind='drawing' (portal Drawings tab) and photos as kind='photo'
-//      (portal Photos tab) — no SharePoint mirror, which is PO-specific.
-//   7. We return a structured result so Power Automate can email the PM
+//   6. The job code — HWI-NN-NNN for Hydro-Wates projects, QYYNNN (e.g.
+//      Q26001) for Sentinel Instruments jobs — is taken (in this order):
+//      from a document itself (Claude extracts it), or the email subject,
+//      or the email body. If none is found, we bounce back asking for it.
+//   7. Each PO file is stored as kind='purchase_order' and mirrored to
+//      SharePoint via upload-po-to-sharepoint (which files Hydro-Wates and
+//      Sentinel jobs into their respective Commercial Proposals trees).
+//      Drawings are stored as kind='drawing' (portal Drawings tab) and
+//      photos as kind='photo' (portal Photos tab) — no SharePoint mirror,
+//      which is PO-specific.
+//   8. We return a structured result so Power Automate can email the PM
 //      back with either a success confirmation or a clear failure reason.
 //
 // Auth: a shared secret (env PO_INGEST_TOKEN) passed in the X-Ingest-Token
 // header. Power Automate stores the same value in its HTTP connector.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { unzipSync } from "https://esm.sh/fflate@0.8.2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -48,12 +55,16 @@ function json(body: unknown, status = 200) {
   });
 }
 
-// Extract the first HWI-NN-NNN sequence from a chunk of text. Case
-// insensitive, tolerates noise like "PO for HWI-26-254 attached".
-function extractHwiCode(text: string): string | null {
+// Extract the first job code from a chunk of text: HWI-NN-NNN for
+// Hydro-Wates projects, or QYYNNN (e.g. Q26001) for Sentinel Instruments
+// jobs. Case insensitive, tolerates noise like "PO for HWI-26-254 attached".
+// HWI wins if both appear — Q\d{5} is the looser pattern.
+function extractJobCode(text: string): string | null {
   if (!text) return null;
-  const m = text.match(/HWI-\d{2}-\d+/i);
-  return m ? m[0].toUpperCase() : null;
+  const hwi = text.match(/HWI-\d{2}-\d+/i);
+  if (hwi) return hwi[0].toUpperCase();
+  const q = text.match(/\bQ\d{5}\b/i);
+  return q ? q[0].toUpperCase() : null;
 }
 
 // Heuristic: which attachments are even worth classifying? Skip inline
@@ -84,6 +95,28 @@ function isPhotoOnlyFormat(filename: string): boolean {
   return /\.(heic|heif|tif|tiff|bmp)$/i.test(filename || "");
 }
 
+// Zip archives get extracted in-function — several customers' purchasing
+// systems email POs as zips.
+function isZipFile(filename: string, contentType?: string): boolean {
+  const ct = (contentType || "").toLowerCase();
+  return /\.zip$/i.test(filename || "") ||
+    ct === "application/zip" ||
+    ct === "application/x-zip-compressed";
+}
+
+// Guess a MIME type from a zip entry's extension so the entry can flow
+// through the same classify/file pipeline as a direct attachment (Power
+// Automate supplies contentType for real attachments; zip entries have none).
+function contentTypeFromName(name: string): string {
+  const lower = (name || "").toLowerCase();
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  return "application/octet-stream";
+}
+
 // Strip path components from a filename and replace anything not safe for
 // Supabase Storage keys.
 function safeFilename(name: string): string {
@@ -99,7 +132,7 @@ interface ClassifierVerdict {
   po_number: string | null;
   customer_name: string | null;
   total_amount: string | null;
-  hwi_code: string | null; // HWI-NN-NNN if visible on the document
+  job_code: string | null; // HWI-NN-NNN or QYYNNN if visible on the document
   reasoning: string;
 }
 
@@ -140,26 +173,28 @@ async function classifyAttachment(
 
 CONTEXT — read this carefully before classifying:
 - Hydro-Wates is a service vendor that provides proof-load testing services to industrial customers (maritime, petroleum, heavy construction).
-- Customers PURCHASE services from Hydro-Wates by issuing a Purchase Order TO Hydro-Wates.
+- Sentinel Instruments is Hydro-Wates' sister company: it sells and recalibrates torque/tension instruments (RTC-800 / RT-800 units and accessories) to the same kind of customers.
+- Customers PURCHASE services or equipment by issuing a Purchase Order TO Hydro-Wates or TO Sentinel Instruments.
 - Hydro-Wates project codes look like "HWI-26-254" (HWI dash two digits dash a number).
+- Sentinel Instruments job codes look like "Q26001" (Q, two-digit year, three-digit sequence).
 
 WHAT COUNTS AS A PURCHASE ORDER (is_po = true):
-- A document issued BY a customer (or end-buyer) TO Hydro-Wates (or to Hydro-Wates' subsidiary "Scofield Group, LLC")
-- The customer's letterhead is on the document, NOT Hydro-Wates' letterhead
+- A document issued BY a customer (or end-buyer) TO Hydro-Wates, TO its subsidiary "Scofield Group, LLC", or TO its sister company "Sentinel Instruments"
+- The customer's letterhead is on the document, NOT Hydro-Wates' or Sentinel Instruments' letterhead
 - The document authorizes purchase of equipment or services
 - Has a PO number, line items, total amount, "Purchase Order" or "PO" in the title or header
-- Direction is: CUSTOMER → HYDRO-WATES
+- Direction is: CUSTOMER → HYDRO-WATES (or CUSTOMER → SENTINEL INSTRUMENTS)
 
 WHAT IS NOT A PURCHASE ORDER (is_po = false):
-- A Quote / Quotation / Proposal issued BY Hydro-Wates TO a customer (Hydro-Wates' letterhead at the top)
-- An Invoice issued BY Hydro-Wates TO a customer
-- A Certificate of testing/calibration issued BY Hydro-Wates
+- A Quote / Quotation / Proposal issued BY Hydro-Wates or Sentinel Instruments TO a customer (their letterhead at the top)
+- An Invoice issued BY Hydro-Wates or Sentinel Instruments TO a customer
+- A Certificate of testing/calibration issued BY Hydro-Wates or Sentinel Instruments
 - An engineering Drawing
 - Email body text with no formal PO document attached
 
 DRAWINGS (is_po = false, document_type = "drawing"):
 - An engineering or technical drawing: general arrangement, rigging/test setup, structural detail, or any CAD-produced sheet with a title block
-- Drawings often show the HWI code or a project name in the title block — extract the HWI code if clearly readable
+- Drawings often show the job code (HWI-NN-NNN or QYYNNN) or a project name in the title block — extract the job code if clearly readable
 
 PHOTOS (is_po = false, document_type = "photo"):
 - A photograph (camera image) of equipment, rigging, a job site, a test setup, damaged or worn parts, nameplates/data plates, or anything else physical
@@ -167,7 +202,7 @@ PHOTOS (is_po = false, document_type = "photo"):
 - Company logos, email-signature graphics, and marketing banners are NOT photos — classify those as "other"
 
 The key test: who is the BUYER on this document?
-- If the buyer is Hydro-Wates' customer (and Hydro-Wates is the vendor receiving the order) → is_po = true
+- If the buyer is a customer (and Hydro-Wates or Sentinel Instruments is the vendor receiving the order) → is_po = true
 - If the buyer is one of Hydro-Wates' suppliers, or the document doesn't have a buyer-seller structure → is_po = false
 
 Reply with ONLY a JSON object in this exact shape (no markdown, no commentary):
@@ -178,11 +213,11 @@ Reply with ONLY a JSON object in this exact shape (no markdown, no commentary):
   "po_number": "string or null",
   "customer_name": "the customer (buyer) name, or null",
   "total_amount": "string or null",
-  "hwi_code": "HWI-NN-NNN or null",
+  "job_code": "HWI-NN-NNN or QYYNNN or null",
   "reasoning": "one short sentence"
 }
 
-For hwi_code: only set it if you can clearly read "HWI-" followed by digits on the document itself. Don't guess.`;
+For job_code: only set it if you can clearly read "HWI-" followed by digits, or a Q followed by five digits (e.g. Q26001), on the document itself. Don't guess.`;
 
   try {
     const resp = await fetch(ANTHROPIC_URL, {
@@ -240,6 +275,18 @@ function decodeBase64(b64: string): Uint8Array {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
+}
+
+// Base64-encode a Uint8Array without blowing the call stack on larger files.
+// Zip entries get re-encoded so they can flow through the same pipeline as
+// the base64 attachments Power Automate sends.
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
 }
 
 Deno.serve(async (req) => {
@@ -303,9 +350,60 @@ Deno.serve(async (req) => {
   const photoFiles: Classified[] = [];
   const skippedNonPo: Array<{ filename: string; document_type: string; reasoning: string }> = [];
 
+  // (1a) Expand zip attachments into their entries so a zipped PO flows
+  // through the same classify/file pipeline as a direct attachment. One
+  // level deep only — a zip inside a zip is skipped with a note.
+  type Incoming = { filename: string; contentBase64: string; contentType?: string };
+  const expandedAttachments: Incoming[] = [];
   for (const att of attachments) {
     const filename = att.filename || "attachment";
     if (!att.contentBase64) continue;
+    if (!isZipFile(filename, att.contentType)) {
+      expandedAttachments.push({ filename, contentBase64: att.contentBase64, contentType: att.contentType });
+      continue;
+    }
+    try {
+      const entries = unzipSync(decodeBase64(att.contentBase64));
+      let extracted = 0;
+      for (const [entryPath, entryBytes] of Object.entries(entries)) {
+        if (entryPath.endsWith("/")) continue; // directory marker
+        const bare = entryPath.split("/").pop() ?? "";
+        // Skip macOS resource-fork junk and hidden files zips often carry.
+        if (!bare || bare.startsWith(".") || entryPath.startsWith("__MACOSX/")) continue;
+        if (entryBytes.length === 0) continue;
+        if (isZipFile(bare)) {
+          skippedNonPo.push({
+            filename: `${filename} → ${bare}`,
+            document_type: "nested-zip",
+            reasoning: "Zip inside a zip — not extracted; attach the inner files directly",
+          });
+          continue;
+        }
+        expandedAttachments.push({
+          filename: bare,
+          contentBase64: bytesToBase64(entryBytes),
+          contentType: contentTypeFromName(bare),
+        });
+        extracted++;
+      }
+      if (extracted === 0) {
+        skippedNonPo.push({
+          filename,
+          document_type: "zip",
+          reasoning: "Zip contained no usable files",
+        });
+      }
+    } catch (e) {
+      skippedNonPo.push({
+        filename,
+        document_type: "unreadable-zip",
+        reasoning: `Could not extract the zip: ${String((e as Error)?.message ?? e).slice(0, 120)}`,
+      });
+    }
+  }
+
+  for (const att of expandedAttachments) {
+    const filename = att.filename;
 
     // Native CAD files skip the vision classifier — the extension is proof
     // enough that it's a drawing (and Claude can't read the format anyway).
@@ -320,7 +418,7 @@ Deno.serve(async (req) => {
           po_number: null,
           customer_name: null,
           total_amount: null,
-          hwi_code: null,
+          job_code: null,
           reasoning: "Native CAD file extension",
         },
       });
@@ -341,7 +439,7 @@ Deno.serve(async (req) => {
           po_number: null,
           customer_name: null,
           total_amount: null,
-          hwi_code: null,
+          job_code: null,
           reasoning: "Camera image format the classifier can't read",
         },
       });
@@ -403,16 +501,16 @@ Deno.serve(async (req) => {
     }, 200);
   }
 
-  // (2) Decide which HWI code to use. Prefer the code printed on a
+  // (2) Decide which job code to use. Prefer the code printed on a
   // document itself (POs first); fall back to subject; fall back to body.
-  const codeFromDoc = [...poFiles, ...drawingFiles, ...photoFiles].map((c) => c.verdict.hwi_code).find((c) => c) ?? null;
-  const codeFromSubject = extractHwiCode(subject);
-  const codeFromBody = extractHwiCode(body);
-  const hwiCode = (extractHwiCode(codeFromDoc ?? "")) // normalize doc code through the same regex (handles odd formats)
+  const codeFromDoc = [...poFiles, ...drawingFiles, ...photoFiles].map((c) => c.verdict.job_code).find((c) => c) ?? null;
+  const codeFromSubject = extractJobCode(subject);
+  const codeFromBody = extractJobCode(body);
+  const jobCode = (extractJobCode(codeFromDoc ?? "")) // normalize doc code through the same regex (handles odd formats)
     ?? codeFromSubject
     ?? codeFromBody;
 
-  if (!hwiCode) {
+  if (!jobCode) {
     const poNumbers = poFiles.map((c) => c.verdict.po_number).filter(Boolean).join(", ");
     const recognized = [
       poFiles.length > 0
@@ -429,24 +527,26 @@ Deno.serve(async (req) => {
       ok: false,
       reason: "no-hwi-code",
       classified: [...poFiles, ...drawingFiles, ...photoFiles].map((c) => ({ filename: c.filename, verdict: c.verdict })),
-      message: `I recognized ${recognized} but couldn't find the HWI project code anywhere — not on the documents, not in the subject, not in the body. Please reply with the HWI code (e.g. HWI-26-254) or re-forward with it added.`,
+      message: `I recognized ${recognized} but couldn't find the job code anywhere — not on the documents, not in the subject, not in the body. Please reply with the job code (e.g. HWI-26-254, or Q26001 for Sentinel Instruments jobs) or re-forward with it added.`,
     }, 200);
   }
 
-  // (3) Look up the project by HWI code prefix.
+  // (3) Look up the project by job-code prefix. (The response key stays
+  // `hwiCode` even for Sentinel Q-codes — Power Automate's Parse JSON
+  // schema and email template reference it by that name.)
   const { data: projects } = await admin
     .from("cportal_projects")
     .select("id, name, customer:cportal_customers(company, name)")
-    .ilike("name", `${hwiCode}%`)
+    .ilike("name", `${jobCode}%`)
     .limit(1);
   const project = projects?.[0];
   if (!project) {
     return json({
       ok: false,
       reason: "project-not-found",
-      hwiCode,
+      hwiCode: jobCode,
       classified: [...poFiles, ...drawingFiles, ...photoFiles].map((c) => ({ filename: c.filename, verdict: c.verdict })),
-      message: `No project starting with "${hwiCode}" found in the portal. Create the project first, then re-forward this email.`,
+      message: `No project starting with "${jobCode}" found in the portal. Create the project first, then re-forward this email.`,
     }, 200);
   }
 
@@ -579,10 +679,10 @@ Deno.serve(async (req) => {
     return json({
       ok: false,
       reason: "all-uploads-failed",
-      hwiCode,
+      hwiCode: jobCode,
       projectName: project.name,
       failures,
-      message: `Found project ${hwiCode} and identified ${toIngest.length} file${toIngest.length === 1 ? "" : "s"}, but couldn't store any of them. See failures.`,
+      message: `Found project ${jobCode} and identified ${toIngest.length} file${toIngest.length === 1 ? "" : "s"}, but couldn't store any of them. See failures.`,
     }, 200);
   }
 
@@ -633,13 +733,13 @@ Deno.serve(async (req) => {
 
   return json({
     ok: true,
-    hwiCode,
+    hwiCode: jobCode,
     projectName: project.name,
     customer: customerCompany,
     uploaded,
     skippedNonPo,
     failures: failures.length ? failures : undefined,
     fromEmail,
-    message: `Uploaded ${uploadedSummary} to project ${hwiCode}${customerCompany ? ` (${customerCompany})` : ""}.${sharepointSentence}${skippedNote}`,
+    message: `Uploaded ${uploadedSummary} to project ${jobCode}${customerCompany ? ` (${customerCompany})` : ""}.${sharepointSentence}${skippedNote}`,
   }, 200);
 });

@@ -11,8 +11,9 @@
 //   4. Get app-only Graph token (same SharePoint app used for sync-leads,
 //      now also has Files.ReadWrite.All).
 //   5. Read the file bytes from Supabase Storage via signed URL.
-//   6. Ensure the folder hierarchy exists in SharePoint
-//      ("<root>/<customer>/<project>/").
+//   6. Find the project folder in SharePoint under the owning entity's
+//      Commercial Proposals tree — Hydro-Wates for HWI-coded projects,
+//      Sentinel Instruments for Q-coded jobs.
 //   7. PUT the file via Microsoft Graph.
 //   8. Update files row with sharepoint_synced_at + sharepoint_path
 //      on success, or sharepoint_error on failure.
@@ -126,28 +127,36 @@ function sanitize(name: string): string {
     .slice(0, 200) || "Untitled";
 }
 
-// Pull the HWI- code (e.g. "HWI-26-254") off the front of a project name.
-// Returns null if the project doesn't follow Hydro-Wates' HWI numbering.
-function parseHwiCode(projectName: string): string | null {
-  const m = projectName.match(/^(HWI-\d{2}-\d+)/i);
-  return m ? m[1].toUpperCase() : null;
+// Pull the job code off the front of a project name. Hydro-Wates projects
+// start with "HWI-26-254"-style codes; Sentinel Instruments jobs with
+// "Q26001"-style codes (Q + two-digit year + three-digit sequence). The
+// entity decides which Commercial Proposals tree the PO files into — both
+// live in the same SharePoint document library, under different top folders.
+type JobCode = { code: string; entity: "hydro-wates" | "sentinel" };
+function parseJobCode(projectName: string): JobCode | null {
+  const hwi = projectName.match(/^(HWI-\d{2}-\d+)/i);
+  if (hwi) return { code: hwi[1].toUpperCase(), entity: "hydro-wates" };
+  const q = projectName.match(/^(Q\d{5})\b/i);
+  if (q) return { code: q[1].toUpperCase(), entity: "sentinel" };
+  return null;
 }
 
-// "HWI-26-254" -> 2026.  Two-digit years 00-50 -> 2000-2050, 51-99 -> 1951-1999.
-function yearFromHwiCode(code: string): number | null {
-  const m = code.match(/^HWI-(\d{2})-/i);
+// "HWI-26-254" or "Q26001" -> 2026.
+// Two-digit years 00-50 -> 2000-2050, 51-99 -> 1951-1999.
+function yearFromJobCode(code: string): number | null {
+  const m = code.match(/^HWI-(\d{2})-/i) ?? code.match(/^Q(\d{2})\d{3}$/i);
   if (!m) return null;
   const yy = parseInt(m[1], 10);
   return yy < 51 ? 2000 + yy : 1900 + yy;
 }
 
-// Find a folder whose name STARTS with the HWI code followed by a comma or
+// Find a folder whose name STARTS with the job code followed by a comma or
 // space, so "HWI-26-25" can't accidentally match "HWI-26-254".
 function findProjectFolder(
   items: Array<{ folder?: unknown; name?: string }>,
-  hwiCode: string,
+  jobCode: string,
 ): { name: string } | null {
-  const code = hwiCode.toUpperCase();
+  const code = jobCode.toUpperCase();
   for (const it of items) {
     if (!it.folder || !it.name) continue;
     const upper = it.name.toUpperCase();
@@ -345,8 +354,11 @@ Deno.serve(async (req) => {
     // Read configuration from env (sensible defaults).
     const hostname = Deno.env.get("SHAREPOINT_PO_HOSTNAME") || "hydrowates.sharepoint.com";
     const sitePath = Deno.env.get("SHAREPOINT_PO_SITE_PATH") || "";
-    // The root folder is an existing path inside the document library.
-    const rootPath = (Deno.env.get("SHAREPOINT_PO_ROOT_FOLDER") || "Hydro-Wates/Commercial Proposals").trim();
+    // Root folders are existing paths inside the document library — one per
+    // entity. Hydro-Wates and Sentinel Instruments share the library but
+    // keep separate Commercial Proposals trees.
+    const hwRootPath = (Deno.env.get("SHAREPOINT_PO_ROOT_FOLDER") || "Hydro-Wates/Commercial Proposals").trim();
+    const sentinelRootPath = (Deno.env.get("SHAREPOINT_SENTINEL_ROOT_FOLDER") || "Sentinel Instruments/Commercial Proposals").trim();
     // Sub-folder inside each project folder where customer POs land,
     // separate from the proposal/quote documents the Hydro-Wates team puts
     // there manually. (Strategy B from the design discussion.)
@@ -358,19 +370,22 @@ Deno.serve(async (req) => {
     // separate subfolder again.
     const customerPoSubfolder = (Deno.env.get("SHAREPOINT_PO_SUBFOLDER") || "Purchase Order").trim();
 
-    // Hydro-Wates organizes Commercial Proposals as:
-    //   {root}/{YYYY} Commercial Proposals/HWI-YY-XXX, {description}, {customer}, {date}/
-    // So we need to (1) parse the HWI code, (2) navigate to the year folder,
-    // (3) find the project folder by HWI-code prefix, (4) create it on the
-    // fly if missing (so a customer can't break the upload by being early).
-    const hwiCode = parseHwiCode(project.name);
-    const year = hwiCode ? yearFromHwiCode(hwiCode) : null;
-    if (!hwiCode || !year) {
+    // Both entities organize Commercial Proposals the same way:
+    //   {root}/{YYYY} Commercial Proposals/{code}, {description}, {customer}, {date}/
+    // So we need to (1) parse the job code (which also picks the entity's
+    // root), (2) navigate to the year folder, (3) find the project folder by
+    // code prefix, (4) fall back to emailing sales@ if the folder is missing
+    // (so a customer can't break the upload by being early).
+    const job = parseJobCode(project.name);
+    const year = job ? yearFromJobCode(job.code) : null;
+    if (!job || !year) {
       throw new Error(
-        `Could not parse an HWI code (e.g. "HWI-26-254") from project name "${project.name}". ` +
-        `POs are filed in SharePoint by HWI code + year, so a non-HWI project name has no obvious destination.`,
+        `Could not parse a job code (e.g. "HWI-26-254" or "Q26001") from project name "${project.name}". ` +
+        `POs are filed in SharePoint by job code + year, so a project name without one has no obvious destination.`,
       );
     }
+    const jobCode = job.code;
+    const rootPath = job.entity === "sentinel" ? sentinelRootPath : hwRootPath;
     const yearFolder = `${year} Commercial Proposals`;
     const yearFolderPath = `${rootPath}/${yearFolder}`;
 
@@ -390,7 +405,7 @@ Deno.serve(async (req) => {
       );
     }
     const yearChildren = await listResp.json();
-    const existingMatch = findProjectFolder(yearChildren.value ?? [], hwiCode);
+    const existingMatch = findProjectFolder(yearChildren.value ?? [], jobCode);
 
     // Download the file from Supabase Storage via a short-lived signed URL.
     // We need the bytes either way: to upload to SharePoint OR to attach to
@@ -417,17 +432,17 @@ Deno.serve(async (req) => {
       const teamEmail = Deno.env.get("ADMIN_NOTIFY_EMAIL") || "sales@hydrowates.com";
       const portalUrl = Deno.env.get("PORTAL_URL") || "";
       const bodyHtml = brandedEmail({
-        preheader: `${file.name} arrived from ${customerName} — no folder yet for ${hwiCode}.`,
+        preheader: `${file.name} arrived from ${customerName} — no folder yet for ${jobCode}.`,
         title: "PO received — needs manual filing",
         bodyHtml: `
-          <p>A customer just uploaded a Purchase Order through the portal, but there's <strong>no matching project folder</strong> in SharePoint for this HWI code yet — likely because the proposal hasn't been sent out from your end.</p>
-          <p><strong>HWI code:</strong> ${esc(hwiCode)}<br/>
+          <p>A customer just uploaded a Purchase Order through the portal, but there's <strong>no matching project folder</strong> in SharePoint for this job code yet — likely because the proposal hasn't been sent out from your end.</p>
+          <p><strong>Job code:</strong> ${esc(jobCode)}<br/>
              <strong>Project name:</strong> ${esc(project.name)}<br/>
              <strong>Customer:</strong> ${esc(customerName)}<br/>
              <strong>PO filename:</strong> ${esc(file.name)}</p>
           ${renderProjectInfoBlock(project)}
           <p><strong>Expected SharePoint location:</strong><br/>
-             <code style="font-size:12px;color:#475569;">${esc(rootPath)}/${esc(yearFolder)}/${esc(hwiCode)}, &lt;description&gt;, ${esc(customerName)}, &lt;date&gt;/${esc(customerPoSubfolder)}/</code></p>
+             <code style="font-size:12px;color:#475569;">${esc(rootPath)}/${esc(yearFolder)}/${esc(jobCode)}, &lt;description&gt;, ${esc(customerName)}, &lt;date&gt;/${esc(customerPoSubfolder)}/</code></p>
           <p>The PO is attached to this email. Once you create the project folder in SharePoint, drop the attached file into its <code>${esc(customerPoSubfolder)}/</code> subfolder.</p>
         `,
         ctaLabel: portalUrl ? "View in portal" : undefined,
@@ -436,7 +451,7 @@ Deno.serve(async (req) => {
 
       await sendEmailWithAttachment(admin, {
         to: teamEmail,
-        subject: `PO received — no SharePoint folder yet for ${hwiCode} (${customerName})`,
+        subject: `PO received — no SharePoint folder yet for ${jobCode} (${customerName})`,
         bodyHtml,
         attachmentName: file.name,
         attachmentBytes: fileBytes,
@@ -457,7 +472,7 @@ Deno.serve(async (req) => {
         ok: true,
         status: "emailed",
         emailedTo: teamEmail,
-        reason: `No project folder matching ${hwiCode} found under ${yearFolder}`,
+        reason: `No project folder matching ${jobCode} found under ${yearFolder}`,
       });
     }
 
