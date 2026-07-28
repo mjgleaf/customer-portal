@@ -18,10 +18,16 @@ import { useAuth } from './AuthContext'
 //     A delta run costs ~10–20 Zoho calls, so continuous use all day stays
 //     around 2–4k calls, leaving headroom for the daily full sweep
 //     (~2 calls per contact) and every other Zoho consumer.
+//   * failure backoff — the success cooldown keys off the last SUCCESS, so
+//     without this an outage (like a spent daily quota) would retry on every
+//     page load. Each doomed run still costs a Zoho OAuth refresh, and Zoho
+//     throttles the token endpoint separately from the API quota.
 
 const LAST_SYNC_KEY = 'hwLastSyncAt'
 const SYNC_STARTED_KEY = 'hwSyncStartedAt'
+const SYNC_FAILED_KEY = 'hwSyncFailedAt'
 const SYNC_COOLDOWN_MS = 120_000
+const FAILURE_COOLDOWN_MS = 60_000
 // A run stuck longer than this (tab closed mid-sync, function timeout) stops
 // counting as in-flight so syncing can resume.
 const STALE_RUN_MS = 3 * 60_000
@@ -83,6 +89,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     const startedElsewhere = readStamp(SYNC_STARTED_KEY)
     if (startedElsewhere && Date.now() - startedElsewhere < STALE_RUN_MS) return
     if (!opts?.force && Date.now() - readStamp(LAST_SYNC_KEY) < SYNC_COOLDOWN_MS) return
+    if (!opts?.force && Date.now() - readStamp(SYNC_FAILED_KEY) < FAILURE_COOLDOWN_MS) return
 
     inFlight.current = true
     setSyncing(true)
@@ -101,6 +108,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
         } catch { /* body already consumed or not JSON */ }
         console.error('sync-zoho failed:', message)
         setLastError(message)
+        writeStamp(SYNC_FAILED_KEY, Date.now())
         return
       }
       // Lead notes are best-effort; ignored if sync-leads isn't deployed.
@@ -114,6 +122,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
         setLastSyncedAt(now)
         setLastError(null)
         writeStamp(LAST_SYNC_KEY, now)
+        writeStamp(SYNC_FAILED_KEY, null)
       }
     } finally {
       writeStamp(SYNC_STARTED_KEY, null)
