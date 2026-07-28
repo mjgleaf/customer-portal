@@ -220,15 +220,35 @@ function mapProjectStatus(zohoStatus: string): string {
 // Zoho Books approval workflow: an invoice moves draft → pending approval →
 // approved (or rejected) → sent. The customer must not see — or be emailed
 // about — an invoice until the PM marks it SENT in Zoho; approval alone
-// still keeps it internal. Depending on API version and org settings Zoho
-// reports the pre-sent state either as the top-level `status` or in
-// `current_sub_status`, so check both.
+// still keeps it internal.
+//
+// FAIL CLOSED: only a status that cannot exist before sending releases an
+// invoice. A block-list of pre-sent states leaks the moment Zoho reports a
+// state it doesn't anticipate — or formats one differently ("Pending
+// Approval" vs "pending_approval") — and a leak here emails the customer.
+// An unrecognized status therefore holds the invoice back; worst case a
+// legitimate invoice is late to the portal, which is visible and fixable,
+// unlike a premature email.
+const RELEASED_INVOICE_STATES = new Set([
+  "sent", "viewed", "unpaid", "overdue", "paid", "partially_paid", "partial", "void",
+]);
 const UNRELEASED_INVOICE_STATES = new Set(["draft", "pending_approval", "approved", "rejected"]);
 
+// Normalize Zoho's status strings for comparison and storage:
+// "Pending Approval" → "pending_approval".
+function normStatus(v: unknown): string {
+  return String(v ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+}
+
 function invoiceReleased(inv: { status?: string; current_sub_status?: string }): boolean {
-  const status = String(inv.status ?? "").toLowerCase();
-  const sub = String(inv.current_sub_status ?? "").toLowerCase();
-  return !UNRELEASED_INVOICE_STATES.has(status) && !UNRELEASED_INVOICE_STATES.has(sub);
+  if (!RELEASED_INVOICE_STATES.has(normStatus(inv.status))) return false;
+  // Depending on API version and org settings Zoho can report the pre-sent
+  // workflow state in `current_sub_status` while the top-level status reads
+  // as released — but a sent invoice may also carry a custom org-defined
+  // sub-status, so the sub-status is only checked against known pre-sent
+  // states rather than the released allow-list.
+  if (UNRELEASED_INVOICE_STATES.has(normStatus(inv.current_sub_status))) return false;
+  return true;
 }
 
 // Parse a Zoho date/timestamp into an ISO string, or null if absent/invalid.
@@ -731,18 +751,25 @@ Deno.serve(async (req) => {
     //    which is when the portal "receives" the invoice and the new-invoice
     //    email fires.
 
-    // Clean up any unreleased rows a prior sync may have stored before this
-    // rule existed. This also ensures that when such an invoice is later
-    // sent, it counts as genuinely new and triggers the notification.
-    await admin.from("cportal_invoices").delete()
-      .in("status", ["draft", "pending_approval", "approved", "rejected"]);
-
-    // Capture existing rows first so we can (a) detect genuinely new invoices
-    // for the notification email and (b) skip re-resolving the project link for
-    // invoices we've already checked in a prior sync.
+    // Capture existing rows BEFORE the cleanup delete below, so the
+    // new-invoice email dedup remembers every row that was in the portal when
+    // this sync started. If the cleanup ever removes a row for an invoice
+    // Zoho still reports as released, the upsert restores it in this same run
+    // without re-emailing anyone. Also used to skip re-resolving the project
+    // link for invoices we've already checked in a prior sync.
     const { data: existingInvoices } = await admin
       .from("cportal_invoices").select("zoho_invoice_id, project_id, project_synced_at");
     const existingInvIds = new Set((existingInvoices ?? []).map((i) => i.zoho_invoice_id));
+
+    // Purge every stored row that isn't in a known released state — fail
+    // closed, matching invoiceReleased above. This removes unreleased rows
+    // stored by any earlier version of this function, in whatever format it
+    // recorded the status. A purged invoice that the PM later marks sent is
+    // absent from the next sync's dedup snapshot, so it counts as genuinely
+    // new and triggers the notification.
+    const { error: purgeError } = await admin.from("cportal_invoices").delete()
+      .or(`status.is.null,status.not.in.(${[...RELEASED_INVOICE_STATES].join(",")})`);
+    if (purgeError) console.error("Unreleased-invoice purge failed:", purgeError.message);
     const priorLink = new Map(
       (existingInvoices ?? []).map((i) => [
         i.zoho_invoice_id,
@@ -782,7 +809,10 @@ Deno.serve(async (req) => {
       customer_id: custMap.get(String(inv.customer_id)) ?? null,
       project_id: resolved[i].projectId,
       invoice_number: inv.invoice_number ?? null,
-      status: inv.status ?? null,
+      // Stored normalized so the fail-closed cleanup above never mistakes a
+      // released row for an unrecognized one (which would delete + re-insert
+      // it every sync).
+      status: inv.status == null ? null : normStatus(inv.status),
       total: inv.total ?? null,
       balance: inv.balance ?? null,
       currency_code: inv.currency_code ?? null,
@@ -808,7 +838,7 @@ Deno.serve(async (req) => {
     for (let i = 0; i < invoices.length; i++) {
       const inv = invoices[i];
       if (existingInvIds.has(String(inv.invoice_id))) continue;
-      if (String(inv.status ?? "").toLowerCase() === "void") continue;
+      if (normStatus(inv.status) === "void") continue;
       const fallback = custEmail.get(custMap.get(String(inv.customer_id)) ?? "");
       for (const to of recipientsFor(resolved[i].projectId, fallback, true)) {
         await sendEmail(
