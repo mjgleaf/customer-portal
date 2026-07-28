@@ -263,6 +263,10 @@ export default function ProjectPage() {
 
   const [showAddMember, setShowAddMember] = useState(false)
   const [selectedUserId, setSelectedUserId] = useState('')
+  // The Add Member picker defaults to people at this project's company;
+  // adding someone from another company (an outside inspector, an owner's
+  // rep) requires flipping this explicitly.
+  const [showAllCompanies, setShowAllCompanies] = useState(false)
 
   useEffect(() => {
     if (!id) return
@@ -2318,7 +2322,7 @@ export default function ProjectPage() {
           <div className="flex items-center justify-between p-5 border-b border-gray-100">
             <h2 className="font-semibold text-gray-900">Members</h2>
             <button
-              onClick={() => setShowAddMember(true)}
+              onClick={() => { setSelectedUserId(''); setShowAllCompanies(false); setShowAddMember(true) }}
               className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 transition-colors"
             >
               <Plus size={15} />
@@ -2809,12 +2813,34 @@ export default function ProjectPage() {
       )}
 
       {/* Add member modal */}
-      {showAddMember && (
+      {showAddMember && (() => {
+        // Scope the picker to the project's company: a profile qualifies if it
+        // belongs to one of the company's Zoho contacts (matched by profile id
+        // or email via companyContacts) or its own company field matches. The
+        // company field alone isn't enough — profiles created before it was
+        // populated have it blank, which is why the contact match comes first.
+        const company = project?.customer?.company?.trim() || null
+        const contactUserIds = new Set(companyContacts.map(c => c.userId).filter(Boolean))
+        const contactEmails = new Set(
+          companyContacts.map(c => c.email?.toLowerCase()).filter((e): e is string => !!e),
+        )
+        const scopedProfiles = company
+          ? availableProfiles.filter(p =>
+              contactUserIds.has(p.id) ||
+              (p.email && contactEmails.has(p.email.toLowerCase())) ||
+              (p.company && p.company.trim().toLowerCase() === company.toLowerCase()))
+          : availableProfiles
+        const shownProfiles = showAllCompanies ? availableProfiles : scopedProfiles
+        return (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-xl">
             <h3 className="font-semibold text-gray-900 mb-4">Add Member</h3>
-            {availableProfiles.length === 0 ? (
-              <p className="text-gray-500 text-sm">All customers are already members.</p>
+            {shownProfiles.length === 0 ? (
+              <p className="text-gray-500 text-sm">
+                {showAllCompanies || !company
+                  ? 'All customers are already members.'
+                  : `Everyone at ${company} with a portal account is already a member. Contacts without an account can be invited from the list behind this dialog.`}
+              </p>
             ) : (
               <select
                 value={selectedUserId}
@@ -2822,12 +2848,20 @@ export default function ProjectPage() {
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
                 <option value="">Select a customer...</option>
-                {availableProfiles.map(p => (
+                {shownProfiles.map(p => (
                   <option key={p.id} value={p.id}>
                     {p.full_name || p.email}{p.company ? ` (${p.company})` : ''}
                   </option>
                 ))}
               </select>
+            )}
+            {company && (
+              <button
+                onClick={() => { setSelectedUserId(''); setShowAllCompanies(v => !v) }}
+                className="mt-2 text-xs text-blue-600 hover:text-blue-700 transition-colors"
+              >
+                {showAllCompanies ? `Show only people at ${company}` : 'Show people from other companies'}
+              </button>
             )}
             <div className="flex gap-3 mt-4">
               <button onClick={() => setShowAddMember(false)} className="flex-1 border border-gray-300 text-gray-700 py-2 rounded-lg text-sm hover:bg-gray-50 transition-colors">
@@ -2843,7 +2877,8 @@ export default function ProjectPage() {
             </div>
           </div>
         </div>
-      )}
+        )
+      })()}
     </div>
   )
 }
