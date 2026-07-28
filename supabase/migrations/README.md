@@ -49,5 +49,5 @@ Function bodies, trigger definitions, and policy expressions were extracted **ve
 - Edge functions (live under `supabase/functions/`, deployed separately)
 - Supabase Auth configuration (managed in the Dashboard)
 - Secrets like `MAIL_SENDER`, `POWER_AUTOMATE_RFQ_WEBHOOK_URL`, the Graph credentials (set via `supabase secrets set`)
-- The pg_cron schedule that runs `sync-zoho` and `sync-leads` hourly (lives in `cron.job`, see project memory notes)
+- ~~The pg_cron schedule that runs `sync-zoho` and `sync-leads` hourly~~ — verified 2026-07-28: pg_cron is NOT installed on LifeOSBase (`cron.job` doesn't exist), so there is no scheduled sync. Syncing happens from admin page loads (see `src/context/SyncContext.tsx`).
 - Microsoft 365 / Azure side configuration (app registration permissions, Application Access Policy, mailbox setup)

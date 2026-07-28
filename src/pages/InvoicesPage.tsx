@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Receipt, FileText, Search, ExternalLink } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
+import { useSync } from '../context/SyncContext'
 import type { Invoice } from '../types'
 
 // All-invoices view across every project the user has access to (RLS handles
@@ -53,8 +54,18 @@ export default function InvoicesPage() {
     void fetchInvoices()
   }, [])
 
-  async function fetchInvoices() {
-    setLoading(true)
+  // Refresh quietly when a background Zoho sync lands while this page is
+  // open (SyncContext kicks one on every page load for admins).
+  const { lastSyncedAt } = useSync()
+  const lastHandledSync = useRef(lastSyncedAt)
+  useEffect(() => {
+    if (!lastSyncedAt || lastSyncedAt === lastHandledSync.current) return
+    lastHandledSync.current = lastSyncedAt
+    void fetchInvoices(true)
+  }, [lastSyncedAt])
+
+  async function fetchInvoices(silent = false) {
+    if (!silent) setLoading(true)
     // RLS gates rows: customer sees own; admin sees all. The customer
     // embed pulls company name so admins can scan whose invoice is whose.
     const { data } = await supabase

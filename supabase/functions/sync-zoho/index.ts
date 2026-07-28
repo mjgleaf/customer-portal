@@ -1,8 +1,19 @@
 // Supabase Edge Function: sync-zoho
 // Pulls Customers (contacts), Projects, and Invoices from Zoho Books (US data
 // center) and upserts them into Supabase. Uses the service-role key, so it
-// bypasses RLS when writing. Callable by an admin (manual button) or by the
-// scheduled cron (which authenticates with the service-role key).
+// bypasses RLS when writing. Callable by an admin (the portal fires it in the
+// background on every page load) or by anything holding the service-role key.
+//
+// DELTA SYNC — the Zoho org has a hard budget of 10,000 API calls/day, and the
+// expensive part of a run is the two per-contact sweeps (detail + contact
+// persons ≈ 2N calls). Most runs therefore only sweep contacts whose
+// last_modified_time moved past the stored watermark (cportal_app_settings:
+// zoho_sync_watermark); projects/invoices stay full-list because those are a
+// handful of paginated calls. A full contact sweep still happens when the
+// caller passes { full: true }, when no watermark exists yet, or at most once
+// every 24h (cportal_app_settings: zoho_full_synced_at) — the daily pass
+// catches anything a delta can miss (e.g. a contact-person edit that doesn't
+// bump the parent contact's modified time).
 //
 // Also sends notification emails via Microsoft Graph (as the shared sales@
 // mailbox) on genuinely-new invoices (only once they're marked sent in Zoho
@@ -379,6 +390,23 @@ Deno.serve(async (req) => {
   }
   if (!allowed) return json({ error: "Not authorized" }, 403);
 
+  // Optional body: { full: true } forces a full contact sweep (all detail +
+  // contact-person calls) instead of the modified-since-watermark delta.
+  const reqBody = await req.json().catch(() => ({} as Record<string, unknown>));
+  const forceFull = (reqBody as { full?: boolean })?.full === true;
+
+  const readSetting = async (key: string): Promise<string | null> => {
+    const { data } = await admin
+      .from("cportal_app_settings").select("value").eq("key", key).maybeSingle();
+    return (data?.value as string | undefined) ?? null;
+  };
+  const writeSetting = async (key: string, value: string) => {
+    const { error } = await admin
+      .from("cportal_app_settings")
+      .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: "key" });
+    if (error) console.error(`app_settings write failed for ${key}:`, error.message);
+  };
+
   try {
     const orgId = Deno.env.get("ZOHO_ORG_ID")!;
     const accessToken = await getAccessToken();
@@ -394,12 +422,43 @@ Deno.serve(async (req) => {
     const summaryCustomers = allContacts.filter((c) => c.contact_type === "customer");
     const nonCustomers = allContacts.filter((c) => c.contact_type !== "customer");
 
+    // Decide which contacts get the expensive per-contact sweeps this run.
+    // Full sweep: forced by the caller, no watermark yet, or the daily pass
+    // is due. Delta sweep: only contacts Zoho reports as modified since the
+    // watermark (with a 5-min overlap for same-moment edits — watermark and
+    // last_modified_time are both Zoho-clock, so no cross-clock skew), plus
+    // any contact the portal doesn't have a row for yet, plus anything whose
+    // modified time we can't parse (fail open: unparseable = sweep it).
+    const FULL_SWEEP_EVERY_MS = 24 * 60 * 60 * 1000;
+    const WATERMARK_OVERLAP_MS = 5 * 60 * 1000;
+    const watermarkMs = Number(await readSetting("zoho_sync_watermark")) || 0;
+    const lastFullSweepMs = Number(await readSetting("zoho_full_synced_at")) || 0;
+    const fullSweep = forceFull || !watermarkMs ||
+      Date.now() - lastFullSweepMs > FULL_SWEEP_EVERY_MS;
+
+    const modifiedMs = (c: { last_modified_time?: unknown }): number =>
+      Date.parse(String(c.last_modified_time ?? ""));
+
+    let sweepCustomers = summaryCustomers;
+    if (!fullSweep) {
+      const { data: knownRows } = await admin
+        .from("cportal_customers").select("zoho_contact_id").not("zoho_contact_id", "is", null);
+      const knownZohoIds = new Set((knownRows ?? []).map((r) => String(r.zoho_contact_id)));
+      sweepCustomers = summaryCustomers.filter((c) => {
+        if (!knownZohoIds.has(String(c.contact_id))) return true;
+        const t = modifiedMs(c);
+        if (!Number.isFinite(t)) return true;
+        return t >= watermarkMs - WATERMARK_OVERLAP_MS;
+      });
+    }
+
     // The /contacts list endpoint returns only summary data — no addresses,
-    // no phone in the right shape. Fetch each customer's full detail record
-    // so we get billing_address and shipping_address. Run with bounded
+    // no phone in the right shape. Fetch each swept customer's full detail
+    // record so we get billing_address and shipping_address. Run with bounded
     // concurrency (5 at a time) to stay under Zoho's per-minute rate limit.
-    // For ~500 contacts at concurrency=5 this takes ~1–2 minutes.
-    const contacts = await mapWithConcurrency(summaryCustomers, 5, async (c) => {
+    // A full sweep of ~500 contacts at concurrency=5 takes ~1–2 minutes; a
+    // quiet delta sweep is zero calls here.
+    const contacts = await mapWithConcurrency(sweepCustomers, 5, async (c) => {
       const details = await fetchContactDetails(String(c.contact_id), accessToken, orgId);
       // Merge summary + details so we keep all fields. Detail wins on conflict.
       return { ...c, ...(details ?? {}) };
@@ -528,13 +587,24 @@ Deno.serve(async (req) => {
     }
 
     const personsByContactId = new Map<string, ContactPerson[]>();
-    // Lower concurrency than the 5 we use for fetchContactDetails — Zoho's
-    // /contactpersons endpoint is flakier under parallel load.
-    await mapWithConcurrency(summaryCustomers, 3, async (c) => {
+    // Same delta gating as the detail sweep: only swept contacts pay the
+    // per-contact call. Lower concurrency than the 5 we use for
+    // fetchContactDetails — Zoho's /contactpersons endpoint is flakier
+    // under parallel load.
+    await mapWithConcurrency(sweepCustomers, 3, async (c) => {
       const id = String(c.contact_id);
       const persons = await fetchContactPersons(id);
       if (persons.length) personsByContactId.set(id, persons);
     });
+
+    // Portal customer ids we actually swept this run — the deletion mirror
+    // below must not touch anyone else's contacts on a delta run (we didn't
+    // fetch their persons, so "not seen" means nothing for them).
+    const sweptPortalIds = new Set<string>();
+    for (const c of sweepCustomers) {
+      const pid = custMap.get(String(c.contact_id));
+      if (pid) sweptPortalIds.add(pid);
+    }
 
     const contactRows: Array<Record<string, unknown>> = [];
     const seenZohoCpids = new Set<string>();
@@ -578,14 +648,19 @@ Deno.serve(async (req) => {
 
     // Mirror Zoho: delete any source='zoho' contacts that no longer exist in
     // Zoho's contact_persons response. Leaves manual/sharepoint entries alone.
+    // Scoped to customers swept THIS run — on a delta run we never fetched
+    // the other customers' persons, so absence from seenZohoCpids says
+    // nothing about them (the daily full sweep covers org-wide cleanup).
     {
       const { data: existingZoho } = await admin
         .from("cportal_customer_contacts")
-        .select("id, zoho_contact_person_id")
+        .select("id, customer_id, zoho_contact_person_id")
         .eq("source", "zoho")
         .not("zoho_contact_person_id", "is", null);
       const stale = (existingZoho ?? []).filter(
-        (r) => r.zoho_contact_person_id && !seenZohoCpids.has(r.zoho_contact_person_id),
+        (r) => r.zoho_contact_person_id &&
+          sweptPortalIds.has(String(r.customer_id)) &&
+          !seenZohoCpids.has(r.zoho_contact_person_id),
       );
       if (stale.length) {
         const { error } = await admin
@@ -854,10 +929,27 @@ Deno.serve(async (req) => {
       }
     }
 
+    // Advance the watermark only after everything above succeeded — a failed
+    // run must leave it untouched so the next run re-sweeps the same window.
+    // Max over ALL summaries (not just swept ones) so the watermark tracks
+    // Zoho's clock even when the delta filter found nothing to sweep.
+    let maxModifiedMs = 0;
+    for (const c of summaryCustomers) {
+      const t = modifiedMs(c);
+      if (Number.isFinite(t) && t > maxModifiedMs) maxModifiedMs = t;
+    }
+    if (maxModifiedMs > watermarkMs) {
+      await writeSetting("zoho_sync_watermark", String(maxModifiedMs));
+    }
+    if (fullSweep) await writeSetting("zoho_full_synced_at", String(Date.now()));
+
     return json({
       ok: true,
+      mode: fullSweep ? "full" : "delta",
       synced: {
         customers: customerRows.length,
+        customersSwept: sweepCustomers.length,
+        customersTotal: summaryCustomers.length,
         projects: projectRows.length,
         invoices: invoiceRows.length,
         invoicesLinkedToProject: resolved.filter((r) => r.projectId).length,

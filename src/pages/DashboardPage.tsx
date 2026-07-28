@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { FolderOpen, RefreshCw, Search, Receipt, AlertCircle, ChevronDown, ChevronRight, HelpCircle } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
+import { useSync } from '../context/SyncContext'
 import type { Project } from '../types'
 
 function beganTime(p: Project): number {
@@ -31,8 +32,6 @@ function formatRelativeTime(ts: number | null): string {
   return `${days}d ago`
 }
 
-const LAST_SYNC_KEY = 'hwLastSyncAt'
-
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')
 
 export default function DashboardPage() {
@@ -43,13 +42,11 @@ export default function DashboardPage() {
   // "missing documents" reminders — that's the customer/admin paperwork
   // workflow. Suppress action items + the action banner for them.
   const showActionItems = profile?.role !== 'service_tech'
+  // Syncing runs app-wide now (SyncContext fires it on every page load);
+  // the dashboard just displays its state and refetches when a run lands.
+  const { syncing, lastSyncedAt, lastError } = useSync()
   const [projects, setProjects] = useState<Project[]>([])
   const [loading, setLoading] = useState(true)
-  const [syncing, setSyncing] = useState(false)
-  const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(() => {
-    const v = typeof localStorage !== 'undefined' ? localStorage.getItem(LAST_SYNC_KEY) : null
-    return v ? Number(v) : null
-  })
   const [search, setSearch] = useState('')
   const [stats, setStats] = useState<{
     outstanding: number
@@ -67,14 +64,18 @@ export default function DashboardPage() {
     if (profile.role === 'admin') fetchStats()
   }, [profile])
 
-  // Auto-sync on dashboard load (admin only). Throttled — if we synced less
-  // than a minute ago, skip the round-trip to Zoho / SharePoint.
+  // When a background sync completes while this page is open, refresh the
+  // project list (and invoice stats) so the new Zoho data shows up without
+  // a manual reload. The ref skips the initial render — the mount effect
+  // above already fetched.
+  const lastHandledSync = useRef(lastSyncedAt)
   useEffect(() => {
-    if (!isAdmin) return
-    const last = lastSyncedAt ?? 0
-    if (Date.now() - last > 60_000) handleSync()
+    if (!lastSyncedAt || lastSyncedAt === lastHandledSync.current) return
+    lastHandledSync.current = lastSyncedAt
+    fetchProjects(true)
+    if (isAdmin) fetchStats()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAdmin])
+  }, [lastSyncedAt])
 
   // Admin dashboard opens with every company collapsed (once, on first load).
   useEffect(() => {
@@ -83,9 +84,11 @@ export default function DashboardPage() {
     didInitCollapse.current = true
   }, [projects, isAdmin])
 
-  async function fetchProjects() {
+  // silent = refresh data without flashing the loading spinner (used when a
+  // background sync lands while the user is looking at the page).
+  async function fetchProjects(silent = false) {
     if (!profile) return
-    setLoading(true)
+    if (!silent) setLoading(true)
     // RLS returns exactly the projects this user may see: admins get all;
     // customers get their own (matched by Zoho contact email, or manual membership).
     const { data } = await supabase
@@ -143,32 +146,6 @@ export default function DashboardPage() {
       if (!isNaN(b) && b > 0) { outstanding += b; if (i.currency_code) currency = i.currency_code }
     }
     setStats({ outstanding, currency })
-  }
-
-  // Runs in the background on dashboard load (admin only). Pulls Zoho + the
-  // SharePoint lead notes, then refreshes the project list. Stamps the last
-  // sync time in localStorage so we can show "Last synced 5 min ago".
-  async function handleSync() {
-    setSyncing(true)
-    const { data, error } = await supabase.functions.invoke('sync-zoho', { body: {} })
-    if (error) {
-      console.error('sync-zoho failed:', error.message)
-      setSyncing(false)
-      return
-    }
-    // Lead notes are best-effort; ignored if sync-leads isn't deployed.
-    try {
-      await supabase.functions.invoke('sync-leads', { body: {} })
-    } catch {
-      // sync-leads not available
-    }
-    setSyncing(false)
-    if (data?.synced) {
-      const now = Date.now()
-      setLastSyncedAt(now)
-      try { localStorage.setItem(LAST_SYNC_KEY, String(now)) } catch { /* private mode */ }
-      fetchProjects()
-    }
   }
 
   // Default order: newest first. Companies are alphabetical (grouped below);
@@ -301,6 +278,14 @@ export default function DashboardPage() {
             {syncing
               ? <><RefreshCw size={11} className="animate-spin" /> Syncing now…</>
               : <><RefreshCw size={11} /> Last synced {formatRelativeTime(lastSyncedAt)}</>}
+          </p>
+        )}
+        {isAdmin && !syncing && lastError && (
+          <p className="text-amber-600 text-xs mt-1 flex items-center gap-1.5">
+            <AlertCircle size={11} className="flex-shrink-0" />
+            {/Zoho.*exceeded the maximum call rate/i.test(lastError)
+              ? "Zoho's daily API limit is used up — syncing resumes after Zoho's overnight reset."
+              : `Last sync failed (${lastError.length > 90 ? lastError.slice(0, 90) + '…' : lastError}) — retries on next page load.`}
           </p>
         )}
       </div>

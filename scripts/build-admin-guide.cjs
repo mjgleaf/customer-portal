@@ -222,8 +222,8 @@ children.push(h2("Artificial intelligence (Claude)"));
 children.push(p("Anthropic's Claude is used in two places: classifying emailed POs (above), and the admin “Analyze with AI” button, which reads a PO PDF and returns a summary, possible concerns, and extracted fields. This costs a few cents per analysis and is admin-only."));
 children.push(h2("How often each source syncs"));
 children.push(table([3100, 3100, 3160], ["Source / job", "Trigger", "Timing"], [
-  ["Zoho (sync-zoho)", "Scheduled + manual button", "Regularly / on demand"],
-  ["SharePoint Lead List (sync-leads)", "Scheduled + manual button", "Regularly / on demand"],
+  ["Zoho (sync-zoho)", "Every page load in admin sessions", "Continuous while an admin is using the portal"],
+  ["SharePoint Lead List (sync-leads)", "Every page load in admin sessions", "Continuous while an admin is using the portal"],
   ["SharePoint files & certificates", "Opening a project page", "On demand"],
   ["Emailed POs", "Power Automate (email arrives)", "Real-time"],
   ["Quote requests", "Customer submits form", "Real-time"],

@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { Users, Search, Mail, Check, Clock } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../context/AuthContext'
+import { useSync } from '../context/SyncContext'
 import type { Customer } from '../types'
 
 // Normalized company key — same basis the detail page uses to group peers.
@@ -28,14 +29,8 @@ export default function CustomersPage() {
   // we're about to invite, or null when the modal is closed.
   const [pendingInvite, setPendingInvite] = useState<Customer | null>(null)
 
-  useEffect(() => {
-    if (!profile) return
-    if (profile.role !== 'admin') { navigate('/'); return }
-    fetchData()
-  }, [profile])
-
-  async function fetchData() {
-    setLoading(true)
+  async function fetchData(silent = false) {
+    if (!silent) setLoading(true)
     const { data: custs } = await supabase.from('cportal_customers').select('*').order('company', { ascending: true })
     const { data: contactRows } = await supabase.from('cportal_customer_contacts').select('customer_id, email')
 
@@ -74,6 +69,23 @@ export default function CustomersPage() {
     setCustomers(list)
     setLoading(false)
   }
+
+  useEffect(() => {
+    if (!profile) return
+    if (profile.role !== 'admin') { navigate('/'); return }
+    fetchData()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile])
+
+  // Refresh quietly when a background Zoho sync lands while this page is
+  // open (SyncContext kicks one on every page load for admins).
+  const { lastSyncedAt } = useSync()
+  const lastHandledSync = useRef(lastSyncedAt)
+  useEffect(() => {
+    if (!lastSyncedAt || lastSyncedAt === lastHandledSync.current) return
+    lastHandledSync.current = lastSyncedAt
+    void fetchData(true)
+  }, [lastSyncedAt])
 
   async function invite(customer: Customer) {
     if (!customer.email) return
