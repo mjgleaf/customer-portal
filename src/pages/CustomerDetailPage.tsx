@@ -282,35 +282,44 @@ export default function CustomerDetailPage() {
     setActionMsg({ kind: 'success', text: `${name} now has access to ${pickerSelected.size} project${pickerSelected.size === 1 ? '' : 's'}.` })
   }
 
+  // Adds write through to Zoho Books (via the add-customer-contact function)
+  // so the contact survives the hourly sync mirror; a plain local insert
+  // would be duplicated the moment the same person is added in Zoho.
   async function handleAddContact(e: FormEvent) {
     e.preventDefault()
     if (!newEmail.trim() || !customer) return
     setSaving(true)
     setError('')
-    const { error: insErr } = await supabase.from('cportal_customer_contacts').insert({
-      customer_id: customer.id,
-      name: newName.trim() || null,
-      email: newEmail.trim().toLowerCase(),
-      role: newRole.trim() || null,
-      phone: newPhone.trim() || null,
-      source: 'manual',
+    const { data, error: insErr } = await supabase.functions.invoke('add-customer-contact', {
+      body: {
+        customerId: customer.id,
+        name: newName.trim(),
+        email: newEmail.trim().toLowerCase(),
+        role: newRole.trim(),
+        phone: newPhone.trim(),
+      },
     })
     setSaving(false)
-    if (insErr) { setError(insErr.message); return }
+    if (insErr || data?.error) { setError(data?.error || insErr?.message || 'Failed to add contact.'); return }
     setNewName(''); setNewEmail(''); setNewRole(''); setNewPhone('')
     setShowAdd(false)
-    setActionMsg({ kind: 'success', text: 'Contact added.' })
-    setTimeout(() => setActionMsg(null), 4000)
+    setActionMsg(data?.warning
+      ? { kind: 'error', text: data.warning }
+      : { kind: 'success', text: 'Contact added and synced to Zoho.' })
+    setTimeout(() => setActionMsg(null), 6000)
     void fetchData()
   }
 
   async function handleDelete(contact: ContactRow) {
     if (!contact.id) return // primary emails can't be deleted from here
     if (!confirm(`Remove ${contact.name || contact.email} from contacts?`)) return
-    const { error: delErr } = await supabase
-      .from('cportal_customer_contacts').delete().eq('id', contact.id)
-    if (delErr) {
-      setActionMsg({ kind: 'error', text: delErr.message })
+    // Deletes through the same function so Zoho-linked contacts are removed
+    // in Zoho too — otherwise the next sync would just restore them.
+    const { data, error: delErr } = await supabase.functions.invoke('add-customer-contact', {
+      body: { action: 'delete', contactId: contact.id },
+    })
+    if (delErr || data?.error) {
+      setActionMsg({ kind: 'error', text: data?.error || delErr?.message || 'Failed to remove contact.' })
     } else {
       setActionMsg({ kind: 'success', text: 'Contact removed.' })
       setTimeout(() => setActionMsg(null), 4000)

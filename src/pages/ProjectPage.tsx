@@ -267,6 +267,12 @@ export default function ProjectPage() {
   // adding someone from another company (an outside inspector, an owner's
   // rep) requires flipping this explicitly.
   const [showAllCompanies, setShowAllCompanies] = useState(false)
+  // "New Contact" form on the Members tab: creates a person on the
+  // project's customer record and writes through to Zoho Books.
+  const [showNewContact, setShowNewContact] = useState(false)
+  const [newContact, setNewContact] = useState({ name: '', email: '', phone: '', role: '' })
+  const [newContactSaving, setNewContactSaving] = useState(false)
+  const [newContactError, setNewContactError] = useState('')
 
   useEffect(() => {
     if (!id) return
@@ -713,8 +719,10 @@ export default function ProjectPage() {
   }
 
   // Pull every Zoho customer contact whose company matches this project's
-  // company, then enrich with status info (member / has account / pending)
-  // so the Members tab can render the right action per row.
+  // company — plus the individual people on those customer records
+  // (cportal_customer_contacts: Zoho contact persons and manual adds) —
+  // then enrich with status info (member / has account / pending) so the
+  // Members tab can render the right action per row.
   async function fetchCompanyContacts() {
     const company = project?.customer?.company
     if (!company) { setCompanyContacts([]); return }
@@ -723,7 +731,31 @@ export default function ProjectPage() {
       .select('id, name, email, company')
       .eq('company', company)
     if (!customers || customers.length === 0) { setCompanyContacts([]); return }
-    const emails = customers.map(c => c.email).filter((e): e is string => !!e)
+
+    const { data: persons } = await supabase
+      .from('cportal_customer_contacts')
+      .select('id, customer_id, name, email')
+      .in('customer_id', customers.map(c => c.id))
+
+    // Dedupe people against the customer rows (which win) and each other.
+    const customerEmails = new Set(
+      customers.map(c => c.email?.toLowerCase()).filter((e): e is string => !!e),
+    )
+    const seenPersonEmails = new Set<string>()
+    const personRows = (persons ?? []).filter(p => {
+      const em = p.email?.toLowerCase()
+      if (!em || customerEmails.has(em) || seenPersonEmails.has(em)) return false
+      seenPersonEmails.add(em)
+      return true
+    })
+
+    // Query profiles with both raw and lowercased emails so a
+    // differently-cased customer email still matches its profile.
+    const rawEmails = [
+      ...customers.map(c => c.email),
+      ...personRows.map(p => p.email),
+    ].filter((e): e is string => !!e)
+    const emails = [...new Set([...rawEmails, ...rawEmails.map(e => e.toLowerCase())])]
     let profileByEmail = new Map<string, string>()
     if (emails.length > 0) {
       const { data: profs } = await supabase
@@ -733,15 +765,20 @@ export default function ProjectPage() {
         .map(p => [p.email.toLowerCase(), p.id]))
     }
     const memberUserIds = new Set(members.map(m => m.user_id))
-    const contacts: CompanyContact[] = customers.map(c => {
-      const userId = c.email ? profileByEmail.get(c.email.toLowerCase()) : undefined
+    const toContact = (key: string, name: string | null, email: string | null): CompanyContact => {
+      const userId = email ? profileByEmail.get(email.toLowerCase()) : undefined
       let status: CompanyContact['status']
       if (userId && memberUserIds.has(userId)) status = 'member'
       else if (userId) status = 'has_account'
       else status = 'pending'
-      return { customerId: c.id, name: c.name, email: c.email, status, userId }
-    })
-    setCompanyContacts(contacts)
+      return { customerId: key, name, email, status, userId }
+    }
+    setCompanyContacts([
+      ...customers.map(c => toContact(c.id, c.name, c.email)),
+      // Prefixed key: these ids live in cportal_customer_contacts, not
+      // cportal_customers; the key is only used for row identity/actions.
+      ...personRows.map(p => toContact(`cc:${p.id}`, p.name, p.email)),
+    ])
   }
 
   // Recompute company contacts whenever the project or members change,
@@ -1047,6 +1084,35 @@ export default function ProjectPage() {
     setSelectedUserId('')
     fetchMembers()
     fetchAvailableProfiles()
+  }
+
+  // Create a person on the project's customer record. The edge function
+  // writes through to Zoho Books (contact person) so the hourly sync keeps
+  // the row; if Zoho can't be updated it saves portal-only and says so.
+  async function handleCreateContact() {
+    const custId = project?.customer_id
+    const email = newContact.email.trim().toLowerCase()
+    if (!custId || !email) return
+    setNewContactSaving(true)
+    setNewContactError('')
+    const { data, error } = await supabase.functions.invoke('add-customer-contact', {
+      body: {
+        customerId: custId,
+        name: newContact.name.trim(),
+        email,
+        phone: newContact.phone.trim(),
+        role: newContact.role.trim(),
+      },
+    })
+    setNewContactSaving(false)
+    if (error || data?.error) {
+      setNewContactError(data?.error || error?.message || 'Failed to add contact.')
+      return
+    }
+    setShowNewContact(false)
+    setNewContact({ name: '', email: '', phone: '', role: '' })
+    setContactActionMsg(data?.warning || `${email} added and synced to Zoho. You can now invite them below.`)
+    fetchCompanyContacts()
   }
 
   async function handleRemoveMember(memberId: string) {
@@ -2321,13 +2387,24 @@ export default function ProjectPage() {
         <div className="bg-white border border-gray-200 rounded-xl">
           <div className="flex items-center justify-between p-5 border-b border-gray-100">
             <h2 className="font-semibold text-gray-900">Members</h2>
-            <button
-              onClick={() => { setSelectedUserId(''); setShowAllCompanies(false); setShowAddMember(true) }}
-              className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 transition-colors"
-            >
-              <Plus size={15} />
-              Add Member
-            </button>
+            <div className="flex items-center gap-2">
+              {project?.customer_id && (
+                <button
+                  onClick={() => { setNewContact({ name: '', email: '', phone: '', role: '' }); setNewContactError(''); setShowNewContact(true) }}
+                  className="flex items-center gap-2 border border-gray-300 text-gray-700 px-3 py-2 rounded-lg text-sm font-semibold hover:bg-gray-50 transition-colors"
+                >
+                  <Plus size={15} />
+                  New Contact
+                </button>
+              )}
+              <button
+                onClick={() => { setSelectedUserId(''); setShowAllCompanies(false); setShowAddMember(true) }}
+                className="flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 transition-colors"
+              >
+                <Plus size={15} />
+                Add Member
+              </button>
+            </div>
           </div>
 
           {contactActionMsg && (
@@ -2806,6 +2883,68 @@ export default function ProjectPage() {
                 className="flex-1 bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-red-700 disabled:opacity-50 transition-colors"
               >
                 Remove
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New contact modal — creates a person on the project's customer
+          record and writes through to Zoho Books */}
+      {showNewContact && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-xl">
+            <h3 className="font-semibold text-gray-900 mb-1">New Contact</h3>
+            <p className="text-xs text-gray-500 mb-4">
+              Added to {project?.customer?.company || 'this customer'} in the portal and in Zoho Books.
+            </p>
+            <div className="space-y-3">
+              <input
+                type="text"
+                placeholder="Name"
+                value={newContact.name}
+                onChange={e => setNewContact(c => ({ ...c, name: e.target.value }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <input
+                type="email"
+                placeholder="Email (required)"
+                value={newContact.email}
+                onChange={e => setNewContact(c => ({ ...c, email: e.target.value }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <input
+                type="tel"
+                placeholder="Phone (optional)"
+                value={newContact.phone}
+                onChange={e => setNewContact(c => ({ ...c, phone: e.target.value }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <input
+                type="text"
+                placeholder="Role, e.g. Accounts Payable (optional)"
+                value={newContact.role}
+                onChange={e => setNewContact(c => ({ ...c, role: e.target.value }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            {newContactError && (
+              <p className="text-xs text-red-600 mt-3">{newContactError}</p>
+            )}
+            <div className="flex gap-3 mt-4">
+              <button
+                onClick={() => setShowNewContact(false)}
+                disabled={newContactSaving}
+                className="flex-1 border border-gray-300 text-gray-700 py-2 rounded-lg text-sm hover:bg-gray-50 disabled:opacity-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleCreateContact}
+                disabled={newContactSaving || !newContact.email.trim()}
+                className="flex-1 bg-blue-600 text-white py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                {newContactSaving ? 'Saving…' : 'Save Contact'}
               </button>
             </div>
           </div>
