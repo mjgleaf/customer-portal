@@ -234,6 +234,16 @@ Deno.serve(async (req) => {
       return ` ${hay} `.includes(` ${needle} `);
     }
 
+    // Near-prefix: equal up to a short trailing tail (≤2 chars). Catches
+    // singular/plural and small typos — "hampton roads connector partner"
+    // (folder) vs "... partners" (customer record) — which word-boundary
+    // containment rejects because "partner" isn't a whole word of
+    // "partners".
+    function nearPrefix(a: string, b: string): boolean {
+      const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+      return long.startsWith(short) && long.length - short.length <= 2;
+    }
+
     function matchCustomer(segments: string[]): { id: string; email: string | null } | null {
       // Pass 1: exact normalized match on any segment. A folder name can
       // only link when every matching segment agrees on ONE customer.
@@ -254,7 +264,7 @@ Deno.serve(async (req) => {
         for (const [k, v] of byNorm) {
           if (!v) continue;
           if (Math.min(k.length, key.length) < 6) continue;
-          if (!containsWords(k, key) && !containsWords(key, k)) continue;
+          if (!containsWords(k, key) && !containsWords(key, k) && !nearPrefix(k, key)) continue;
           if (found && found.id !== v.id) return null; // ambiguous
           found = v;
         }
