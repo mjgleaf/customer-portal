@@ -24,6 +24,8 @@
 // multi-office company must not have every office's invoices land with one
 // person. Honors each user's email_notifications preference and the
 // app_settings.emails_paused kill switch; best-effort if creds are unset.
+// New-invoice emails additionally require app_settings.invoice_emails_paused
+// to be "false" — absent or anything else means they stay off.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -226,6 +228,17 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T)
 
 function mapProjectStatus(zohoStatus: string): string {
   return zohoStatus === "active" ? "active" : "completed";
+}
+
+// Job-code convention shared with the SharePoint functions: Hydro-Wates jobs
+// are "HWI-26-254"-style, Sentinel Instruments jobs "Q26001"-style. Used to
+// match a newly-awarded Zoho project to its pre-award quoted row.
+function parseJobCode(name: string): string | null {
+  const hwi = name.match(/^(HWI-\d{2}-\d+)/i);
+  if (hwi) return hwi[1].toUpperCase();
+  const q = name.match(/^(Q\d{5})\b/i);
+  if (q) return q[1].toUpperCase();
+  return null;
 }
 
 // Zoho Books approval workflow: an invoice moves draft → pending approval →
@@ -673,8 +686,23 @@ Deno.serve(async (req) => {
 
     // 2) Projects — capture existing statuses first so we can detect changes
     const { data: existingProjects } = await admin
-      .from("cportal_projects").select("zoho_project_id, status").not("zoho_project_id", "is", null);
-    const oldStatus = new Map((existingProjects ?? []).map((p) => [p.zoho_project_id, p.status]));
+      .from("cportal_projects").select("id, zoho_project_id, name, status");
+    const oldStatus = new Map(
+      (existingProjects ?? [])
+        .filter((p) => p.zoho_project_id)
+        .map((p) => [p.zoho_project_id, p.status]),
+    );
+
+    // Rows with no Zoho link are pre-award projects created by
+    // sync-projects-from-sharepoint (status 'quoted'). Index them by job code
+    // so a newly-awarded Zoho project CLAIMS its quoted row instead of
+    // inserting a duplicate.
+    const unclaimedByCode = new Map<string, string>();
+    for (const p of existingProjects ?? []) {
+      if (p.zoho_project_id) continue;
+      const code = parseJobCode(String(p.name ?? ""));
+      if (code && !unclaimedByCode.has(code)) unclaimedByCode.set(code, p.id);
+    }
 
     const projects = await fetchAll("projects", "projects", accessToken, orgId);
     const projectRows = projects.map((p) => ({
@@ -686,8 +714,36 @@ Deno.serve(async (req) => {
       started_on: toIso(p.created_time ?? p.start_date ?? p.created_date),
       updated_at: new Date().toISOString(),
     }));
-    if (projectRows.length) {
-      const { error } = await admin.from("cportal_projects").upsert(projectRows, { onConflict: "zoho_project_id" });
+
+    // Claim pass: a Zoho project we haven't stored yet whose job code matches
+    // a quoted row updates that row in place. started_on is deliberately NOT
+    // overwritten (the proposal date predates the Zoho project's creation),
+    // and a null Zoho customer link must not clobber the folder-name match.
+    const toUpsert: typeof projectRows = [];
+    for (const row of projectRows) {
+      const claimId = oldStatus.has(row.zoho_project_id)
+        ? undefined
+        : unclaimedByCode.get(parseJobCode(row.name) ?? "");
+      if (!claimId) { toUpsert.push(row); continue; }
+      const patch: Record<string, unknown> = {
+        zoho_project_id: row.zoho_project_id,
+        name: row.name,
+        description: row.description,
+        status: row.status,
+        updated_at: row.updated_at,
+      };
+      if (row.customer_id) patch.customer_id = row.customer_id;
+      const { error } = await admin.from("cportal_projects").update(patch).eq("id", claimId);
+      if (error) {
+        console.error(`Quoted-project claim failed for ${row.name}: ${error.message}`);
+        toUpsert.push(row); // fall back to a plain insert rather than losing the project
+      } else {
+        unclaimedByCode.delete(parseJobCode(row.name) ?? "");
+        console.log(`[claim] "${row.name}" took over quoted project ${claimId}`);
+      }
+    }
+    if (toUpsert.length) {
+      const { error } = await admin.from("cportal_projects").upsert(toUpsert, { onConflict: "zoho_project_id" });
       if (error) throw error;
     }
 
@@ -910,7 +966,14 @@ Deno.serve(async (req) => {
     // customer already has a portal account (a cportal_profiles row is created
     // at invite time, so its presence means they've been invited/registered —
     // cold customers should not receive "view it in your portal" emails).
-    for (let i = 0; i < invoices.length; i++) {
+    // Invoice emails have their own kill switch on top of emails_paused:
+    // paused unless app_settings.invoice_emails_paused is explicitly "false"
+    // (same fail-closed convention as emails_paused). Status-change emails
+    // above are unaffected.
+    const { data: invEmailSetting } = await admin
+      .from("cportal_app_settings").select("value").eq("key", "invoice_emails_paused").maybeSingle();
+    const invoiceEmailsEnabled = invEmailSetting?.value === "false";
+    for (let i = 0; invoiceEmailsEnabled && i < invoices.length; i++) {
       const inv = invoices[i];
       if (existingInvIds.has(String(inv.invoice_id))) continue;
       if (normStatus(inv.status) === "void") continue;
@@ -928,6 +991,7 @@ Deno.serve(async (req) => {
         );
       }
     }
+    if (!invoiceEmailsEnabled) console.log("[invoice emails paused] skipped new-invoice notifications");
 
     // Advance the watermark only after everything above succeeded — a failed
     // run must leave it untouched so the next run re-sweeps the same window.

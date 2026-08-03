@@ -178,6 +178,11 @@ export default function DashboardPage() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          {project.status === 'quoted' && (
+            <span className="text-xs font-semibold px-2 py-1 rounded-full text-purple-700 bg-purple-100">
+              Quoted
+            </span>
+          )}
           {mentionProjects.has(project.id) && (
             <span className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-full text-red-700 bg-red-100">
               <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
@@ -218,6 +223,11 @@ export default function DashboardPage() {
         <span className="text-sm font-medium text-gray-900 truncate group-hover:text-blue-700 transition-colors">
           {project.name}
         </span>
+        {project.status === 'quoted' && (
+          <span className="flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded-full text-purple-700 bg-purple-100">
+            Quoted
+          </span>
+        )}
         {mentionProjects.has(project.id) && (
           <span className="inline-flex items-center gap-1 flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded-full text-red-700 bg-red-100">
             <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
