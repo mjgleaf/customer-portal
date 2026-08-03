@@ -396,7 +396,7 @@ Deno.serve(async (req) => {
     // backfill source_created_at on rows that pre-date that column.
     const { data: existingRows } = await admin
       .from("cportal_files")
-      .select("id, sharepoint_source_id, source_created_at")
+      .select("id, sharepoint_source_id, source_created_at, kind")
       .eq("project_id", projectId)
       .not("sharepoint_source_id", "is", null);
     const existing = new Map<string, { id: string; needsSourceDate: boolean }>();
@@ -417,6 +417,13 @@ Deno.serve(async (req) => {
     // under their own summary bucket.
     const ROOT_CERT_KEY = "Project root (Certificates)";
     summary[ROOT_CERT_KEY] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, removed: 0, errors: 0 };
+    // Fresh proposals often have the quote PDF at the project folder root
+    // (named "<job code>, ....pdf") before anyone files it into Quote/.
+    // When the project has no quote from the Quote/ subfolder, root PDFs
+    // carrying the job-code prefix are picked up as quotes.
+    const ROOT_QUOTE_KEY = "Project root (Quote PDFs)";
+    summary[ROOT_QUOTE_KEY] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, removed: 0, errors: 0 };
+    let hasQuoteFile = (existingRows ?? []).some((r) => r.kind === "quote");
 
     // 3. Iterate each subfolder, sync new files. Skipped when certsOnly is
     // set — useful for targeted bulk runs that only want root-level
@@ -488,6 +495,7 @@ Deno.serve(async (req) => {
           }
           existing.set(item.id, { id: insertedRow.id, needsSourceDate: false });
           summary[sub.spName].added++;
+          if (sub.portalKind === "quote") hasQuoteFile = true;
         } catch (e) {
           console.error(`Sync failed for ${item.name}:`, e);
           summary[sub.spName].errors++;
@@ -764,6 +772,53 @@ Deno.serve(async (req) => {
       } catch (e) {
         console.error(`Root cert sync failed for ${item.name}:`, e);
         summary[ROOT_CERT_KEY].errors++;
+      }
+    }
+
+    // 5. Root-level quote PDFs — only when the project has no quote at all
+    // (from the Quote/ subfolder or a prior sync), so a quote that exists in
+    // both places doesn't show up twice. Job-code prefix is the filter:
+    // quotes are exported as "<folder name>.pdf", certificates and other
+    // root files don't start with the code. Skipped for certsOnly runs.
+    if (!certsOnly && !hasQuoteFile) for (const item of rootChildren) {
+      if (item.folder || !item.id || !item.name) continue;
+      if (!item.name.toUpperCase().startsWith(hwiCode)) continue;
+      if (!isPdf(item)) {
+        summary[ROOT_QUOTE_KEY].pdfFiltered++;
+        continue;
+      }
+
+      const prior = existing.get(item.id);
+      if (prior) {
+        summary[ROOT_QUOTE_KEY].skipped++;
+        continue;
+      }
+
+      // Reference-only insert, same shape as the Quote/ subfolder rows.
+      try {
+        const { data: insertedRow, error: insErr } = await admin.from("cportal_files").insert({
+          project_id: projectId,
+          name: item.name,
+          storage_path: null,
+          size: item.size ?? null,
+          mime_type: item.file?.mimeType || "application/pdf",
+          kind: "quote",
+          sharepoint_source_id: item.id,
+          source_created_at: item.createdDateTime || null,
+          sharepoint_synced_at: new Date().toISOString(),
+          sharepoint_path: item.webUrl || "synced-from-sharepoint",
+        }).select("id").single();
+        if (insErr || !insertedRow) {
+          console.error(`Root quote insert failed for ${item.name}: ${insErr?.message}`);
+          summary[ROOT_QUOTE_KEY].errors++;
+          continue;
+        }
+        existing.set(item.id, { id: insertedRow.id, needsSourceDate: false });
+        summary[ROOT_QUOTE_KEY].added++;
+        hasQuoteFile = true;
+      } catch (e) {
+        console.error(`Root quote sync failed for ${item.name}:`, e);
+        summary[ROOT_QUOTE_KEY].errors++;
       }
     }
 

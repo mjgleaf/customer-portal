@@ -395,7 +395,7 @@ Deno.serve(async (req) => {
       const folderPath = code ? folderPathByCode.get(code) : undefined;
       if (!folderPath) return; // prior-year folder or renamed/removed — skip
       summary.quoteFoldersChecked++;
-      let items: Awaited<ReturnType<typeof listChildren>>;
+      let items: Awaited<ReturnType<typeof listChildren>> = [];
       try {
         items = await listChildren(driveId, `${folderPath}/Quote`, token);
       } catch (e) {
@@ -403,11 +403,27 @@ Deno.serve(async (req) => {
         // No Quote subfolder yet (fresh proposal) — perfectly normal.
         if (!msg.includes("404") && !msg.includes("itemNotFound")) {
           summary.errors.push(`quote ${p.name}: ${msg}`);
+          return;
         }
-        return;
       }
-      for (const item of items) {
-        if (item.folder || !item.id || !item.name || !isPdf(item)) continue;
+      let quotePdfs = items.filter((it) => !it.folder && it.id && it.name && isPdf(it));
+      // Fresh proposals often have the quote PDF sitting at the project
+      // folder ROOT (named "<job code>, ....pdf") before anyone files it
+      // into Quote/. Fall back to root PDFs that start with the job code —
+      // certificates and other root PDFs don't carry that prefix.
+      if (quotePdfs.length === 0) {
+        try {
+          const rootItems = await listChildren(driveId, folderPath, token);
+          quotePdfs = rootItems.filter((it) =>
+            !it.folder && it.id && it.name && isPdf(it) &&
+            it.name.toUpperCase().startsWith(code!),
+          );
+        } catch (e) {
+          summary.errors.push(`quote-root ${p.name}: ${String((e as Error).message)}`);
+          return;
+        }
+      }
+      for (const item of quotePdfs) {
         const { error } = await admin.from("cportal_files").insert({
           project_id: p.id,
           name: item.name,
