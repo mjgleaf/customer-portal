@@ -91,14 +91,25 @@ export default function DashboardPage() {
     if (!silent) setLoading(true)
     // RLS returns exactly the projects this user may see: admins get all;
     // customers get their own (matched by Zoho contact email, or manual membership).
-    const { data } = await supabase
-      .from('cportal_projects')
-      .select('*, customer:cportal_customers(company, name)')
-      .order('created_at', { ascending: false })
-    setProjects(data ?? [])
+    // Paged: PostgREST caps a single request at 1000 rows, and the portal now
+    // holds more projects than that — an unpaged fetch silently drops the
+    // oldest ones.
+    const PAGE = 1000
+    let all: Project[] = []
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await supabase
+        .from('cportal_projects')
+        .select('*, customer:cportal_customers(company, name)')
+        .order('created_at', { ascending: false })
+        .range(from, from + PAGE - 1)
+      if (error) break
+      all = all.concat(data ?? [])
+      if (!data || data.length < PAGE) break
+    }
+    setProjects(all)
     // Skip action-items fetch for techs — they don't care about missing
     // documents (it's a customer/admin paperwork concern, not theirs).
-    if (showActionItems) fetchActionItems((data ?? []).map((p) => p.id))
+    if (showActionItems) fetchActionItems(all.map((p) => p.id))
     fetchMentions()
     setLoading(false)
   }
@@ -115,14 +126,20 @@ export default function DashboardPage() {
   }
 
   // Count outstanding required documents per project (missing PO + unmet checklist items).
+  // Chunked: an admin's id list is every project in the portal, and a single
+  // .in() with 1000+ uuids builds a URL PostgREST rejects (and the row cap
+  // would truncate the files result anyway).
   async function fetchActionItems(ids: string[]) {
     if (ids.length === 0) { setActionItems({}); return }
-    const [reqRes, fileRes] = await Promise.all([
-      supabase.from('cportal_document_requests').select('id, project_id').in('project_id', ids),
-      supabase.from('cportal_files').select('project_id, kind, document_request_id').in('project_id', ids),
-    ])
-    const reqs = reqRes.data ?? []
-    const files = fileRes.data ?? []
+    const CHUNK = 150
+    const chunks: string[][] = []
+    for (let i = 0; i < ids.length; i += CHUNK) chunks.push(ids.slice(i, i + CHUNK))
+    const results = await Promise.all(chunks.map((chunk) => Promise.all([
+      supabase.from('cportal_document_requests').select('id, project_id').in('project_id', chunk),
+      supabase.from('cportal_files').select('project_id, kind, document_request_id').in('project_id', chunk),
+    ])))
+    const reqs = results.flatMap(([reqRes]) => reqRes.data ?? [])
+    const files = results.flatMap(([, fileRes]) => fileRes.data ?? [])
     const result: Record<string, number> = {}
     for (const pid of ids) {
       const hasPO = files.some(f => f.project_id === pid && f.kind === 'purchase_order')
