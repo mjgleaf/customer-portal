@@ -75,10 +75,25 @@ function isClassifiable(filename: string, contentType?: string): boolean {
   const ct = (contentType || "").toLowerCase();
   // PDFs always.
   if (ct === "application/pdf" || lower.endsWith(".pdf")) return true;
-  // Larger images may be scanned POs; tiny signature images get filtered
-  // by Claude itself if they sneak through.
-  if (ct.startsWith("image/") && !lower.match(/signature|logo|icon/)) return true;
+  // Images by contentType OR extension — Outlook reports many forwarded
+  // image attachments as application/octet-stream, so the declared type
+  // alone can't be trusted. Larger images may be scanned POs; tiny
+  // signature images get filtered by Claude itself if they sneak through.
+  const looksLikeImage = ct.startsWith("image/") || /\.(jpe?g|png|gif|webp)$/i.test(lower);
+  if (looksLikeImage && !lower.match(/signature|logo|icon/)) return true;
   return false;
+}
+
+// The vision API accepts exactly these image media types. Derive a valid
+// one from the declared contentType or, failing that, the filename
+// extension. Returns null if neither yields a type the API can ingest.
+const VALID_IMAGE_MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+function imageMediaTypeFor(filename: string, contentType?: string): string | null {
+  const ct = (contentType || "").toLowerCase();
+  if (ct === "image/jpg") return "image/jpeg"; // nonstandard but common
+  if (VALID_IMAGE_MEDIA_TYPES.has(ct)) return ct;
+  const byName = contentTypeFromName(filename);
+  return VALID_IMAGE_MEDIA_TYPES.has(byName) ? byName : null;
 }
 
 // Native CAD formats the vision classifier can't read, but whose extension
@@ -90,9 +105,11 @@ function isCadFile(filename: string): boolean {
 // Camera/image formats the vision API can't ingest (it accepts JPEG, PNG,
 // GIF, and WebP only). On a project email these are near-certainly job-site
 // photos — iPhones attach .heic by default — so file them as photos by
-// extension, same pattern as CAD files above.
-function isPhotoOnlyFormat(filename: string): boolean {
-  return /\.(heic|heif|tif|tiff|bmp)$/i.test(filename || "");
+// extension or declared type, same pattern as CAD files above.
+function isPhotoOnlyFormat(filename: string, contentType?: string): boolean {
+  const ct = (contentType || "").toLowerCase();
+  return /\.(heic|heif|tif|tiff|bmp)$/i.test(filename || "") ||
+    /^image\/(heic|heif|tiff?|bmp)$/.test(ct);
 }
 
 // Zip archives get extracted in-function — several customers' purchasing
@@ -104,9 +121,9 @@ function isZipFile(filename: string, contentType?: string): boolean {
     ct === "application/x-zip-compressed";
 }
 
-// Guess a MIME type from a zip entry's extension so the entry can flow
-// through the same classify/file pipeline as a direct attachment (Power
-// Automate supplies contentType for real attachments; zip entries have none).
+// Guess a MIME type from a filename extension. Used for zip entries (which
+// carry no contentType) and to repair attachments whose declared type is
+// missing or a generic application/octet-stream.
 function contentTypeFromName(name: string): string {
   const lower = (name || "").toLowerCase();
   if (lower.endsWith(".pdf")) return "application/pdf";
@@ -114,6 +131,10 @@ function contentTypeFromName(name: string): string {
   if (lower.endsWith(".png")) return "image/png";
   if (lower.endsWith(".gif")) return "image/gif";
   if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".heic")) return "image/heic";
+  if (lower.endsWith(".heif")) return "image/heif";
+  if (lower.endsWith(".tif") || lower.endsWith(".tiff")) return "image/tiff";
+  if (lower.endsWith(".bmp")) return "image/bmp";
   return "application/octet-stream";
 }
 
@@ -144,8 +165,10 @@ async function classifyAttachment(
   contentBase64: string,
   contentType: string,
 ): Promise<ClassifierVerdict | null> {
-  const isImage = contentType.startsWith("image/");
   const isPdf = contentType === "application/pdf" || filename.toLowerCase().endsWith(".pdf");
+  // Normalize to a media type the vision API accepts — the declared
+  // contentType is often application/octet-stream or image/jpg.
+  const imageMediaType = isPdf ? null : imageMediaTypeFor(filename, contentType);
 
   const sourceBlock = isPdf
     ? {
@@ -156,12 +179,12 @@ async function classifyAttachment(
           data: contentBase64,
         },
       }
-    : isImage
+    : imageMediaType
     ? {
         type: "image",
         source: {
           type: "base64",
-          media_type: contentType,
+          media_type: imageMediaType,
           data: contentBase64,
         },
       }
@@ -199,6 +222,7 @@ DRAWINGS (is_po = false, document_type = "drawing"):
 PHOTOS (is_po = false, document_type = "photo"):
 - A photograph (camera image) of equipment, rigging, a job site, a test setup, damaged or worn parts, nameplates/data plates, or anything else physical
 - The test vs drawings: a photo is captured by a camera; a drawing is a produced technical sheet. A photo OF a drawing (e.g. a snapshot of a printed sheet) counts as a drawing if the sheet fills the frame and is legible, otherwise a photo
+- If the image shows physical equipment, rigging, a vessel, a work site, or anything else in the physical world, it IS a photo — even when blurry, dark, partial, or hard to identify. When torn between "photo" and "other" for a camera image, choose "photo"
 - Company logos, email-signature graphics, and marketing banners are NOT photos — classify those as "other"
 
 The key test: who is the BUYER on this document?
@@ -357,7 +381,14 @@ Deno.serve(async (req) => {
   const expandedAttachments: Incoming[] = [];
   for (const att of attachments) {
     const filename = att.filename || "attachment";
-    if (!att.contentBase64) continue;
+    if (!att.contentBase64) {
+      skippedNonPo.push({
+        filename,
+        document_type: "no-content",
+        reasoning: "Attachment arrived without file content in the payload",
+      });
+      continue;
+    }
     if (!isZipFile(filename, att.contentType)) {
       expandedAttachments.push({ filename, contentBase64: att.contentBase64, contentType: att.contentType });
       continue;
@@ -402,6 +433,14 @@ Deno.serve(async (req) => {
     }
   }
 
+  // One inventory line per email so silent drops are diagnosable from logs.
+  console.log(
+    "attachment inventory: " +
+      (expandedAttachments
+        .map((a) => `${a.filename} (${a.contentType || "no type"}, ~${Math.round((a.contentBase64.length * 3) / 4 / 1024)} KB)`)
+        .join("; ") || "none"),
+  );
+
   for (const att of expandedAttachments) {
     const filename = att.filename;
 
@@ -428,7 +467,7 @@ Deno.serve(async (req) => {
     // Camera formats the vision API can't read (.heic etc.) are filed as
     // photos by extension — must run BEFORE the classifier, whose API call
     // would just fail on these media types.
-    if (isPhotoOnlyFormat(filename)) {
+    if (isPhotoOnlyFormat(filename, att.contentType)) {
       photoFiles.push({
         filename,
         contentBase64: att.contentBase64,
@@ -446,7 +485,24 @@ Deno.serve(async (req) => {
       continue;
     }
 
-    if (!isClassifiable(filename, att.contentType)) continue;
+    if (!isClassifiable(filename, att.contentType)) {
+      // Signature graphics are skipped silently on purpose; everything else
+      // gets surfaced so the PM's reply email names what wasn't filed.
+      if (!/signature|logo|icon/.test(filename.toLowerCase())) {
+        skippedNonPo.push({
+          filename,
+          document_type: "unrecognized",
+          reasoning: `File type I can't read (contentType: ${att.contentType || "not provided"})`,
+        });
+      }
+      continue;
+    }
+
+    // Best-guess MIME for storing the file: prefer a normalized image type,
+    // then the declared type, then the extension.
+    const storedType = imageMediaTypeFor(filename, att.contentType) ??
+      att.contentType ?? contentTypeFromName(filename);
+    const approxBytes = Math.round((att.contentBase64.length * 3) / 4);
 
     const verdict = await classifyAttachment(
       apiKey,
@@ -454,27 +510,77 @@ Deno.serve(async (req) => {
       att.contentBase64,
       att.contentType ?? "application/pdf",
     );
-    if (!verdict) continue;
+    if (!verdict) {
+      // Classifier unavailable or rejected the file (e.g. an image over the
+      // vision API's 5 MB / 8000 px limits). A substantial image on a project
+      // email is near-certainly a job-site photo — file it rather than drop
+      // it. Small failed images are signature-graphic territory; skip those
+      // with a note.
+      if (imageMediaTypeFor(filename, att.contentType) && approxBytes >= 200_000) {
+        photoFiles.push({
+          filename,
+          contentBase64: att.contentBase64,
+          contentType: storedType,
+          verdict: {
+            is_po: false,
+            document_type: "photo",
+            po_number: null,
+            customer_name: null,
+            total_amount: null,
+            job_code: null,
+            reasoning: "Classifier couldn't read it — filed as photo by size and format",
+          },
+        });
+      } else {
+        skippedNonPo.push({
+          filename,
+          document_type: "unclassified",
+          reasoning: "Couldn't classify this file (classifier error)",
+        });
+      }
+      continue;
+    }
+
+    // Always log what the classifier decided and why — "other" verdicts are
+    // invisible in the reply email beyond their count, so this is the only
+    // way to diagnose a misclassification after the fact.
+    console.log(
+      `verdict: ${filename} → ${verdict.document_type}${verdict.is_po ? " (PO)" : ""} — ${verdict.reasoning}`,
+    );
+
+    // A substantial image that Claude labels "other" is far more likely a
+    // mislabeled job-site photo than signature junk (which is tiny). File it
+    // as a photo; the size floor keeps logos and banners out.
+    if (
+      !verdict.is_po &&
+      verdict.document_type === "other" &&
+      imageMediaTypeFor(filename, att.contentType) &&
+      approxBytes >= 200_000
+    ) {
+      console.log(`override: ${filename} reclassified other → photo (${Math.round(approxBytes / 1024)} KB image)`);
+      verdict.document_type = "photo";
+      verdict.reasoning = `Large image on a project email — filed as photo despite "other" verdict. Original: ${verdict.reasoning}`;
+    }
 
     if (verdict.is_po) {
       poFiles.push({
         filename,
         contentBase64: att.contentBase64,
-        contentType: att.contentType ?? "application/pdf",
+        contentType: storedType,
         verdict,
       });
     } else if (verdict.document_type === "drawing") {
       drawingFiles.push({
         filename,
         contentBase64: att.contentBase64,
-        contentType: att.contentType ?? "application/pdf",
+        contentType: storedType,
         verdict,
       });
     } else if (verdict.document_type === "photo") {
       photoFiles.push({
         filename,
         contentBase64: att.contentBase64,
-        contentType: att.contentType ?? "image/jpeg",
+        contentType: storedType,
         verdict,
       });
     } else {
@@ -576,6 +682,30 @@ Deno.serve(async (req) => {
   for (const c of toIngest) {
     try {
       const bytes = decodeBase64(c.contentBase64);
+
+      // Power Automate sometimes fires two runs for the same email a few ms
+      // apart, and PMs sometimes re-forward an email after a partial failure.
+      // Skip anything identical (same name, size, kind) already stored in the
+      // last 24 hours — deleting the file in the portal clears the match, so
+      // a deliberate re-file after deletion still works.
+      const { data: dupe } = await admin
+        .from("cportal_files")
+        .select("id")
+        .eq("project_id", project.id)
+        .eq("name", c.filename)
+        .eq("size", bytes.length)
+        .eq("kind", c.kind)
+        .gte("created_at", new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+        .limit(1);
+      if (dupe && dupe.length > 0) {
+        skippedNonPo.push({
+          filename: c.filename,
+          document_type: "duplicate",
+          reasoning: "Identical file was already filed minutes ago (duplicate flow run)",
+        });
+        continue;
+      }
+
       const safeName = safeFilename(c.filename);
       const storagePath = `${project.id}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safeName}`;
 
@@ -676,6 +806,16 @@ Deno.serve(async (req) => {
   }
 
   if (uploaded.length === 0) {
+    const dupeCount = skippedNonPo.filter((s) => s.document_type === "duplicate").length;
+    if (dupeCount > 0 && failures.length === 0) {
+      return json({
+        ok: true,
+        reason: "duplicate-run",
+        hwiCode: jobCode,
+        projectName: project.name,
+        message: `All ${dupeCount} file${dupeCount === 1 ? "" : "s"} in this email were already filed to ${jobCode} within the last few minutes — this looks like a duplicate delivery, so nothing was stored twice.`,
+      }, 200);
+    }
     return json({
       ok: false,
       reason: "all-uploads-failed",
