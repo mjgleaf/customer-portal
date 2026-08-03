@@ -97,8 +97,31 @@ async function listChildren(driveId: string, path: string, token: string) {
     id?: string;
     name?: string;
     folder?: unknown;
+    file?: { mimeType?: string };
+    size?: number;
+    webUrl?: string;
     createdDateTime?: string;
   }>;
+}
+
+function isPdf(item: { name?: string; file?: { mimeType?: string } }): boolean {
+  if ((item.file?.mimeType ?? "").toLowerCase() === "application/pdf") return true;
+  return (item.name ?? "").toLowerCase().endsWith(".pdf");
+}
+
+// Run fn over items with bounded concurrency — the quote backfill can touch
+// a couple hundred folders on its first pass, and sequential Graph calls
+// would push the run toward the function timeout.
+async function mapPool<T>(items: T[], limit: number, fn: (t: T) => Promise<void>): Promise<void> {
+  let i = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (i < items.length) {
+        const idx = i++;
+        await fn(items[idx]);
+      }
+    }),
+  );
 }
 
 // Same job-code convention as upload-po-to-sharepoint: Hydro-Wates jobs are
@@ -248,8 +271,19 @@ Deno.serve(async (req) => {
       customerMatched: 0,
       relinked: 0,
       membersAdded: 0,
+      quoteFoldersChecked: 0,
+      quoteFilesAdded: 0,
       errors: [] as string[],
     };
+
+    // Job code -> full drive path of the proposal folder, filled during the
+    // scan (covers every current-year folder, not just newly created ones).
+    // The quote backfill below uses it to reach Quote/ subfolders without
+    // re-listing anything.
+    const folderPathByCode = new Map<string, string>();
+    // Projects created this run, so the backfill can include them without
+    // re-querying.
+    const createdRows: Array<{ id: string; name: string }> = [];
 
     // Attach the matched customer's portal profile as a project member (same
     // convention as sync-zoho; the unique constraint makes re-adds harmless).
@@ -286,6 +320,7 @@ Deno.serve(async (req) => {
         summary.scanned++;
         const code = parseJobCode(item.name);
         if (!code) { summary.noJobCode++; continue; }
+        folderPathByCode.set(code, `${yearFolderPath}/${item.name}`);
         if (knownCodes.has(code)) { summary.skippedExisting++; continue; }
 
         const customer = matchCustomer(candidateSegments(item.name, code));
@@ -304,6 +339,7 @@ Deno.serve(async (req) => {
           continue;
         }
         knownCodes.add(code);
+        createdRows.push({ id: inserted.id, name: item.name });
         summary.created++;
         console.log(`[quoted] created "${item.name}" customer=${customer ? customer.id : "unmatched"}`);
 
@@ -334,6 +370,60 @@ Deno.serve(async (req) => {
       summary.relinked++;
       await addMemberFor(p.id, customer);
     }
+
+    // ---- Quote-PDF backfill ---------------------------------------------
+    // The per-project file sync (sync-files-from-sharepoint) only runs when
+    // someone opens a project page, so a quoted job's proposal PDF would sit
+    // invisible until first view. Every run, list the Quote/ subfolder of
+    // quoted projects that don't have a quote file yet and insert the same
+    // reference-only rows the file sync would. Both writers dedupe against
+    // rows by sharepoint_source_id, so they can't double-insert; once a
+    // project has any quote file it drops out of this pass entirely, so the
+    // steady-state cost is one Graph call per not-yet-filed quote.
+    const { data: quoteFileRows } = await admin
+      .from("cportal_files").select("project_id").eq("kind", "quote");
+    const hasQuote = new Set((quoteFileRows ?? []).map((r) => String(r.project_id)));
+    const quotedRows = [
+      ...(existingProjects ?? [])
+        .filter((p) => p.status === "quoted")
+        .map((p) => ({ id: String(p.id), name: String(p.name ?? "") })),
+      ...createdRows,
+    ].filter((p) => !hasQuote.has(p.id));
+
+    await mapPool(quotedRows, 5, async (p) => {
+      const code = parseJobCode(p.name);
+      const folderPath = code ? folderPathByCode.get(code) : undefined;
+      if (!folderPath) return; // prior-year folder or renamed/removed — skip
+      summary.quoteFoldersChecked++;
+      let items: Awaited<ReturnType<typeof listChildren>>;
+      try {
+        items = await listChildren(driveId, `${folderPath}/Quote`, token);
+      } catch (e) {
+        const msg = String((e as Error).message);
+        // No Quote subfolder yet (fresh proposal) — perfectly normal.
+        if (!msg.includes("404") && !msg.includes("itemNotFound")) {
+          summary.errors.push(`quote ${p.name}: ${msg}`);
+        }
+        return;
+      }
+      for (const item of items) {
+        if (item.folder || !item.id || !item.name || !isPdf(item)) continue;
+        const { error } = await admin.from("cportal_files").insert({
+          project_id: p.id,
+          name: item.name,
+          storage_path: null,
+          size: item.size ?? null,
+          mime_type: item.file?.mimeType || "application/pdf",
+          kind: "quote",
+          sharepoint_source_id: item.id,
+          source_created_at: item.createdDateTime || null,
+          sharepoint_synced_at: new Date().toISOString(),
+          sharepoint_path: item.webUrl || "synced-from-sharepoint",
+        });
+        if (error) summary.errors.push(`quote ${item.name}: ${error.message}`);
+        else summary.quoteFilesAdded++;
+      }
+    });
 
     return json({ ok: true, summary });
   } catch (e) {
