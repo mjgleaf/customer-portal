@@ -2798,6 +2798,9 @@ export default function ProjectPage() {
           equipment_certificate: 'Equipment certificate',
           drawing: 'Drawing',
           photo: 'Photo',
+          packing_list: 'Packing list',
+          commercial_invoice: 'Commercial invoice',
+          shipping_document: 'Shipping document',
           general: 'Document',
         } as Record<string, string>)[f.kind ?? 'general'] ?? 'Document'
         return (

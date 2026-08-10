@@ -710,29 +710,71 @@ Deno.serve(async (req) => {
       }
     }
 
-    // 4. Root-level test certificates. Files named "Certificate*.pdf" at the
-    // project folder root are customer-facing proof-load test certificates
-    // (distinct from the equipment calibration certs in Inspection Documents).
-    // We scan the root we already listed earlier.
+    // 4. Root-level customer-facing documents, matched by filename:
+    //    - "Certificate*"       -> proof-load test certificates (kind: certificate)
+    //    - "*Packing List*"     -> packing lists (kind: packing_list)
+    //    - "*Commercial Invoice*" -> commercial invoices (kind: commercial_invoice)
+    // Packing list / commercial invoice naming varies wildly in practice
+    // ("packing list.pdf", "Packing List HWI-26-093.pdf", "Commercial
+    // Invoice, HWI-26-345.pdf"), so those two match the phrase anywhere in
+    // the name, separators included. Some jobs file shipping paperwork in a
+    // "Shipping Documents" subfolder instead of the root — walk that too.
+    // PDF-only across the board: Word copies alongside are working drafts,
+    // not the issued document.
+    const SHIPPING_KEY = "Shipping documents";
+    summary[SHIPPING_KEY] = { added: 0, skipped: 0, backfilled: 0, pdfFiltered: 0, removed: 0, errors: 0 };
+
+    // certsOnly bulk runs are specifically for test certificates; they skip
+    // packing lists / commercial invoices like they skip everything else.
+    const classifyCustomerDoc = (name: string): { kind: string; bucket: string } | null => {
+      if (/^certificate/i.test(name)) return { kind: "certificate", bucket: ROOT_CERT_KEY };
+      if (certsOnly) return null;
+      if (/packing[\s_.,-]*list/i.test(name)) return { kind: "packing_list", bucket: SHIPPING_KEY };
+      if (/commercial[\s_.,-]*invoice/i.test(name)) return { kind: "commercial_invoice", bucket: SHIPPING_KEY };
+      return null;
+    };
+
     let rootChildren: Awaited<ReturnType<typeof listChildren>> = [];
     try {
       rootChildren = await listChildren(driveId, projectFolderPath, token);
     } catch (e) {
       console.warn(`Root listing failed for ${projectFolderPath}:`, (e as Error).message);
     }
+
+    const customerDocs: Array<{ item: (typeof rootChildren)[number]; kind: string; bucket: string }> = [];
     for (const item of rootChildren) {
       if (item.folder || !item.id || !item.name) continue;
-      // Match files starting with "certificate" (case-insensitive). The user's
-      // observed pattern is "Certificate_1.pdf", "Certificate_2.pdf", etc.
-      if (!/^certificate/i.test(item.name)) continue;
-      // PDF-only for these — Word documents at the root are usually drafts
-      // or work procedures, not the final issued certificate.
+      const cls = classifyCustomerDoc(item.name);
+      if (cls) customerDocs.push({ item, ...cls });
+    }
+
+    // Optional "Shipping Documents" subfolder: packing lists and commercial
+    // invoices keep their specific kind; any other PDF in there is still
+    // customer-facing shipping paperwork (BOLs etc.).
+    const shippingFolder = certsOnly
+      ? undefined
+      : rootChildren.find((it) => it.folder && it.name && /^shipping documents$/i.test(it.name));
+    if (shippingFolder) {
+      try {
+        const shipItems = await listChildren(driveId, `${projectFolderPath}/${shippingFolder.name}`, token);
+        for (const item of shipItems) {
+          if (item.folder || !item.id || !item.name) continue;
+          const cls = classifyCustomerDoc(item.name) ?? { kind: "shipping_document", bucket: SHIPPING_KEY };
+          customerDocs.push({ item, ...cls });
+        }
+      } catch (e) {
+        console.warn(`Shipping Documents walk failed for ${projectFolderPath}: ${(e as Error).message}`);
+        summary[SHIPPING_KEY].errors++;
+      }
+    }
+
+    for (const { item, kind, bucket } of customerDocs) {
       if (!isPdf(item)) {
-        summary[ROOT_CERT_KEY].pdfFiltered++;
+        summary[bucket].pdfFiltered++;
         continue;
       }
 
-      const prior = existing.get(item.id);
+      const prior = existing.get(item.id!);
       if (prior) {
         if (prior.needsSourceDate && item.createdDateTime) {
           const { error: updErr } = await admin
@@ -741,10 +783,10 @@ Deno.serve(async (req) => {
             .eq("id", prior.id);
           if (!updErr) {
             prior.needsSourceDate = false;
-            summary[ROOT_CERT_KEY].backfilled++;
+            summary[bucket].backfilled++;
           }
         }
-        summary[ROOT_CERT_KEY].skipped++;
+        summary[bucket].skipped++;
         continue;
       }
 
@@ -756,7 +798,7 @@ Deno.serve(async (req) => {
           storage_path: null,
           size: item.size ?? null,
           mime_type: item.file?.mimeType || "application/pdf",
-          kind: "certificate",
+          kind,
           sharepoint_source_id: item.id,
           source_created_at: item.createdDateTime || null,
           sharepoint_synced_at: new Date().toISOString(),
@@ -764,14 +806,14 @@ Deno.serve(async (req) => {
         }).select("id").single();
         if (insErr || !insertedRow) {
           console.error(`Files insert failed for ${item.name}: ${insErr?.message}`);
-          summary[ROOT_CERT_KEY].errors++;
+          summary[bucket].errors++;
           continue;
         }
-        existing.set(item.id, { id: insertedRow.id, needsSourceDate: false });
-        summary[ROOT_CERT_KEY].added++;
+        existing.set(item.id!, { id: insertedRow.id, needsSourceDate: false });
+        summary[bucket].added++;
       } catch (e) {
-        console.error(`Root cert sync failed for ${item.name}:`, e);
-        summary[ROOT_CERT_KEY].errors++;
+        console.error(`Customer doc sync failed for ${item.name}:`, e);
+        summary[bucket].errors++;
       }
     }
 
