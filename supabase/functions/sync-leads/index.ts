@@ -41,6 +41,26 @@ function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { ...corsHeaders, "Content-Type": "application/json" } });
 }
 
+// PostgREST caps every response at Supabase's max-rows setting (1000 by
+// default), and supabase-js surfaces the truncated page as if it were the
+// whole result. cportal_projects is past 1400 rows, so an unpaged read left
+// a third of the projects invisible to the lead matcher — those jobs never
+// got their scope/site-contact/ship-to fields. Page (ordered by id so pages
+// don't shift) until a short page marks the end.
+const PAGE_SIZE = 1000;
+async function selectAll<T>(
+  build: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+): Promise<T[]> {
+  const all: T[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await build(from, from + PAGE_SIZE - 1);
+    if (error) throw new Error(`paged select failed: ${error.message}`);
+    const rows = data ?? [];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) return all;
+  }
+}
+
 async function graphToken(): Promise<string> {
   const body = new URLSearchParams({
     client_id: CLIENT_ID,
@@ -104,9 +124,11 @@ Deno.serve(async (req) => {
     }
 
     // Map project name -> {id, customer_id} (trimmed, lower-cased)
-    const { data: projects } = await admin.from("cportal_projects").select("id, name, customer_id");
+    const projects = await selectAll<{ id: string; name: string | null; customer_id: string | null }>(
+      (a, b) => admin.from("cportal_projects").select("id, name, customer_id").order("id").range(a, b),
+    );
     const byName = new Map<string, { id: string; customer_id: string | null }>();
-    for (const p of projects ?? []) {
+    for (const p of projects) {
       byName.set(String(p.name).trim().toLowerCase(), { id: p.id, customer_id: p.customer_id });
     }
 
@@ -262,11 +284,13 @@ Deno.serve(async (req) => {
     // appear in any current lead. Leaves zoho and manual entries alone.
     let contactsRemoved = 0;
     {
-      const { data: existingSp } = await admin
-        .from("cportal_customer_contacts")
-        .select("id, customer_id, email")
-        .eq("source", "sharepoint");
-      const stale = (existingSp ?? []).filter(
+      const existingSp = await selectAll<{ id: string; customer_id: string; email: string }>(
+        (a, b) => admin.from("cportal_customer_contacts")
+          .select("id, customer_id, email")
+          .eq("source", "sharepoint")
+          .order("id").range(a, b),
+      );
+      const stale = existingSp.filter(
         (r) => !seenContactKeys.has(`${r.customer_id}::${r.email}`),
       );
       if (stale.length) {

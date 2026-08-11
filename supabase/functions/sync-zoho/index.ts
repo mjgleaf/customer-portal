@@ -226,6 +226,32 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T)
   return out;
 }
 
+// PostgREST caps every response at Supabase's max-rows setting (1000 by
+// default), and supabase-js surfaces the truncated page as if it were the
+// whole result. cportal_projects is past 1400 rows and the Zoho-linked
+// subset alone is past 1100, so the unpaged "read everything" selects here
+// were silently losing their tails — the quoted-row claim pass couldn't see
+// every pre-award row (duplicate projects), projMap missed ~130 projects
+// (member auto-add and status emails silently skipped), and the invoice
+// dedup snapshot would start re-emailing customers the day cportal_invoices
+// crosses 1000 rows. Every full-table read must page (ordered by id so
+// pages don't shift) until a short page marks the end. Errors throw rather
+// than pass as an empty page — syncing against partial data is how
+// duplicates and repeat emails happen.
+const PAGE_SIZE = 1000;
+async function selectAll<T>(
+  build: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+): Promise<T[]> {
+  const all: T[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await build(from, from + PAGE_SIZE - 1);
+    if (error) throw new Error(`paged select failed: ${error.message}`);
+    const rows = data ?? [];
+    all.push(...rows);
+    if (rows.length < PAGE_SIZE) return all;
+  }
+}
+
 function mapProjectStatus(zohoStatus: string): string {
   return zohoStatus === "active" ? "active" : "completed";
 }
@@ -454,9 +480,10 @@ Deno.serve(async (req) => {
 
     let sweepCustomers = summaryCustomers;
     if (!fullSweep) {
-      const { data: knownRows } = await admin
-        .from("cportal_customers").select("zoho_contact_id").not("zoho_contact_id", "is", null);
-      const knownZohoIds = new Set((knownRows ?? []).map((r) => String(r.zoho_contact_id)));
+      const knownRows = await selectAll<{ zoho_contact_id: string }>(
+        (a, b) => admin.from("cportal_customers").select("zoho_contact_id").not("zoho_contact_id", "is", null).order("id").range(a, b),
+      );
+      const knownZohoIds = new Set(knownRows.map((r) => String(r.zoho_contact_id)));
       sweepCustomers = summaryCustomers.filter((c) => {
         if (!knownZohoIds.has(String(c.contact_id))) return true;
         const t = modifiedMs(c);
@@ -481,11 +508,11 @@ Deno.serve(async (req) => {
     // should NOT recreate (they were merged into a surviving customer
     // record by an admin) and where to re-point any project/invoice
     // references to them.
-    const { data: mergedRows } = await admin
-      .from("cportal_merged_zoho_contacts")
-      .select("zoho_contact_id, merged_into_customer_id");
+    const mergedRows = await selectAll<{ zoho_contact_id: string; merged_into_customer_id: string }>(
+      (a, b) => admin.from("cportal_merged_zoho_contacts").select("zoho_contact_id, merged_into_customer_id").order("zoho_contact_id").range(a, b),
+    );
     const mergedMap = new Map<string, string>(
-      (mergedRows ?? []).map((m) => [String(m.zoho_contact_id), String(m.merged_into_customer_id)]),
+      mergedRows.map((m) => [String(m.zoho_contact_id), String(m.merged_into_customer_id)]),
     );
 
     const customerRows = contacts
@@ -546,9 +573,11 @@ Deno.serve(async (req) => {
       }
     }
 
-    const { data: custList } = await admin.from("cportal_customers").select("id, zoho_contact_id, email");
-    const custMap = new Map<string, string>((custList ?? []).map((c) => [String(c.zoho_contact_id), String(c.id)]));
-    const custEmail = new Map((custList ?? []).map((c) => [c.id, c.email]));
+    const custList = await selectAll<{ id: string; zoho_contact_id: string | null; email: string | null }>(
+      (a, b) => admin.from("cportal_customers").select("id, zoho_contact_id, email").order("id").range(a, b),
+    );
+    const custMap = new Map<string, string>(custList.map((c) => [String(c.zoho_contact_id), String(c.id)]));
+    const custEmail = new Map(custList.map((c) => [c.id, c.email]));
 
     // Route merged Zoho contact ids to their surviving customer so any
     // projects/invoices that reference the merged contact_id end up on
@@ -665,12 +694,14 @@ Deno.serve(async (req) => {
     // the other customers' persons, so absence from seenZohoCpids says
     // nothing about them (the daily full sweep covers org-wide cleanup).
     {
-      const { data: existingZoho } = await admin
-        .from("cportal_customer_contacts")
-        .select("id, customer_id, zoho_contact_person_id")
-        .eq("source", "zoho")
-        .not("zoho_contact_person_id", "is", null);
-      const stale = (existingZoho ?? []).filter(
+      const existingZoho = await selectAll<{ id: string; customer_id: string; zoho_contact_person_id: string | null }>(
+        (a, b) => admin.from("cportal_customer_contacts")
+          .select("id, customer_id, zoho_contact_person_id")
+          .eq("source", "zoho")
+          .not("zoho_contact_person_id", "is", null)
+          .order("id").range(a, b),
+      );
+      const stale = existingZoho.filter(
         (r) => r.zoho_contact_person_id &&
           sweptPortalIds.has(String(r.customer_id)) &&
           !seenZohoCpids.has(r.zoho_contact_person_id),
@@ -684,11 +715,15 @@ Deno.serve(async (req) => {
       }
     }
 
-    // 2) Projects — capture existing statuses first so we can detect changes
-    const { data: existingProjects } = await admin
-      .from("cportal_projects").select("id, zoho_project_id, name, status");
+    // 2) Projects — capture existing statuses first so we can detect changes.
+    // This read feeding oldStatus AND unclaimedByCode is the one that must
+    // never truncate: a claim pass that can't see a quoted row inserts a
+    // duplicate project instead of claiming it.
+    const existingProjects = await selectAll<{ id: string; zoho_project_id: string | null; name: string | null; status: string }>(
+      (a, b) => admin.from("cportal_projects").select("id, zoho_project_id, name, status").order("id").range(a, b),
+    );
     const oldStatus = new Map(
-      (existingProjects ?? [])
+      existingProjects
         .filter((p) => p.zoho_project_id)
         .map((p) => [p.zoho_project_id, p.status]),
     );
@@ -698,7 +733,7 @@ Deno.serve(async (req) => {
     // so a newly-awarded Zoho project CLAIMS its quoted row instead of
     // inserting a duplicate.
     const unclaimedByCode = new Map<string, string>();
-    for (const p of existingProjects ?? []) {
+    for (const p of existingProjects) {
       if (p.zoho_project_id) continue;
       const code = parseJobCode(String(p.name ?? ""));
       if (code && !unclaimedByCode.has(code)) unclaimedByCode.set(code, p.id);
@@ -750,9 +785,10 @@ Deno.serve(async (req) => {
     // (Status-change emails are sent further down, once project membership has
     // been refreshed, so they can be routed to the members on the job.)
 
-    const { data: projList } = await admin
-      .from("cportal_projects").select("id, zoho_project_id").not("zoho_project_id", "is", null);
-    const projMap = new Map((projList ?? []).map((p) => [p.zoho_project_id, p.id]));
+    const projList = await selectAll<{ id: string; zoho_project_id: string }>(
+      (a, b) => admin.from("cportal_projects").select("id, zoho_project_id").not("zoho_project_id", "is", null).order("id").range(a, b),
+    );
+    const projMap = new Map(projList.map((p) => [p.zoho_project_id, p.id]));
 
     // Auto-add project members from each project's customer email. For every
     // project whose customer has a portal profile, ensure that profile is
@@ -764,9 +800,11 @@ Deno.serve(async (req) => {
     // unique constraint on (project_id, user_id).
     let membersAdded = 0;
     {
-      const { data: allProfiles } = await admin.from("cportal_profiles").select("id, email");
+      const allProfiles = await selectAll<{ id: string; email: string | null }>(
+        (a, b) => admin.from("cportal_profiles").select("id, email").order("id").range(a, b),
+      );
       const profileByEmail = new Map<string, string>();
-      for (const p of allProfiles ?? []) {
+      for (const p of allProfiles) {
         if (p.email) profileByEmail.set(p.email.toLowerCase(), p.id);
       }
       for (const p of projects) {
@@ -800,13 +838,14 @@ Deno.serve(async (req) => {
     // run are included. Internal roles (admin, service_tech) are never emailed,
     // and each user's email_notifications preference (portal Account page) is
     // honored — the email footer has always promised that control.
-    const { data: mailProfiles } = await admin
-      .from("cportal_profiles").select("id, email, role, email_notifications");
+    const mailProfiles = await selectAll<{ id: string; email: string | null; role: string | null; email_notifications: boolean | null }>(
+      (a, b) => admin.from("cportal_profiles").select("id, email, role, email_notifications").order("id").range(a, b),
+    );
     const optedOut = new Set<string>();
     const portalEmails = new Set<string>();
     const internalEmails = new Set<string>();
     const profileEmailById = new Map<string, string>();
-    for (const pf of mailProfiles ?? []) {
+    for (const pf of mailProfiles) {
       const email = String(pf.email ?? "").trim().toLowerCase();
       if (!email) continue;
       portalEmails.add(email);
@@ -815,10 +854,11 @@ Deno.serve(async (req) => {
       if (pf.role === "admin" || pf.role === "service_tech") internalEmails.add(email);
     }
 
-    const { data: memberRows } = await admin
-      .from("cportal_project_members").select("project_id, user_id");
+    const memberRows = await selectAll<{ project_id: string; user_id: string }>(
+      (a, b) => admin.from("cportal_project_members").select("project_id, user_id").order("id").range(a, b),
+    );
     const membersByProject = new Map<string, string[]>();
-    for (const m of memberRows ?? []) {
+    for (const m of memberRows) {
       const email = profileEmailById.get(m.user_id);
       if (!email || internalEmails.has(email)) continue;
       const list = membersByProject.get(m.project_id) ?? [];
@@ -888,9 +928,10 @@ Deno.serve(async (req) => {
     // Zoho still reports as released, the upsert restores it in this same run
     // without re-emailing anyone. Also used to skip re-resolving the project
     // link for invoices we've already checked in a prior sync.
-    const { data: existingInvoices } = await admin
-      .from("cportal_invoices").select("zoho_invoice_id, project_id, project_synced_at");
-    const existingInvIds = new Set((existingInvoices ?? []).map((i) => i.zoho_invoice_id));
+    const existingInvoices = await selectAll<{ zoho_invoice_id: string; project_id: string | null; project_synced_at: string | null }>(
+      (a, b) => admin.from("cportal_invoices").select("zoho_invoice_id, project_id, project_synced_at").order("id").range(a, b),
+    );
+    const existingInvIds = new Set(existingInvoices.map((i) => i.zoho_invoice_id));
 
     // Purge every stored row that isn't in a known released state — fail
     // closed, matching invoiceReleased above. This removes unreleased rows
@@ -902,7 +943,7 @@ Deno.serve(async (req) => {
       .or(`status.is.null,status.not.in.(${[...RELEASED_INVOICE_STATES].join(",")})`);
     if (purgeError) console.error("Unreleased-invoice purge failed:", purgeError.message);
     const priorLink = new Map(
-      (existingInvoices ?? []).map((i) => [
+      existingInvoices.map((i) => [
         i.zoho_invoice_id,
         { projectId: i.project_id as string | null, checked: !!i.project_synced_at },
       ]),

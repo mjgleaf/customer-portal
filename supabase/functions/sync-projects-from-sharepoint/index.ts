@@ -109,6 +109,30 @@ function isPdf(item: { name?: string; file?: { mimeType?: string } }): boolean {
   return (item.name ?? "").toLowerCase().endsWith(".pdf");
 }
 
+// PostgREST caps every response at Supabase's max-rows setting (1000 by
+// default), and supabase-js surfaces the truncated page as if it were the
+// whole result. cportal_projects is past 1400 rows, so the "which job codes
+// already exist?" read below silently lost its tail — which is exactly how
+// the 2026-08-03 backfill created a duplicate 'quoted' row for ~85 already-
+// awarded jobs. Every full-table read must page (ordered by id so pages
+// don't shift) until a short page marks the end.
+const PAGE_SIZE = 1000;
+async function selectAll<T>(
+  build: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+): Promise<T[]> {
+  const all: T[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await build(from, from + PAGE_SIZE - 1);
+    if (error) throw new Error(`paged select failed: ${error.message}`);
+    const rows = data ?? [];
+    all.push(...rows);
+    // A select that errors must abort the run (throw above) rather than
+    // return partial data: syncing against an incomplete project list is
+    // how duplicates happen.
+    if (rows.length < PAGE_SIZE) return all;
+  }
+}
+
 // Run fn over items with bounded concurrency — the quote backfill can touch
 // a couple hundred folders on its first pass, and sequential Graph calls
 // would push the run toward the function timeout.
@@ -199,27 +223,31 @@ Deno.serve(async (req) => {
 
     // Every existing portal project's job code — Zoho-synced or quoted, the
     // folder is already represented either way, so skip it.
-    const { data: existingProjects } = await admin
-      .from("cportal_projects").select("id, name, status, customer_id");
+    const existingProjects = await selectAll<{ id: string; name: string | null; status: string; customer_id: string | null }>(
+      (a, b) => admin.from("cportal_projects").select("id, name, status, customer_id").order("id").range(a, b),
+    );
     const knownCodes = new Set<string>();
-    for (const p of existingProjects ?? []) {
+    for (const p of existingProjects) {
       const code = parseJobCode(String(p.name ?? ""));
       if (code) knownCodes.add(code);
     }
 
     // Customers + profiles for the best-effort link / member auto-add.
-    const { data: customers } = await admin
-      .from("cportal_customers").select("id, name, company, email");
-    const { data: profiles } = await admin.from("cportal_profiles").select("id, email");
+    const customers = await selectAll<{ id: string; name: string | null; company: string | null; email: string | null }>(
+      (a, b) => admin.from("cportal_customers").select("id, name, company, email").order("id").range(a, b),
+    );
+    const profiles = await selectAll<{ id: string; email: string | null }>(
+      (a, b) => admin.from("cportal_profiles").select("id, email").order("id").range(a, b),
+    );
     const profileByEmail = new Map<string, string>();
-    for (const pf of profiles ?? []) {
+    for (const pf of profiles) {
       if (pf.email) profileByEmail.set(String(pf.email).toLowerCase(), pf.id);
     }
 
     // Unique-match lookup: normalized company/name -> customer id, with
     // ambiguous keys (two customers normalizing to the same string) dropped.
     const byNorm = new Map<string, { id: string; email: string | null } | null>();
-    for (const c of customers ?? []) {
+    for (const c of customers) {
       for (const field of [c.company, c.name]) {
         const key = normCompany(String(field ?? ""));
         if (!key) continue;
@@ -362,7 +390,7 @@ Deno.serve(async (req) => {
     // once Zoho (or an admin) creates them, the next hourly run links the
     // quoted job automatically. Never overrides a non-null customer_id, so
     // manual admin assignments stick.
-    for (const p of existingProjects ?? []) {
+    for (const p of existingProjects) {
       if (p.status !== "quoted" || p.customer_id) continue;
       const code = parseJobCode(String(p.name ?? ""));
       if (!code) continue;
@@ -390,11 +418,12 @@ Deno.serve(async (req) => {
     // rows by sharepoint_source_id, so they can't double-insert; once a
     // project has any quote file it drops out of this pass entirely, so the
     // steady-state cost is one Graph call per not-yet-filed quote.
-    const { data: quoteFileRows } = await admin
-      .from("cportal_files").select("project_id").eq("kind", "quote");
-    const hasQuote = new Set((quoteFileRows ?? []).map((r) => String(r.project_id)));
+    const quoteFileRows = await selectAll<{ project_id: string }>(
+      (a, b) => admin.from("cportal_files").select("project_id").eq("kind", "quote").order("id").range(a, b),
+    );
+    const hasQuote = new Set(quoteFileRows.map((r) => String(r.project_id)));
     const quotedRows = [
-      ...(existingProjects ?? [])
+      ...existingProjects
         .filter((p) => p.status === "quoted")
         .map((p) => ({ id: String(p.id), name: String(p.name ?? "") })),
       ...createdRows,
