@@ -724,13 +724,26 @@ export default function ProjectPage() {
   // then enrich with status info (member / has account / pending) so the
   // Members tab can render the right action per row.
   async function fetchCompanyContacts() {
-    const company = project?.customer?.company
-    if (!company) { setCompanyContacts([]); return }
-    const { data: customers } = await supabase
-      .from('cportal_customers')
-      .select('id, name, email, company')
-      .eq('company', company)
-    if (!customers || customers.length === 0) { setCompanyContacts([]); return }
+    // Group by company name when there is one (a company can span several
+    // Zoho customer records). About half the Zoho customers have no company
+    // filled in, so fall back to the project's own customer row rather than
+    // returning nothing.
+    const company = project?.customer?.company?.trim()
+    let customers: { id: string; name: string | null; email: string | null }[] = []
+    if (company) {
+      const { data } = await supabase
+        .from('cportal_customers')
+        .select('id, name, email, company')
+        .eq('company', company)
+      customers = data ?? []
+    } else if (project?.customer_id) {
+      const { data } = await supabase
+        .from('cportal_customers')
+        .select('id, name, email, company')
+        .eq('id', project.customer_id)
+      customers = data ?? []
+    }
+    if (customers.length === 0) { setCompanyContacts([]); return }
 
     const { data: persons } = await supabase
       .from('cportal_customer_contacts')
@@ -2459,8 +2472,8 @@ export default function ProjectPage() {
                   <Users className="mx-auto text-gray-300 mb-3" size={40} />
                   <p className="text-gray-500 text-sm font-medium">No members yet</p>
                   <p className="text-gray-400 text-xs mt-1">
-                    {project?.customer?.company
-                      ? `No Zoho contacts found at ${project.customer.company} yet — they'll appear here once synced.`
+                    {project?.customer?.company || project?.customer?.name
+                      ? `No Zoho contacts found at ${project.customer.company || project.customer.name} yet — they'll appear here once synced.`
                       : 'Add customers to give them access.'}
                   </p>
                 </div>
@@ -2956,12 +2969,17 @@ export default function ProjectPage() {
 
       {/* Add member modal */}
       {showAddMember && (() => {
-        // Scope the picker to the project's company: a profile qualifies if it
-        // belongs to one of the company's Zoho contacts (matched by profile id
+        // Scope the picker to the project's customer: a profile qualifies if it
+        // belongs to one of the customer's Zoho contacts (matched by profile id
         // or email via companyContacts) or its own company field matches. The
         // company field alone isn't enough — profiles created before it was
         // populated have it blank, which is why the contact match comes first.
-        const company = project?.customer?.company?.trim() || null
+        // Fall back to the customer's name when it has no company set (about
+        // half of them don't) — an unscoped picker here used to dump every
+        // portal profile into the list. Only a project with no customer at
+        // all shows everyone, since there's nothing to scope by.
+        const company =
+          project?.customer?.company?.trim() || project?.customer?.name?.trim() || null
         const contactUserIds = new Set(companyContacts.map(c => c.userId).filter(Boolean))
         const contactEmails = new Set(
           companyContacts.map(c => c.email?.toLowerCase()).filter((e): e is string => !!e),

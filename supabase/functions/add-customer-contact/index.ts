@@ -76,28 +76,25 @@ Deno.serve(async (req) => {
       if (!contactId) return json({ error: "contactId is required" }, 400);
       const { data: row } = await admin
         .from("cportal_customer_contacts")
-        .select("id, zoho_contact_person_id, customer_id")
+        .select("id, zoho_contact_person_id")
         .eq("id", contactId).maybeSingle();
       if (!row) return json({ error: "Contact not found" }, 404);
 
       if (row.zoho_contact_person_id) {
-        const { data: cust } = await admin
-          .from("cportal_customers").select("zoho_contact_id")
-          .eq("id", row.customer_id).maybeSingle();
-        if (cust?.zoho_contact_id) {
-          const accessToken = await zohoAccessToken();
-          const url = `${ZOHO_BOOKS}/contacts/${cust.zoho_contact_id}/contactpersons/${row.zoho_contact_person_id}?organization_id=${orgId}`;
-          const res = await fetch(url, {
-            method: "DELETE",
-            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-          });
-          const data = await res.json().catch(() => ({}));
-          // Zoho code 0 = success. A person already gone from Zoho (deleted
-          // there directly) shouldn't block the local removal.
-          const alreadyGone = res.status === 404 || data.code === 1004 || data.code === 2006;
-          if (!(res.ok && data.code === 0) && !alreadyGone) {
-            return json({ error: `Zoho delete failed: ${data.message ?? res.status}` }, 502);
-          }
+        const accessToken = await zohoAccessToken();
+        // Zoho's create/update/delete endpoints for contact persons don't
+        // take the parent contact id in the path — only list/get do.
+        const url = `${ZOHO_BOOKS}/contacts/contactpersons/${row.zoho_contact_person_id}?organization_id=${orgId}`;
+        const res = await fetch(url, {
+          method: "DELETE",
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        });
+        const data = await res.json().catch(() => ({}));
+        // Zoho code 0 = success. A person already gone from Zoho (deleted
+        // there directly) shouldn't block the local removal.
+        const alreadyGone = res.status === 404 || data.code === 1004 || data.code === 2006;
+        if (!(res.ok && data.code === 0) && !alreadyGone) {
+          return json({ error: `Zoho delete failed: ${data.message ?? res.status}` }, 502);
         }
       }
       const { error: delErr } = await admin.from("cportal_customer_contacts").delete().eq("id", row.id);
@@ -133,7 +130,10 @@ Deno.serve(async (req) => {
       try {
         const accessToken = await zohoAccessToken();
         const [firstName, ...rest] = (name || email.split("@")[0]).split(/\s+/);
-        const url = `${ZOHO_BOOKS}/contacts/${customer.zoho_contact_id}/contactpersons?organization_id=${orgId}`;
+        // Create takes the parent contact id in the BODY, not the path —
+        // POSTing to /contacts/{id}/contactpersons (the list endpoint) gets
+        // "The HTTP method POST is not allowed for the requested resource".
+        const url = `${ZOHO_BOOKS}/contacts/contactpersons?organization_id=${orgId}`;
         const res = await fetch(url, {
           method: "POST",
           headers: {
@@ -141,6 +141,7 @@ Deno.serve(async (req) => {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
+            contact_id: customer.zoho_contact_id,
             first_name: firstName,
             last_name: rest.join(" "),
             email,
