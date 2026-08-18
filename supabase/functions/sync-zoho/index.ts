@@ -156,6 +156,18 @@ async function getAccessToken(): Promise<string> {
   return data.access_token;
 }
 
+// Normalize a company name for duplicate detection: lowercased, "and" folded
+// to "&", every non-alphanumeric stripped. Two contacts that normalize to the
+// same string are the same company written differently ("Hoist & Crane Service
+// Group" / "Hoist and Crane Service Group"). TypeScript twin of the SQL
+// cportal_normalize_company() — keep the two in step.
+function normalizeCompany(raw: string): string {
+  return raw
+    .replace(/(^| )and( |$)/gi, " & ")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
 // Fetch every page of a Zoho Books list endpoint.
 async function fetchAll(path: string, key: string, accessToken: string, orgId: string): Promise<any[]> {
   const out: any[] = [];
@@ -514,6 +526,52 @@ Deno.serve(async (req) => {
     const mergedMap = new Map<string, string>(
       mergedRows.map((m) => [String(m.zoho_contact_id), String(m.merged_into_customer_id)]),
     );
+
+    // Auto-dedup. Zoho grows a second contact for a company whenever someone
+    // is added under a different spelling, and since cportal_customers is 1:1
+    // on zoho_contact_id, each one became its own header on the admin
+    // dashboard. When a brand-new contact's company name normalizes to an
+    // existing customer's, record it as merged instead — the mergedMap
+    // handling below then routes its projects and invoices onto the existing
+    // record, no new row created.
+    //
+    // Only contacts we have NO row for yet are considered. An id already in
+    // the table is left alone, so this can never fold two established customer
+    // records (each with their own projects, invoices, and portal access) into
+    // one — that stays a deliberate, admin-reviewed migration. Undo a bad
+    // auto-match by deleting its cportal_merged_zoho_contacts row.
+    const existingCustomers = await selectAll<
+      { id: string; zoho_contact_id: string | null; company: string | null; name: string | null }
+    >(
+      (a, b) => admin.from("cportal_customers").select("id, zoho_contact_id, company, name").order("id").range(a, b),
+    );
+    const existingZohoIds = new Set(existingCustomers.map((r) => String(r.zoho_contact_id)));
+    // First row wins on collision. After 99000016 no two customers share a
+    // normalized name, so a collision here means an admin deliberately kept
+    // two same-named records — leave that pairing to them and stay consistent.
+    const customerByName = new Map<string, string>();
+    for (const r of existingCustomers) {
+      const norm = normalizeCompany((r.company ?? "").trim() || (r.name ?? ""));
+      if (norm && !customerByName.has(norm)) customerByName.set(norm, String(r.id));
+    }
+
+    const autoMerged: { zoho_contact_id: string; merged_into_customer_id: string }[] = [];
+    for (const c of contacts) {
+      const zohoId = String(c.contact_id);
+      if (mergedMap.has(zohoId) || existingZohoIds.has(zohoId)) continue;
+      const label = String(c.company_name ?? "").trim() || String(c.contact_name ?? "");
+      const survivorId = customerByName.get(normalizeCompany(label));
+      if (!survivorId) continue;
+      autoMerged.push({ zoho_contact_id: zohoId, merged_into_customer_id: survivorId });
+      mergedMap.set(zohoId, survivorId);
+      console.log(`[auto-dedup] Zoho contact ${zohoId} ("${label}") routed into customer ${survivorId}`);
+    }
+    if (autoMerged.length) {
+      const { error } = await admin
+        .from("cportal_merged_zoho_contacts")
+        .upsert(autoMerged, { onConflict: "zoho_contact_id" });
+      if (error) throw error;
+    }
 
     const customerRows = contacts
       .filter((c) => !mergedMap.has(String(c.contact_id)))
@@ -1061,6 +1119,7 @@ Deno.serve(async (req) => {
         membersAdded,
         customersRemoved,
         customersOrphaned,
+        customersAutoMerged: autoMerged.length,
         contactsSynced,
         contactsRemoved,
         contactPersonsFetched: contactRows.length,
