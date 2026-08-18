@@ -266,6 +266,31 @@ function dateFromFilename(name: string): number | null {
   return best;
 }
 
+// An asset folder is an archive, not a certificate drawer: alongside the
+// unit's certs it holds the import/customs paperwork, airway bills, sales
+// invoices and delivery notes from when the unit was bought. None of that is
+// a certificate, and it wins the "newest cert" race far too easily — that
+// paperwork carries no date in its filename, so certTime falls back to the
+// SharePoint created date (2023 for everything swept in by the archive
+// migration) while genuine certs are ranked by their much older filename
+// dates. That is how "Shipping Docs, JWA to HWI, Duty.pdf" ended up published
+// as a water bag's equipment certificate.
+//
+// Two rules, applied in order, decide what may represent a unit:
+//   1. Commercial/logistics paperwork is dropped outright — unless the name
+//      also says certificate ("... Purchase Docs and Certificate.pdf").
+//   2. Files that name themselves a certificate (or sit in a "Calibration
+//      Certificates" subfolder) outrank everything else. Anything unlabelled
+//      is a fallback only, for the assets whose certs are filed under opaque
+//      names ("LL-1611.PDF", "43569 3-2024.PDF", "Xerox Scan_...PDF").
+const CERT_NAME_RE = /cert|calibration/i;
+const PAPERWORK_RE =
+  /(shipping\s*doc|air\s*way\s*bill|waybill|\bh?awb\b|bill\s+of\s+lading|customs|\bduty\b|\bimport|\bexport|delivery\s+(note|summary)|packing\s+list|\binvoi|\bbroker|purchase\s+order|return\s+form)/i;
+
+function isNonCertPaperwork(name: string): boolean {
+  return PAPERWORK_RE.test(name) && !CERT_NAME_RE.test(name);
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
@@ -579,9 +604,11 @@ Deno.serve(async (req) => {
           // Newer certs increasingly live in a "Calibration Certificates"
           // subfolder instead of the asset folder root — walk one level of
           // cert-named subfolders too, so the current cert isn't missed.
+          const certFolderIds = new Set<string>();
           for (const subf of assetItems.filter((it) => it.folder && it.name && /cert/i.test(it.name))) {
             try {
               const subItems = await listChildren(driveId, `${drivePath}/${subf.name}`, token);
+              for (const si of subItems) if (si.id) certFolderIds.add(si.id);
               assetItems = assetItems.concat(subItems);
             } catch (e) {
               console.warn(`Cert subfolder walk failed for ${sn} at "${drivePath}/${subf.name}": ${(e as Error).message}`);
@@ -600,6 +627,15 @@ Deno.serve(async (req) => {
           // (or no load-out date is known), take the earliest available —
           // the closest to the job — or the newest overall respectively.
           const pdfs = assetItems.filter((it) => !it.folder && it.id && it.name && isPdf(it));
+          // Only certificates may represent the unit (see isNonCertPaperwork).
+          // `pdfs` stays the full folder listing — the cleanup pass below uses
+          // it to retire rows an earlier sync published from this folder,
+          // paperwork included.
+          const eligible = pdfs.filter((it) => !isNonCertPaperwork(it.name!));
+          const certNamed = eligible.filter(
+            (it) => CERT_NAME_RE.test(it.name!) || certFolderIds.has(it.id!),
+          );
+          const candidates = certNamed.length > 0 ? certNamed : eligible;
           const certTime = (it: (typeof pdfs)[number]): number =>
             dateFromFilename(it.name!)
               ?? (it.createdDateTime ? Date.parse(it.createdDateTime) : 0);
@@ -615,21 +651,21 @@ Deno.serve(async (req) => {
           );
           let keeper: (typeof pdfs)[number] | null = null;
           let keeperTime = -1;
-          for (const it of pdfs) {
+          for (const it of candidates) {
             const t = certTime(it);
             if (t <= cutoff && t > keeperTime) {
               keeperTime = t;
               keeper = it;
             }
           }
-          if (!keeper && pdfs.length > 0) {
+          if (!keeper && candidates.length > 0) {
             // Everything post-dates the load-out — take the earliest cert,
             // the nearest one to the job.
-            keeper = pdfs.reduce((a, b) => (certTime(a) <= certTime(b) ? a : b));
+            keeper = candidates.reduce((a, b) => (certTime(a) <= certTime(b) ? a : b));
           }
           console.log(
             `[equip-cert] ${sn}: loadout=${loadoutAt === null ? "unknown" : new Date(loadoutAt).toISOString().slice(0, 10)}` +
-            ` certs=${pdfs.length} keeper=${keeper?.name ?? "none"}`,
+            ` pdfs=${pdfs.length} certs=${candidates.length} keeper=${keeper?.name ?? "none"}`,
           );
 
           // Cleanup: earlier versions of this sync pulled the whole folder,
