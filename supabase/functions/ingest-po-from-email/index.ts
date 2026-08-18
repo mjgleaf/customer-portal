@@ -157,8 +157,42 @@ interface ClassifierVerdict {
   reasoning: string;
 }
 
-// Ask Claude Haiku 4.5 vision to classify one attachment. Returns null if
-// the API call fails — caller treats that as "couldn't classify, skip".
+// Pull the first complete JSON object out of the classifier's reply.
+//
+// The obvious `/\{[\s\S]*\}/` is greedy: it spans from the first "{" to the
+// LAST "}" anywhere in the response. The prompt asks for bare JSON and no
+// commentary, but one stray brace in a trailing sentence is enough to make
+// that match swallow the object plus the prose after it — JSON.parse then
+// throws "Unexpected non-whitespace character after JSON" and the attachment
+// is dropped as unclassified. (Seen in production on a real PO: valid verdict,
+// trailing text, file filed as "unclassified".)
+//
+// Scan for the brace that actually closes the object instead, tracking string
+// literals so braces inside values don't throw the depth off.
+function extractFirstJsonObject(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) return text.slice(start, i + 1);
+  }
+  // Unbalanced — the reply was cut off mid-object (usually max_tokens).
+  return null;
+}
+
+// Ask Claude vision to classify one attachment. Returns null if the API call
+// fails — caller treats that as "couldn't classify, skip".
 async function classifyAttachment(
   apiKey: string,
   filename: string,
@@ -280,12 +314,20 @@ For job_code: only set it if you can clearly read "HWI-" followed by digits, or 
     const textBlock = contentBlocks.find((b) => b.type === "text");
     const text = (textBlock?.text ?? "") as string;
     // Pull the first JSON object out of the response (tolerates surrounding text).
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) {
-      console.warn(`Classifier didn't return JSON for ${filename}: ${text.slice(0, 200)}`);
+    const json = extractFirstJsonObject(text);
+    if (!json) {
+      console.warn(`Classifier didn't return JSON for ${filename}: ${text.slice(0, 300)}`);
       return null;
     }
-    return JSON.parse(match[0]) as ClassifierVerdict;
+    try {
+      return JSON.parse(json) as ClassifierVerdict;
+    } catch (e) {
+      // Log what we actually tried to parse — the outer catch only reports the
+      // SyntaxError, which is not enough to tell a malformed verdict from a
+      // truncated one without digging through the function logs.
+      console.warn(`Classifier returned unparseable JSON for ${filename}: ${json.slice(0, 300)}`, e);
+      return null;
+    }
   } catch (e) {
     console.warn(`Classifier threw for ${filename}:`, e);
     return null;
