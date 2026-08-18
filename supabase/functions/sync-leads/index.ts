@@ -30,6 +30,11 @@ const SITE_CONTACT_PHONE_FIELDS = ["ContactPhoneOnSite"];
 // encodings to be safe (same approach as EMAIL_FIELDS). This is the
 // authoritative ship-to — Zoho Books shipping addresses are unreliable.
 const SHIPTO_FIELDS = ["addressshipto", "AddressShipTo", "AddressShipto", "addressShipTo", "Address_x0020_Ship_x0020_To", "ShipToAddress", "ShipTo"];
+// Customer PO number + date, typed by hand into the pipeline app. Mirrored
+// onto the project so the portal can show the customer their own PO number
+// and stop asking for a PO document once one has been recorded.
+const PONUM_FIELDS = ["PONum", "ponum", "PONumber", "PO_x0020_Num"];
+const PODATE_FIELDS = ["PODate", "podate", "PO_x0020_Date"];
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -136,6 +141,7 @@ Deno.serve(async (req) => {
     let projectTypesSet = 0;
     let siteContactsSet = 0;
     let shipToSet = 0;
+    let poNumbersSet = 0;
     let membersAdded = 0;
     let contactsSynced = 0;
 
@@ -175,7 +181,7 @@ Deno.serve(async (req) => {
 
       // Build the update payload incrementally so we only PATCH the columns
       // this lead actually has values for.
-      const update: Record<string, string> = {};
+      const update: Record<string, string | null> = {};
 
       // 1. LeadComments -> project_scope
       const comments = String(f[COMMENTS_FIELD] ?? "").trim();
@@ -214,6 +220,33 @@ Deno.serve(async (req) => {
       }
       if (shipTo) update.ship_to_address = shipTo;
 
+      // 5. PONum / PODate -> po_number / po_date. Unlike every other field
+      //    here, a blank is meaningful: the pipeline is the only source of
+      //    po_number, and a recorded PO satisfies the portal's "Purchase
+      //    order" requirement. Leaving a stale number behind after someone
+      //    clears a wrong entry would keep the requirement wrongly ticked,
+      //    so an empty PONum clears the portal's copy.
+      let poNum = "";
+      for (const key of PONUM_FIELDS) {
+        const v = f[key];
+        if (typeof v === "string" && v.trim()) { poNum = v.trim(); break; }
+        if (typeof v === "number") { poNum = String(v); break; }
+      }
+      update.po_number = poNum || null;
+
+      let poDate: string | null = null;
+      for (const key of PODATE_FIELDS) {
+        const v = f[key];
+        if (typeof v === "string" && v.trim()) {
+          const d = new Date(v.trim());
+          if (!isNaN(d.getTime())) poDate = d.toISOString();
+          break;
+        }
+      }
+      // Only meaningful alongside a number — don't leave a date on a project
+      // whose PO entry was cleared.
+      update.po_date = poNum ? poDate : null;
+
       if (Object.keys(update).length > 0) {
         const { error } = await admin.from("cportal_projects").update(update).eq("id", projectId);
         if (!error) {
@@ -221,10 +254,11 @@ Deno.serve(async (req) => {
           if (update.project_type) projectTypesSet++;
           if (update.site_contact) siteContactsSet++;
           if (update.ship_to_address) shipToSet++;
+          if (update.po_number) poNumbersSet++;
         }
       }
 
-      // 5. LeadEmail -> the person who submitted the lead. We do two
+      // 6. LeadEmail -> the person who submitted the lead. We do two
       //    things with it:
       //      a) Add as a contact on the project's customer so they (and
       //         their company peers) automatically get portal access.
@@ -309,6 +343,7 @@ Deno.serve(async (req) => {
       projectTypesSet,
       siteContactsSet,
       shipToSet,
+      poNumbersSet,
       membersAdded,
       contactsSynced,
       contactsRemoved,

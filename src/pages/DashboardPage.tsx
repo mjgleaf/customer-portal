@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { FolderOpen, RefreshCw, Search, Receipt, AlertCircle, ChevronDown, ChevronRight, HelpCircle } from 'lucide-react'
 import { supabase } from '../lib/supabase'
+import { hasPoNumber } from '../lib/poNumber'
 import { useAuth } from '../context/AuthContext'
 import { useSync } from '../context/SyncContext'
 import type { Project } from '../types'
@@ -109,7 +110,7 @@ export default function DashboardPage() {
     setProjects(all)
     // Skip action-items fetch for techs — they don't care about missing
     // documents (it's a customer/admin paperwork concern, not theirs).
-    if (showActionItems) fetchActionItems(all.map((p) => p.id))
+    if (showActionItems) fetchActionItems(all)
     fetchMentions()
     setLoading(false)
   }
@@ -129,8 +130,13 @@ export default function DashboardPage() {
   // Chunked: an admin's id list is every project in the portal, and a single
   // .in() with 1000+ uuids builds a URL PostgREST rejects (and the row cap
   // would truncate the files result anyway).
-  async function fetchActionItems(ids: string[]) {
-    if (ids.length === 0) { setActionItems({}); return }
+  async function fetchActionItems(list: Project[]) {
+    if (list.length === 0) { setActionItems({}); return }
+    const ids = list.map((p) => p.id)
+    // A PO number recorded in the sales pipeline counts as the PO being in
+    // hand, same as on the project page — verbal and credit-card POs never
+    // produce a document, so the badge shouldn't keep asking for one.
+    const poOnRecord = new Set(list.filter((p) => hasPoNumber(p.po_number)).map((p) => p.id))
     const CHUNK = 150
     const chunks: string[][] = []
     for (let i = 0; i < ids.length; i += CHUNK) chunks.push(ids.slice(i, i + CHUNK))
@@ -142,7 +148,7 @@ export default function DashboardPage() {
     const files = results.flatMap(([, fileRes]) => fileRes.data ?? [])
     const result: Record<string, number> = {}
     for (const pid of ids) {
-      const hasPO = files.some(f => f.project_id === pid && f.kind === 'purchase_order')
+      const hasPO = poOnRecord.has(pid) || files.some(f => f.project_id === pid && f.kind === 'purchase_order')
       const fulfilled = new Set(files.filter(f => f.project_id === pid && f.document_request_id).map(f => f.document_request_id))
       const unmet = reqs.filter(r => r.project_id === pid && !fulfilled.has(r.id)).length
       result[pid] = (hasPO ? 0 : 1) + unmet

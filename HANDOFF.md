@@ -120,7 +120,7 @@ supabase functions deploy <name> --project-ref vpdcikiyaifppkkantrb --use-api --
 |---|---|---|
 | `sync-zoho` | Auto-fired on every page load in admin sessions (`SyncContext`, in-flight lock + 2-min cooldown). NOTE: the "hourly cron" older docs mention does not exist — pg_cron is not installed on the LifeOSBase database (verified 2026-07-28). | Pulls customers/projects/invoices from Zoho Books. Delta sync: per-contact detail + contact-person calls only for contacts modified since the stored watermark (`cportal_app_settings.zoho_sync_watermark`); full sweep at most daily (`zoho_full_synced_at`) or on `{ "full": true }`. Keeps runs ~10-20 Zoho calls vs ~2-per-contact — the org's Zoho budget is 10k calls/day (hit on 2026-07-28, which blocks all syncing until the overnight reset). Auto-adds project members on email match. Sends Graph email on status changes. |
 | `sync-files-from-sharepoint` | Project page load (auto-sync) + admin button + bulk-sync script | Pulls files from `Purchase Order/` and `Quote/` subfolders + root `Certificate*.pdf` files for a given project. Also syncs root-level packing lists (`*packing list*` anywhere in the filename → `kind='packing_list'`) and commercial invoices (`*commercial invoice*` → `kind='commercial_invoice'`), plus everything PDF in an optional `Shipping Documents/` subfolder (unmatched files there → `kind='shipping_document'`); all PDF-only, and all land on the customer-visible Documents tab. Equipment certificates come via the loadout pipeline: Load Out List (JobNumber) → shipped Assembly SNs → Hydro-Wates Inventory (FolderPath) → the equipment's Asset Records folder (root + one level of "cert"-named subfolders, e.g. `Calibration Certificates/`) — syncing ONLY the cert in force at that unit's load-out: the newest cert dated on/before the unit's Load Out List date (explicit load-out/ship date column when the list has one, else the row's Created time; 3-day grace; always capped at today, since some files are named with their calibration DUE date a year out). Old jobs keep the historically-correct cert rather than later recalibrations. Cert dates parse from the MM-DD-YY filename date (SharePoint created date as fallback). Certs outside that rule previously synced into the project are deleted on the next sync. Dedupes by SharePoint item ID. Supports `certsOnly: true` body param to skip subfolders + equipment. |
-| `sync-leads` | Manual / scheduled | Pulls project descriptions from the SharePoint Lead List into `projects.lead_comments`. |
+| `sync-leads` | Hourly pg_cron (`sync-leads-hourly`, :12) + manual | Pulls fields from the SharePoint Lead List (the sales pipeline app's list) into matched projects, joined on `QuoteNum` -> `projects.name`: `LeadComments` -> `lead_comments`, `ProjType` -> `project_type`, `ContactNameOnSite`/`ContactPhoneOnSite` -> `site_contact*`, `addressshipto` -> `ship_to_address`, and `PONum`/`PODate` -> `po_number`/`po_date`. Also upserts `LeadEmail` as a customer contact. **`po_number` is the one field that clears on blank** — it satisfies the portal's "Purchase order" requirement, so a stale value left behind after someone clears a wrong pipeline entry would keep that requirement wrongly ticked. |
 | `sharepoint-list` | Debug helper, gated by `INSPECT_KEY` header | Read-only Graph folder listing. Used during development to inspect SharePoint structure. |
 | `upload-po-to-sharepoint` | Admin/customer PO upload via portal + `ingest-po-from-email` | Mirrors a portal-uploaded PO into SharePoint's `Purchase Order/` subfolder, routed by job code to the owning entity's Commercial Proposals tree (HWI → Hydro-Wates, Q → Sentinel Instruments; both in the same document library). If no matching project folder exists, emails sales@ with the PO attached. Records the SharePoint item ID for dedup with future syncs. |
 | `ingest-po-from-email` | Power Automate (`PO Email Ingest` flow) | Receives forwarded PO / drawing / photo emails. Zip attachments are extracted in-function (one level deep) and each entry processed like a direct attachment. Claude Opus vision classifies each attachment as PO, drawing, photo, or other. POs upload into the portal AND fire the SharePoint mirror; drawings upload with `kind='drawing'` (project Drawings tab) and photos with `kind='photo'` (project Photos tab) — no SharePoint mirror for either. Native CAD files (.dwg/.dxf/.step) are filed as drawings by extension; camera formats Claude can't read (.heic/.tiff/.bmp) as photos by extension. Projects are matched by job code: `HWI-YY-NNN` (Hydro-Wates) or `QYYNNN` e.g. Q26001 (Sentinel Instruments). Bounces with a friendly explanation if nothing recognized or no job code found. |
@@ -161,7 +161,7 @@ Tables (current production):
 |---|---|---|
 | `profiles` | One row per portal user (auth.users mirror + role + preferences) | `role: 'customer'|'admin'`, `email_notifications: bool` |
 | `customers` | Synced from Zoho contacts (contact_type='customer' only) | `zoho_contact_id`, `shipping_*`, `billing_*`, `phone` |
-| `projects` | Synced from Zoho projects + manually created | `zoho_project_id`, `customer_id`, `status`, `description`, `lead_comments` |
+| `projects` | Synced from Zoho projects + manually created | `zoho_project_id`, `customer_id`, `status`, `description`, `lead_comments`, `po_number`/`po_date` (customer PO typed into the pipeline app; see below) |
 | `project_members` | Explicit per-user, per-project access | `project_id → projects`, `user_id → auth.users` |
 | `files` | Every file in the portal (uploads + SharePoint syncs) | `kind`, `sharepoint_source_id` (dedup), `sharepoint_synced_at`, `sharepoint_path`, `source_created_at` (real OneDrive upload date) |
 | `document_requests` | Admin-defined required documents per project | `label` |
@@ -177,6 +177,32 @@ Helper functions in `public`:
 - `can_access_project(pid uuid)` — combines admin OR project_members OR customer-email match
 - `handle_new_user()` — trigger on auth.users insert; auto-creates a profile row
 - `prevent_role_escalation()` — trigger on profiles update; blocks customers from setting their own role to admin
+
+### Customer PO numbers from the pipeline app
+
+The sales pipeline app's SharePoint "Lead List" has a `PONum` column the team
+fills in by hand when a customer's PO arrives — often long before, or instead
+of, a PDF ever reaching the portal. `sync-leads` mirrors it to
+`cportal_projects.po_number` (+ `po_date`), matched by `QuoteNum` -> project
+name. As of 2026-08-18 that covers 223 projects.
+
+Two rules govern how it surfaces (`src/lib/poNumber.ts` is the single place
+that decides):
+
+1. **A recorded PO number satisfies the "Purchase order — required" checklist
+   item**, with or without an uploaded document — on the project page and in
+   the dashboard's outstanding-documents badge. Verbal and credit-card POs
+   never produce a document, so waiting on a PDF would nag forever. The row
+   then reads "PO received · no document uploaded" and the admin Remind button
+   disappears.
+2. **~20% of pipeline values are notes, not numbers** ("Verbal Jeremy", "CC",
+   "Credit Card", "TBR", or just the name of whoever gave the go-ahead). The
+   raw value is always stored; the UI shows it to customers only when it
+   contains a digit. Admins see the placeholders too, rendered muted, so they
+   can tell *why* a project's PO requirement is already ticked. The test is
+   deliberately just "has a digit" — real customer POs range from `7260` to
+   `T-31590` to `SEWARD72926`, and anything stricter would hide genuine POs
+   from the people who issued them.
 
 Storage buckets:
 - `project-files` — every uploaded file, scoped per-project by RLS (folder = project UUID)

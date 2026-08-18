@@ -3,6 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom'
 import { ArrowLeft, Upload, Download, Trash2, FileText, Users, Edit2, X, Check, Plus, Receipt, ExternalLink, ClipboardList, Award, Eye, Send, MessageSquare, Sparkles, MapPin, Lock, User, Phone, Navigation, Clock, Wrench, Camera, Image as ImageIcon } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { latestEquipmentCerts } from '../lib/equipmentCerts'
+import { displayPoNumber, hasPoNumber, isRealPoNumber } from '../lib/poNumber'
 import { useAuth } from '../context/AuthContext'
 import type { Project, ProjectFile, ProjectMember, Profile, Invoice, DocumentRequest } from '../types'
 
@@ -1163,6 +1164,14 @@ export default function ProjectPage() {
   const drawings = files.filter(f => f.kind === 'drawing')
   const photos = files.filter(f => f.kind === 'photo')
   const poFile = files.find(f => f.kind === 'purchase_order')
+  // A PO number typed into the sales pipeline satisfies the "Purchase order"
+  // requirement on its own: verbal POs and credit-card jobs never produce a
+  // document, so waiting for a PDF would nag forever. The number itself is
+  // only shown to the customer when it reads as a real reference — see
+  // src/lib/poNumber.
+  const poNumberRaw = project?.po_number ?? null
+  const poNumberShown = displayPoNumber(poNumberRaw, isAdmin)
+  const poSatisfied = !!poFile || hasPoNumber(poNumberRaw)
   const quotes = files.filter(f => f.kind === 'quote')
   const generalDocs = files.filter(f =>
     f.kind !== 'certificate' && f.kind !== 'equipment_certificate' && f.kind !== 'drawing' && f.kind !== 'photo' && f.kind !== 'purchase_order' && f.kind !== 'quote' && !f.document_request_id
@@ -1409,13 +1418,27 @@ export default function ProjectPage() {
               <div className="px-5 py-3.5">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3 min-w-0">
-                    {poFile
+                    {poSatisfied
                       ? <Check size={18} className="text-green-600 flex-shrink-0" />
                       : <div className="w-[18px] h-[18px] rounded-full border-2 border-gray-300 flex-shrink-0" />}
                     <div className="min-w-0">
                       <p className="text-sm font-medium text-gray-900 truncate">
                         Purchase order <span className="text-xs font-normal text-gray-400">· required</span>
                       </p>
+                      {/* PO number from the sales pipeline. Shown above the
+                          document line because it's the thing a customer
+                          actually recognises — the PDF is just evidence. */}
+                      {poNumberShown && (
+                        isRealPoNumber(poNumberRaw)
+                          ? <p className="text-xs text-gray-600 truncate">
+                              PO <span className="font-semibold text-gray-900">{poNumberShown}</span>
+                              {project?.po_date && <span className="text-gray-400"> · {formatDate(project.po_date)}</span>}
+                            </p>
+                          : <p className="text-xs text-gray-400 italic truncate" title="Recorded in the sales pipeline. Not shown to the customer because it isn't a PO number.">
+                              Recorded in pipeline as “{poNumberShown}”
+                              {project?.po_date && <span> · {formatDate(project.po_date)}</span>}
+                            </p>
+                      )}
                       {poFile
                         ? <div className="text-xs text-gray-400 truncate">
                             <span className="truncate">{poFile.name} · {formatDate(poFile.source_created_at || poFile.created_at)}</span>
@@ -1439,12 +1462,17 @@ export default function ProjectPage() {
                               </span>
                             )}
                           </div>
-                        : <p className="text-xs text-amber-600">
-                            Awaiting upload
-                            {isAdmin && lastReminderByKey['po'] && (
-                              <span className="text-gray-400 font-normal ml-1.5">· Reminded {formatRelativeTime(lastReminderByKey['po'])}</span>
-                            )}
-                          </p>}
+                        : poSatisfied
+                          // PO on record but no document — a verbal or
+                          // credit-card PO may never produce one, so this
+                          // states the fact instead of chasing.
+                          ? <p className="text-xs text-gray-400">PO received · no document uploaded</p>
+                          : <p className="text-xs text-amber-600">
+                              Awaiting upload
+                              {isAdmin && lastReminderByKey['po'] && (
+                                <span className="text-gray-400 font-normal ml-1.5">· Reminded {formatRelativeTime(lastReminderByKey['po'])}</span>
+                              )}
+                            </p>}
                     </div>
                   </div>
                   <div className="flex items-center gap-1 ml-4 flex-shrink-0">
@@ -1458,7 +1486,7 @@ export default function ProjectPage() {
                         </button>
                       </>
                     )}
-                    {!poFile && isAdmin && (
+                    {!poSatisfied && isAdmin && (
                       <button
                         onClick={() => sendReminder('Purchase order', 'po')}
                         disabled={reminderState?.key === 'po' && reminderState.status === 'sending'}

@@ -37,6 +37,12 @@ export interface Project {
   } | null
   lead_comments?: string | null
   ship_to_address?: string | null
+  // Customer PO number + date, mirrored from the sales pipeline's Lead List
+  // by sync-leads. po_number is raw pipeline text and may be a placeholder
+  // note rather than a number — run it through src/lib/poNumber before
+  // showing it to anyone.
+  po_number?: string | null
+  po_date?: string | null
 }
 
 export interface ProjectFile {
