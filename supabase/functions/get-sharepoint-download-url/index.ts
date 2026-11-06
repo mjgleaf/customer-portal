@@ -113,7 +113,7 @@ Deno.serve(async (req) => {
 
     // Access check: admin, service tech (Service-type project only),
     // project_member, OR customer email match.
-    const { data: profile } = await admin.from("cportal_profiles").select("role, email").eq("id", user.id).single();
+    const { data: profile } = await admin.from("cportal_profiles").select("role").eq("id", user.id).single();
     const isAdmin = profile?.role === "admin";
     const isServiceTech = profile?.role === "service_tech";
     if (!isAdmin) {
@@ -142,7 +142,9 @@ Deno.serve(async (req) => {
 
       // Check 3: email match on the project's customer record?
       if (!hasAccess) {
-        const callerEmail = (profile?.email ?? "").toLowerCase();
+        // Use the verified login email from the auth token, never the
+        // user-editable cportal_profiles.email column.
+        const callerEmail = (user.email ?? "").trim().toLowerCase();
         if (callerEmail) {
           const { data: project } = await admin
             .from("cportal_projects")

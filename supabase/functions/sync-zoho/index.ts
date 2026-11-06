@@ -16,18 +16,21 @@
 // bump the parent contact's modified time).
 //
 // Also sends notification emails via Microsoft Graph (as the shared sales@
-// mailbox) on genuinely-new invoices (only once they're marked sent in Zoho
-// Books, past any approval workflow) and on project status changes. Emails are
-// routed to the linked project's members (job-scoped) rather than the customer
-// record's primary-contact email (company-scoped), falling back to the customer
+// mailbox) on project status changes. Emails are routed to the linked
+// project's members (job-scoped) rather than the customer record's
+// primary-contact email (company-scoped), falling back to the customer
 // email only when there's no project link or the project has no members — a
-// multi-office company must not have every office's invoices land with one
-// person. Honors each user's email_notifications preference and the
+// multi-office company must not have every office's status updates land with
+// one person. Honors each user's email_notifications preference and the
 // app_settings.emails_paused kill switch; best-effort if creds are unset.
-// New-invoice emails additionally require app_settings.invoice_emails_paused
-// to be "false" — absent or anything else means they stay off.
+//
+// Deliberately NO "new invoice available" (or any other "now available in
+// your portal") emails: the owner's standing policy is that customers are
+// never notified when something appears on the portal. Do not add
+// availability notifications back here.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { isServiceRoleToken } from "../_shared/auth.ts";
 
 // --- Branded email wrapper (inlined copy of _shared/email-template.ts so
 //     this function deploys as a single self-contained file) ---------------
@@ -245,11 +248,11 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T)
 // were silently losing their tails — the quoted-row claim pass couldn't see
 // every pre-award row (duplicate projects), projMap missed ~130 projects
 // (member auto-add and status emails silently skipped), and the invoice
-// dedup snapshot would start re-emailing customers the day cportal_invoices
-// crosses 1000 rows. Every full-table read must page (ordered by id so
-// pages don't shift) until a short page marks the end. Errors throw rather
-// than pass as an empty page — syncing against partial data is how
-// duplicates and repeat emails happen.
+// project-link cache would re-walk Zoho detail calls the day
+// cportal_invoices crosses 1000 rows. Every full-table read must page
+// (ordered by id so pages don't shift) until a short page marks the end.
+// Errors throw rather than pass as an empty page — syncing against partial
+// data is how duplicates and repeat emails happen.
 const PAGE_SIZE = 1000;
 async function selectAll<T>(
   build: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
@@ -280,17 +283,16 @@ function parseJobCode(name: string): string | null {
 }
 
 // Zoho Books approval workflow: an invoice moves draft → pending approval →
-// approved (or rejected) → sent. The customer must not see — or be emailed
-// about — an invoice until the PM marks it SENT in Zoho; approval alone
-// still keeps it internal.
+// approved (or rejected) → sent. The customer must not see an invoice until
+// the PM marks it SENT in Zoho; approval alone still keeps it internal.
 //
 // FAIL CLOSED: only a status that cannot exist before sending releases an
 // invoice. A block-list of pre-sent states leaks the moment Zoho reports a
 // state it doesn't anticipate — or formats one differently ("Pending
-// Approval" vs "pending_approval") — and a leak here emails the customer.
-// An unrecognized status therefore holds the invoice back; worst case a
-// legitimate invoice is late to the portal, which is visible and fixable,
-// unlike a premature email.
+// Approval" vs "pending_approval") — and a leak here shows the customer an
+// invoice that's still being prepared. An unrecognized status therefore
+// holds the invoice back; worst case a legitimate invoice is late to the
+// portal, which is visible and fixable, unlike a premature release.
 const RELEASED_INVOICE_STATES = new Set([
   "sent", "viewed", "unpaid", "overdue", "paid", "partially_paid", "partial", "void",
 ]);
@@ -318,16 +320,6 @@ function toIso(v: unknown): string | null {
   if (!v) return null;
   const d = new Date(v as string);
   return isNaN(d.getTime()) ? null : d.toISOString();
-}
-
-function money(amount: unknown, currency: string | null): string {
-  const n = Number(amount);
-  if (isNaN(n)) return String(amount ?? "");
-  try {
-    return new Intl.NumberFormat("en-US", { style: "currency", currency: currency || "USD" }).format(n);
-  } catch {
-    return String(n);
-  }
 }
 
 // --- Microsoft Graph (app-only) email sender -------------------------------
@@ -414,24 +406,11 @@ Deno.serve(async (req) => {
   const admin = createClient(supabaseUrl, serviceKey);
 
   // Authorize: allow the scheduled cron (service-role key) or an admin user.
-  // Three paths: direct env match, JWT role:service_role claim, or admin user JWT.
-  // The multi-path check handles both legacy JWT-format service keys and the
-  // newer sb_secret_* format.
+  // Two paths: a signature-verified service-role key, or an admin user JWT.
   const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "").trim();
   let allowed = false;
-  if (token && token === serviceKey) {
-    allowed = true;
-  }
-  if (!allowed && token) {
-    try {
-      const parts = token.split(".");
-      if (parts.length === 3) {
-        const padded = parts[1] + "=".repeat((4 - parts[1].length % 4) % 4);
-        const payload = JSON.parse(atob(padded.replace(/-/g, "+").replace(/_/g, "/")));
-        if (payload?.role === "service_role") allowed = true;
-      }
-    } catch { /* not a JWT */ }
-  }
+  // Signature-verified; never trust a decoded role claim (see _shared/auth.ts).
+  if (await isServiceRoleToken(token)) allowed = true;
   if (!allowed && token) {
     const { data: { user } } = await admin.auth.getUser(token);
     if (user) {
@@ -900,13 +879,11 @@ Deno.serve(async (req) => {
       (a, b) => admin.from("cportal_profiles").select("id, email, role, email_notifications").order("id").range(a, b),
     );
     const optedOut = new Set<string>();
-    const portalEmails = new Set<string>();
     const internalEmails = new Set<string>();
     const profileEmailById = new Map<string, string>();
     for (const pf of mailProfiles) {
       const email = String(pf.email ?? "").trim().toLowerCase();
       if (!email) continue;
-      portalEmails.add(email);
       profileEmailById.set(pf.id, email);
       if (pf.email_notifications === false) optedOut.add(email);
       if (pf.role === "admin" || pf.role === "service_tech") internalEmails.add(email);
@@ -933,14 +910,9 @@ Deno.serve(async (req) => {
     // all the project has. When the audience exists but everyone in it opted
     // out, we send nothing rather than fall back — falling back would re-route
     // job news to the company-wide contact (the exact bug this prevents).
-    // requirePortal: new-invoice emails only go to customers who already have
-    // a portal account (never-invited customers shouldn't get "view it in
-    // your portal" emails); status emails keep their historical behavior of
-    // reaching the customer email regardless.
     function recipientsFor(
       portalProjectId: string | null | undefined,
       fallbackEmail: string | null | undefined,
-      requirePortal: boolean,
     ): string[] {
       const fb = String(fallbackEmail ?? "").trim().toLowerCase();
       const members = (portalProjectId ? membersByProject.get(portalProjectId) : undefined) ?? [];
@@ -948,7 +920,6 @@ Deno.serve(async (req) => {
       const audience = jobPeople.length ? jobPeople : members;
       if (audience.length) return audience.filter((e) => !optedOut.has(e));
       if (!fb || optedOut.has(fb)) return [];
-      if (requirePortal && !portalEmails.has(fb)) return [];
       return [fb];
     }
 
@@ -958,7 +929,7 @@ Deno.serve(async (req) => {
       const prev = oldStatus.get(String(p.project_id));
       if (prev === undefined || prev === newStatus) continue;
       const fallback = custEmail.get(custMap.get(String(p.customer_id)) ?? "");
-      for (const to of recipientsFor(projMap.get(String(p.project_id)), fallback, false)) {
+      for (const to of recipientsFor(projMap.get(String(p.project_id)), fallback)) {
         await sendEmail(
           admin,
           to,
@@ -975,28 +946,22 @@ Deno.serve(async (req) => {
     // 3) Invoices — only invoices the PM has MARKED SENT in Zoho flow into
     //    the portal. Drafts, invoices pending approval, approved-but-unsent
     //    invoices, and rejected invoices stay out entirely so a customer
-    //    never sees — or gets emailed about — an invoice that's still being
-    //    prepared. The moment the PM sends it, the next sync brings it in —
-    //    which is when the portal "receives" the invoice and the new-invoice
-    //    email fires.
+    //    never sees an invoice that's still being prepared. The moment the
+    //    PM sends it, the next sync brings it in. No email is sent when it
+    //    lands — see the no-availability-notifications policy up top.
 
-    // Capture existing rows BEFORE the cleanup delete below, so the
-    // new-invoice email dedup remembers every row that was in the portal when
-    // this sync started. If the cleanup ever removes a row for an invoice
-    // Zoho still reports as released, the upsert restores it in this same run
-    // without re-emailing anyone. Also used to skip re-resolving the project
-    // link for invoices we've already checked in a prior sync.
+    // Capture existing rows BEFORE the cleanup delete below so we can reuse
+    // each invoice's already-resolved project link instead of re-walking the
+    // Zoho detail endpoint every sync.
     const existingInvoices = await selectAll<{ zoho_invoice_id: string; project_id: string | null; project_synced_at: string | null }>(
       (a, b) => admin.from("cportal_invoices").select("zoho_invoice_id, project_id, project_synced_at").order("id").range(a, b),
     );
-    const existingInvIds = new Set(existingInvoices.map((i) => i.zoho_invoice_id));
 
     // Purge every stored row that isn't in a known released state — fail
     // closed, matching invoiceReleased above. This removes unreleased rows
     // stored by any earlier version of this function, in whatever format it
-    // recorded the status. A purged invoice that the PM later marks sent is
-    // absent from the next sync's dedup snapshot, so it counts as genuinely
-    // new and triggers the notification.
+    // recorded the status. A purged invoice that the PM later marks sent
+    // simply reappears via the upsert on a later sync.
     const { error: purgeError } = await admin.from("cportal_invoices").delete()
       .or(`status.is.null,status.not.in.(${[...RELEASED_INVOICE_STATES].join(",")})`);
     if (purgeError) console.error("Unreleased-invoice purge failed:", purgeError.message);
@@ -1056,41 +1021,6 @@ Deno.serve(async (req) => {
       const { error } = await admin.from("cportal_invoices").upsert(invoiceRows, { onConflict: "zoho_invoice_id" });
       if (error) throw error;
     }
-
-    // Email the job's people about genuinely-new invoices. Unreleased invoices
-    // (draft / pending approval / approved-but-unsent / rejected) are already
-    // filtered out above, so this only fires for invoices the PM has marked
-    // sent in Zoho. Skip voided invoices. Recipients come from the linked project's
-    // members; the customer-record email is only a fallback, and only when that
-    // customer already has a portal account (a cportal_profiles row is created
-    // at invite time, so its presence means they've been invited/registered —
-    // cold customers should not receive "view it in your portal" emails).
-    // Invoice emails have their own kill switch on top of emails_paused:
-    // paused unless app_settings.invoice_emails_paused is explicitly "false"
-    // (same fail-closed convention as emails_paused). Status-change emails
-    // above are unaffected.
-    const { data: invEmailSetting } = await admin
-      .from("cportal_app_settings").select("value").eq("key", "invoice_emails_paused").maybeSingle();
-    const invoiceEmailsEnabled = invEmailSetting?.value === "false";
-    for (let i = 0; invoiceEmailsEnabled && i < invoices.length; i++) {
-      const inv = invoices[i];
-      if (existingInvIds.has(String(inv.invoice_id))) continue;
-      if (normStatus(inv.status) === "void") continue;
-      const fallback = custEmail.get(custMap.get(String(inv.customer_id)) ?? "");
-      for (const to of recipientsFor(resolved[i].projectId, fallback, true)) {
-        await sendEmail(
-          admin,
-          to,
-          `New invoice ${inv.invoice_number ?? ""}`.trim(),
-          brandedEmail({
-            preheader: `Invoice ${inv.invoice_number ?? ""} for ${money(inv.total, inv.currency_code)} is ready.`,
-            title: `New invoice ${inv.invoice_number ?? ""}`.trim(),
-            bodyHtml: `<p>A new invoice <strong>${inv.invoice_number ?? ""}</strong> for <strong>${money(inv.total, inv.currency_code)}</strong> is now available in your portal.</p>`,
-          }),
-        );
-      }
-    }
-    if (!invoiceEmailsEnabled) console.log("[invoice emails paused] skipped new-invoice notifications");
 
     // Advance the watermark only after everything above succeeded — a failed
     // run must leave it untouched so the next run re-sweeps the same window.

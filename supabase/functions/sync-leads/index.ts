@@ -7,6 +7,7 @@
 // Read-only against SharePoint. Callable by an admin or the scheduled cron.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { isServiceRoleToken } from "../_shared/auth.ts";
 
 const TENANT = Deno.env.get("SHAREPOINT_TENANT_ID")!;
 const CLIENT_ID = Deno.env.get("SHAREPOINT_CLIENT_ID")!;
@@ -90,20 +91,11 @@ Deno.serve(async (req) => {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const admin = createClient(supabaseUrl, serviceKey);
 
-  // Three-path auth: direct env match, JWT role:service_role claim, or admin user JWT.
+  // Auth: a signature-verified service-role key, or an admin user JWT.
   const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "").trim();
   let allowed = false;
-  if (token && token === serviceKey) allowed = true;
-  if (!allowed && token) {
-    try {
-      const parts = token.split(".");
-      if (parts.length === 3) {
-        const padded = parts[1] + "=".repeat((4 - parts[1].length % 4) % 4);
-        const payload = JSON.parse(atob(padded.replace(/-/g, "+").replace(/_/g, "/")));
-        if (payload?.role === "service_role") allowed = true;
-      }
-    } catch { /* not a JWT */ }
-  }
+  // Signature-verified; never trust a decoded role claim (see _shared/auth.ts).
+  if (await isServiceRoleToken(token)) allowed = true;
   if (!allowed && token) {
     const { data: { user } } = await admin.auth.getUser(token);
     if (user) {

@@ -21,6 +21,7 @@
 // Best-effort: a failure here doesn't break the upload flow in the portal.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { isServiceRoleToken } from "../_shared/auth.ts";
 import { brandedEmail } from "../_shared/email-template.ts";
 import { renderProjectInfoBlock } from "../_shared/project-context.ts";
 
@@ -285,33 +286,14 @@ Deno.serve(async (req) => {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const admin = createClient(supabaseUrl, serviceKey);
 
-  // Caller must be a logged-in user OR present a service-role-claim JWT
-  // (matches the sync-zoho pattern so cron jobs, scripts, and other
-  // automation can invoke the function without a user session). We check
-  // the JWT's role claim rather than string-comparing the env var so this
-  // works regardless of which service-role-key format Supabase issued.
+  // Caller must be a logged-in user OR present a genuine service-role key
+  // (cron jobs, scripts, and ingest-po-from-email use the latter).
   const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "").trim();
   if (!token) return json({ error: "Not authorized" }, 401);
   let isServiceRole = false;
-  // Check 1: direct string match against the env service-role key. Handles
-  // the new sb_secret_ key format which isn't a JWT and so can't be parsed
-  // the legacy way below. Inter-function calls from ingest-po-from-email
-  // use this path.
-  if (token === serviceKey) {
-    isServiceRole = true;
-  }
-  // Check 2: legacy JWT with role:service_role claim (old key format).
-  if (!isServiceRole) {
-    try {
-      const parts = token.split(".");
-      if (parts.length === 3) {
-        const padded = parts[1] + "=".repeat((4 - parts[1].length % 4) % 4);
-        const payload = JSON.parse(atob(padded.replace(/-/g, "+").replace(/_/g, "/")));
-        if (payload?.role === "service_role") isServiceRole = true;
-      }
-    } catch { /* not a JWT — fall through to user check */ }
-  }
-  // Check 3: regular user JWT — must resolve to an actual auth.users row.
+  // Signature-verified; never trust a decoded role claim (see _shared/auth.ts).
+  if (await isServiceRoleToken(token)) isServiceRole = true;
+  // Otherwise: regular user JWT — must resolve to an actual auth.users row.
   if (!isServiceRole) {
     const { data: { user } } = await admin.auth.getUser(token);
     if (!user) return json({ error: "Not authorized" }, 401);
