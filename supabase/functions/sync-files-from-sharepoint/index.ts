@@ -11,6 +11,7 @@
 // Admin-only.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { isServiceRoleToken } from "../_shared/auth.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -304,14 +305,8 @@ Deno.serve(async (req) => {
   const authToken = (req.headers.get("Authorization") ?? "").replace("Bearer ", "").trim();
   if (!authToken) return json({ error: "Not authorized" }, 401);
   let isServiceRole = false;
-  try {
-    const parts = authToken.split(".");
-    if (parts.length === 3) {
-      const padded = parts[1] + "=".repeat((4 - parts[1].length % 4) % 4);
-      const payload = JSON.parse(atob(padded.replace(/-/g, "+").replace(/_/g, "/")));
-      if (payload?.role === "service_role") isServiceRole = true;
-    }
-  } catch { /* fall through */ }
+  // Signature-verified; never trust a decoded role claim (see _shared/auth.ts).
+  if (await isServiceRoleToken(authToken)) isServiceRole = true;
 
   let callerUserId: string | null = null;
   let callerIsAdmin = false;
